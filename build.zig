@@ -229,4 +229,52 @@ pub fn build(b: *std.Build) void {
         const install_lib_auv_proteus_hwd = b.addInstallFileWithDir(lib_auv_proteus_hwd_so, .lib, "libauv_proteus_hwd.so");
         b.getInstallStep().dependOn(&install_lib_auv_proteus_hwd.step);
     }
+
+    if (b.option(bool, "hydrus", "Build the Stonefish hydrus_sim plugin") == true) {
+        const stonefish_prefix = b.option([]const u8, "stonefish-prefix", "Stonefish install prefix") orelse
+            @panic("-Dhydrus requires -Dstonefish-prefix");
+        const lib_auv_hydrus_sim = b.addSystemCommand(&.{cxx});
+        lib_auv_hydrus_sim.addArgs(&.{
+            "-shared",
+            "-fPIC",
+            "-std=gnu++23",
+            "-D_GNU_SOURCE",
+            "-DBT_EULER_DEFAULT_ZYX",
+            "-DBT_USE_DOUBLE_PRECISION",
+            "-fopenmp",
+        });
+        lib_auv_hydrus_sim.addArg(b.fmt("-DSHADER_DIR_PATH=\"{s}/share/Stonefish/shaders/\"", .{stonefish_prefix}));
+        lib_auv_hydrus_sim.addArg(if (optimize == .Debug) "-O0" else "-O2");
+        if (optimize == .Debug)
+            lib_auv_hydrus_sim.addArg("-g");
+
+        lib_auv_hydrus_sim.addArg("-o");
+        const lib_auv_hydrus_sim_so = lib_auv_hydrus_sim.addOutputFileArg("libauv_hydrus_sim.so");
+        lib_auv_hydrus_sim.addFileArg(b.path("auvs/hydrus_sim/auv.cpp"));
+        lib_auv_hydrus_sim.addFileInput(b.path("include/auv.h"));
+        lib_auv_hydrus_sim.addFileInput(b.path("include/math.h"));
+        lib_auv_hydrus_sim.addArgs(&.{
+            "-I",
+            b.pathFromRoot("include"),
+            "-isystem",
+            b.fmt("{s}/include/Stonefish", .{stonefish_prefix}),
+            "-isystem",
+            "/usr/include/SDL2",
+            b.fmt("-L{s}/lib", .{stonefish_prefix}),
+            b.fmt("-Wl,-rpath,{s}/lib", .{stonefish_prefix}),
+            "-Wl,--no-undefined",
+            "-lStonefish",
+            "-lSDL2",
+            "-lfreetype",
+            "-lOpenGL",
+            "-lGLX",
+            "-lGLU",
+            "-lgomp",
+            "-pthread",
+        });
+
+        const install_lib_auv_hydrus_sim = b.addInstallFileWithDir(lib_auv_hydrus_sim_so, .lib, "libauv_hydrus_sim.so");
+        b.getInstallStep().dependOn(&install_lib_auv_hydrus_sim.step);
+        b.step("hydrus", "Build the Stonefish hydrus_sim plugin").dependOn(&install_lib_auv_hydrus_sim.step);
+    }
 }
