@@ -19,7 +19,6 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <memory>
 #include <optional>
 #include <print>
 #include <string>
@@ -288,8 +287,8 @@ private:
 
 struct SimulationContext
 {
-    std::unique_ptr<SimManager> sim;
-    std::unique_ptr<SimApp> app;
+    SimManager* sim = nullptr;
+    SimApp* app = nullptr;
 };
 
 SimulationContext* g_simulation_context = nullptr;
@@ -326,9 +325,9 @@ void auv_init(void)
     auv_deinit();
 
     g_simulation_context = new SimulationContext();
-    g_simulation_context->sim = std::make_unique<SimManager>(kStepsPerSecond, dataPath / scenario_file);
-    g_simulation_context->app = std::make_unique<SimApp>(
-        dataPath.string(), DefaultRenderSettings(), DefaultHelperSettings(), g_simulation_context->sim.get());
+    g_simulation_context->sim = new SimManager(kStepsPerSecond, dataPath / scenario_file);
+    g_simulation_context->app = new SimApp(
+        dataPath.string(), DefaultRenderSettings(), DefaultHelperSettings(), g_simulation_context->sim);
     g_simulation_context->app->start(sf::Scalar(1) / kStepsPerSecond);
 }
 
@@ -357,10 +356,8 @@ void auv_deinit(void)
     if(g_simulation_context == nullptr)
         return;
 
-    (void)g_simulation_context->sim.release();
     if(g_simulation_context->app)
         g_simulation_context->app->shutdown();
-    (void)g_simulation_context->app.release();
 
     delete g_simulation_context;
     g_simulation_context = nullptr;
