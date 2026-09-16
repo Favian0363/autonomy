@@ -120,11 +120,11 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) void {
         break :blk false;
     }) {
         if (ctx.config_loader.load(ctx.io)) |config| {
-            std.log.debug("succesfully reloaded config: {s}/{s}", .{ctx.auv_watcher.dir, ctx.auv_watcher.name});
+            std.log.debug("succesfully reloaded config: {s}/{s}", .{ ctx.auv_watcher.dir, ctx.auv_watcher.name });
             std.log.debug("{any}", .{config});
             ctx.config = config;
         } else |err| {
-            std.log.err("failed to reload config: {s}/{s}", .{ctx.auv_watcher.dir, ctx.auv_watcher.name});
+            std.log.err("failed to reload config: {s}/{s}", .{ ctx.auv_watcher.dir, ctx.auv_watcher.name });
             std.log.err("{s}", .{@errorName(err)});
             std.log.info("kept previous config", .{});
         }
@@ -136,12 +136,12 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) void {
     }) {
         ctx.auv.deinit();
         if (ctx.auv_loader.load(ctx.io)) |auv| {
-            std.log.debug("succesfully reloaded auv: {s}/{s}", .{ctx.auv_watcher.dir, ctx.auv_watcher.name});
+            std.log.debug("succesfully reloaded auv: {s}/{s}", .{ ctx.auv_watcher.dir, ctx.auv_watcher.name });
             std.log.debug("{any}", .{auv});
             ctx.auv = auv;
             std.log.debug("restarted auv loop", .{});
         } else |err| {
-            std.log.err("failed to reload auv: {s}/{s}", .{ctx.auv_watcher.dir, ctx.auv_watcher.name});
+            std.log.err("failed to reload auv: {s}/{s}", .{ ctx.auv_watcher.dir, ctx.auv_watcher.name });
             std.log.err("{s}", .{@errorName(err)});
             std.log.info("kept previous auv", .{});
         }
@@ -190,9 +190,7 @@ fn pidStep(ctx: *MissionContext) void {
 
     // Vehicle forward is +Y in body frame.
     const forward = math.quaternionRotate(rot, .{ 0.0, 1.0, 0.0 });
-
-    const current_rpy = math.quaternionToEuler(rot);
-    _, _, const current_yaw = current_rpy;
+    const current_yaw = std.math.atan2(forward[1], forward[0]);
 
     const dir = math.Vector3f{
         pose_err[0],
@@ -276,7 +274,8 @@ fn pidStep(ctx: *MissionContext) void {
         body_force[0] = 0.0;
         body_force[1] = 0.0;
     } else {
-        body_force[0] = @max(body_force[0], 0.0);
+        // Hydrus TAM has no body-X (sway) column; only +Y is surge.
+        body_force[0] = 0.0;
         body_force[1] = @max(body_force[1], 0.0);
     }
 
@@ -324,13 +323,12 @@ fn pidStep(ctx: *MissionContext) void {
         math.debug3f("\tforward ", forward);
         math.debug3f("\tdir2d   ", dir);
         std.log.debug(
-        "\tcurrent_yaw={d:3.2} target_yaw={d:3.2} yaw_error={d:3.2}",
-        .{ current_yaw, target_yaw, yaw_error },
+            "\tcurrent_yaw={d:3.2} target_yaw={d:3.2} yaw_error={d:3.2}",
+            .{ current_yaw, target_yaw, yaw_error },
         );
         math.debug3f("\trotated ", rotated);
         math.debug3f("\tbody_force ", body_force);
         math.debug6f("\tinput   ", input);
-        // std.log.debug("timestamp_ns = {}", .{timestamp_ns});
         std.log.debug("\tthruster_values = {any}", .{thruster_values});
     }
     ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));

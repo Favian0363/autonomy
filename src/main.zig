@@ -15,7 +15,5 @@ pub fn main(init: std.process.Init) !void {
         .prequalify => @import("missions/prequalify.zig").mission(&ctx),
     }
 
-    while (true) {
-        ctx.yieldUntilNextFrameAndUpdate();
-    }
+    ctx.yieldUntilNextFrameAndUpdate();
 }

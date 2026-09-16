@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstdio>
 #include <math.h>
 
 #include "auv.h"
@@ -17,6 +18,7 @@
 #include "sensors/ScalarSensor.h"
 
 
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -44,10 +46,13 @@ std::optional<ObjectCls> ParseObjectClass(const char* text)
     if(text == nullptr || *text == '\0')
         return std::nullopt;
 
-    const std::string_view cls = text;
+    std::string cls{text};
+    for(char& c : cls)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
     if(cls == "cube" || cls == "0")
         return ObjectCls::cube;
-    if(cls == "rect" || cls == "1")
+    if(cls == "rect" || cls == "rectangle" || cls == "1")
         return ObjectCls::rect;
     if(cls == "gate" || cls == "2")
         return ObjectCls::gate;
@@ -56,11 +61,15 @@ std::optional<ObjectCls> ParseObjectClass(const char* text)
 
 std::optional<ObjectCls> InferObjectClass(const std::string& name)
 {
-    if(name.find("gate") != std::string::npos)
+    std::string lower = name;
+    for(char& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if(lower.find("gate") != std::string::npos)
         return ObjectCls::gate;
-    if(name.find("rect") != std::string::npos)
+    if(lower.find("rect") != std::string::npos)
         return ObjectCls::rect;
-    if(name.find("cube") != std::string::npos)
+    if(lower.find("cube") != std::string::npos)
         return ObjectCls::cube;
     return std::nullopt;
 }
@@ -182,9 +191,18 @@ public:
 
         thrusters.clear();
         sf::Robot* robot = getRobot(0u);
+        if(robot == nullptr)
+        {
+            std::println(stdout, "[hydrus_sim] no robot in scenario; thrusters will not run");
+            return;
+        }
         for(size_t i = 0; sf::Actuator* actuator = robot->getActuator(i); ++i)
+        {
+            if(actuator->getType() != sf::ActuatorType::THRUSTER)
+                continue;
             thrusters.push_back(static_cast<sf::Thruster*>(actuator));
     }
+}
 
     void setThrustorValues(const float* thrustor_values, uint8_t thrustor_values_len)
     {
@@ -242,7 +260,7 @@ public:
         return frame;
     }
 
-private:
+
     std::filesystem::path scenarioPath;
     std::unordered_map<std::string, ObjectCls> objectClasses;
     sf::ScalarSensor* odometry = nullptr;
@@ -333,11 +351,14 @@ void auv_init(void)
 
 void auv_yield_until_next_frame(AuvFrame* frame)
 {
+    if(g_simulation_context == nullptr || g_simulation_context->app == nullptr)
+        return;
+
     g_simulation_context->app->StepSimulation();
     g_simulation_context->app->pump();
     if(g_simulation_context->app->getState() == sf::SimulationState::FINISHED)
     {
-        std::println(stderr, "[hydrus_sim] simulation finished; restart for another run");
+        std::println(stdout, "[hydrus_sim] simulation finished; restart for another run");
         auv_deinit();
         return;
     }
@@ -348,7 +369,7 @@ void auv_set_thrustor_values(const float* thrustor_values, uint8_t thrustor_valu
 {
     if(g_simulation_context == nullptr)
         return;
-    g_simulation_context->sim->setThrustorValues(thrustor_values, thrustor_values_len);
+    g_simulation_context->sim->setThrustorValues(thrustor_values, thrustor_values_len); 
 }
 
 void auv_deinit(void)

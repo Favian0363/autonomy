@@ -36,7 +36,7 @@ pub fn init(p_init: std.process.Init) !MissionArgs {
         .mission_id = mission_id,
         .auv_dynlib_path = auv_dynlib_path,
         .live_config_path = live_config_path,
-        .goal_dist_threshold = 1000,
+        .goal_dist_threshold = 1.0,
     };
 }
 
