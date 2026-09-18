@@ -61,7 +61,7 @@
 
 	<!-- Gate -->
 
-	<static name="Gate" type="model" clss="gate">
+	<static name="Gate" type="model" cls="gate">
 		<physical>
 			<mesh filename="models/gate.obj" scale="1.0" convex="false" />
 			<origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />
@@ -85,15 +85,6 @@
 		<material name="pvc" />
 		<look name="yellow" />
 	</static>
-
-
-
-	<!-- TODO// THIS IS SUPPOSE TO BE FOR TESTING IF THE MISSION ACTED CORRECTLY -->
-	<!-- <volumetric_trigger>
-	<origin rpy="0.0 0.0 0.0" xyz="10.0 1.0 2.0" />
-	<dimensions xyz="2.0 2.0 4.0" />
-	</volumetric_trigger> -->
-
 
 	<!-- Single Hydrus AUV instance -->
 	<include file="scenarios/hydrus_auv.scn">
