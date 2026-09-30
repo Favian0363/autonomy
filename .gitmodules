@@ -1,3 +1,0 @@
-[submodule "vendor/stonefish"]
-	path = vendor/stonefish
-	url = git@github.com:patrykcieslak/stonefish.git

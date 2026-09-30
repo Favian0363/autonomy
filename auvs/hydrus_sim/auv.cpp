@@ -2,22 +2,22 @@
 #include <cstdio>
 #include <math.h>
 
-#include "../../include/auv.h"
+#include "auv.h"
 
-#include "Stonefish/actuators/Actuator.h"
-#include "Stonefish/actuators/Thruster.h"
-#include "Stonefish/core/ConsoleSimulationApp.h"
-#include "Stonefish/core/GraphicalSimulationApp.h"
-#include "Stonefish/core/Robot.h"
-#include "Stonefish/core/ScenarioParser.h"
-#include "Stonefish/core/SimulationManager.h"
-#include "Stonefish/entities/Entity.h"
-#include "Stonefish/entities/MovingEntity.h"
-#include "Stonefish/entities/StaticEntity.h"
-#include "Stonefish/graphics/OpenGLDataStructs.h"
-#include "Stonefish/graphics/OpenGLPipeline.h"
-#include "Stonefish/sensors/Sensor.h"
-#include "Stonefish/sensors/ScalarSensor.h"
+#include "actuators/Actuator.h"
+#include "actuators/Thruster.h"
+#include "core/ConsoleSimulationApp.h"
+#include "core/GraphicalSimulationApp.h"
+#include "core/Robot.h"
+#include "core/ScenarioParser.h"
+#include "core/SimulationManager.h"
+#include "entities/Entity.h"
+#include "entities/MovingEntity.h"
+#include "entities/StaticEntity.h"
+#include "graphics/OpenGLDataStructs.h"
+#include "graphics/OpenGLPipeline.h"
+#include "sensors/Sensor.h"
+#include "sensors/ScalarSensor.h"
 
 
 #include <cctype>
