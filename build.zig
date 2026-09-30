@@ -6,7 +6,7 @@ const std = @import("std");
 // for defining build steps and express dependencies between them, allowing the
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -230,51 +230,37 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_lib_auv_proteus_hwd.step);
     }
 
-    if (b.option(bool, "hydrus", "Build the Stonefish hydrus_sim plugin") == true) {
-        const stonefish_prefix = b.option([]const u8, "stonefish-prefix", "Stonefish install prefix") orelse
-            @panic("-Dhydrus requires -Dstonefish-prefix");
-        const lib_auv_hydrus_sim = b.addSystemCommand(&.{cxx});
-        lib_auv_hydrus_sim.addArgs(&.{
-            "-shared",
-            "-fPIC",
-            "-std=gnu++23",
-            "-D_GNU_SOURCE",
-            "-DBT_EULER_DEFAULT_ZYX",
-            "-DBT_USE_DOUBLE_PRECISION",
-            "-fopenmp",
-        });
-        lib_auv_hydrus_sim.addArg(b.fmt("-DSHADER_DIR_PATH=\"{s}/share/Stonefish/shaders/\"", .{stonefish_prefix}));
-        lib_auv_hydrus_sim.addArg(if (optimize == .Debug) "-O0" else "-O2");
-        if (optimize == .Debug)
-            lib_auv_hydrus_sim.addArg("-g");
+    const cmake_configure = b.addSystemCommand(&.{
+        "cmake",
+        "-B",
+        "build",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+    });
+    try cmake_configure.step.addWatchInput(b.path("CMakeLists.txt"));
 
-        lib_auv_hydrus_sim.addArg("-o");
-        const lib_auv_hydrus_sim_so = lib_auv_hydrus_sim.addOutputFileArg("libauv_hydrus_sim.so");
-        lib_auv_hydrus_sim.addFileArg(b.path("auvs/hydrus_sim/auv.cpp"));
-        lib_auv_hydrus_sim.addFileInput(b.path("include/auv.h"));
-        lib_auv_hydrus_sim.addFileInput(b.path("include/math.h"));
-        lib_auv_hydrus_sim.addArgs(&.{
-            "-I",
-            b.pathFromRoot("include"),
-            "-isystem",
-            b.fmt("{s}/include/Stonefish", .{stonefish_prefix}),
-            "-isystem",
-            "/usr/include/SDL2",
-            b.fmt("-L{s}/lib", .{stonefish_prefix}),
-            b.fmt("-Wl,-rpath,{s}/lib", .{stonefish_prefix}),
-            "-Wl,--no-undefined",
-            "-lStonefish",
-            "-lSDL2",
-            "-lfreetype",
-            "-lOpenGL",
-            "-lGLX",
-            "-lGLU",
-            "-lgomp",
-            "-pthread",
-        });
+    const cmake_build = b.addSystemCommand(&.{
+        "cmake",
+        "--build",
+        "build",
+        "--target",
+    });
+    cmake_build.step.dependOn(&cmake_configure.step);
 
-        const install_lib_auv_hydrus_sim = b.addInstallFileWithDir(lib_auv_hydrus_sim_so, .lib, "libauv_hydrus_sim.so");
-        b.getInstallStep().dependOn(&install_lib_auv_hydrus_sim.step);
-        b.step("hydrus", "Build the Stonefish hydrus_sim plugin").dependOn(&install_lib_auv_hydrus_sim.step);
+    const stonefish = b.option(bool, "stonefish", "Build the Stonefish hydrus_sim plugin") orelse false;
+    if (stonefish) {
+        const cmake_target = "auv_hydrus_sim";
+        cmake_build.addArg(cmake_target);
+
+        _ = try cmake_build.step.addDirectoryWatchInput(b.path("auvs/hydrus_sim"));
+
+        const cmake_dynlib_file = b.fmt("lib{s}{s}", .{cmake_target, target.result.dynamicLibSuffix()});
+        const cmake_dynlib_path = b.path(b.fmt("build/{s}", .{cmake_dynlib_file}));
+
+        const install_hydrus_sim = b.addInstallFileWithDir(cmake_dynlib_path, .lib, cmake_dynlib_file);
+        install_hydrus_sim.step.dependOn(&cmake_build.step);
+
+        b.getInstallStep().dependOn(&install_hydrus_sim.step);
     }
+
+    cmake_build.step.dependOn(&cmake_configure.step);
 }
