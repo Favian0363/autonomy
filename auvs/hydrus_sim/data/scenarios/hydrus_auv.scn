@@ -28,7 +28,7 @@
 
 			<external_part name="LowLegsLeft" type="model" physics="submerged" buoyant="true">
 				<physical>
-					<mesh filename="models/hydrus_lowlegs.obj" scale="0.01" />
+					<mesh filename="models/gate.obj" scale="0.01" />
 					<origin rpy="-1.5708 0.0 0.0" xyz="0.0 0.0 0.0" />
 				</physical>
 				<material name="hdpe" />
@@ -38,7 +38,7 @@
 
 			<external_part name="LowLegsRight" type="model" physics="submerged" buoyant="true">
 				<physical>
-					<mesh filename="models/hydrus_lowlegs.obj" scale="0.01" />
+					<mesh filename="models/gate.obj" scale="0.01" />
 					<origin rpy="-1.5708 0.0 0.0" xyz="0.0 0.0 0.0" />
 				</physical>
 				<material name="hdpe" />
