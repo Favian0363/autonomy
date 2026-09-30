@@ -12,16 +12,15 @@ auv_dynlib_path: []const u8,
 mission_id: MissionId,
 live_config_path: []const u8,
 
-pub fn init(p_init: std.process.Init) !MissionArgs {
-    const argsSlice = try p_init.minimal.args.toSlice(p_init.arena.allocator());
-    if (argsSlice.len < 3) {
-        std.log.err("usage: {s} <auv_dynlib_path> <mission_name> <live_config_path>", .{argsSlice[0]});
+pub fn init(args_slice: []const [:0]const u8) !MissionArgs {
+    if (args_slice.len < 3) {
+        std.log.err("usage: {s} <auv_dynlib_path> <mission_name> <live_config_path>", .{args_slice[0]});
         return error.MissingArgs;
     }
 
-    const auv_dynlib_path = argsSlice[1];
-    const mission_name = argsSlice[2];
-    const live_config_path = argsSlice[3];
+    const auv_dynlib_path = args_slice[1];
+    const mission_name = args_slice[2];
+    const live_config_path = args_slice[3];
     const mission_id = std.meta.stringToEnum(MissionId, mission_name) orelse {
         std.log.err("mission_id `{s}` doesn't exist", .{mission_name});
         std.log.info("valids mission_id's are:", .{});

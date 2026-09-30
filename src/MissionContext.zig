@@ -39,8 +39,8 @@ config: ConfigLoader.Config,
 config_loader: ConfigLoader,
 config_watcher: FileWatcher,
 
-pub fn init(gpa: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext {
-    var config_loader: ConfigLoader = try .init(gpa, args.live_config_path);
+pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext {
+    var config_loader: ConfigLoader = try .init(arena, args.live_config_path);
     const config = config_loader.load(io) catch |err| {
         std.log.err("failed to load config: {s}", .{config_loader.config_path});
         return err;
@@ -48,7 +48,7 @@ pub fn init(gpa: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext {
     std.log.debug("succesfully loaded config: {s}", .{config_loader.config_path});
     std.log.debug("{any}", .{config});
 
-    var auv_loader: AuvLoader = try .init(gpa, args.auv_dynlib_path);
+    var auv_loader: AuvLoader = try .init(arena, args.auv_dynlib_path);
     const auv = auv_loader.load(io) catch |err| {
         const dl_err = std.mem.span(std.c.dlerror()) orelse "NO_DL_ERROR";
         std.log.err("dlerror: `{s}`", .{dl_err});
@@ -80,11 +80,11 @@ pub fn init(gpa: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext {
 
         .auv = auv,
         .auv_loader = auv_loader,
-        .auv_watcher = try .init(gpa, args.auv_dynlib_path),
+        .auv_watcher = try .init(arena, args.auv_dynlib_path),
 
         .config = config,
         .config_loader = config_loader,
-        .config_watcher = try .init(gpa, args.live_config_path),
+        .config_watcher = try .init(arena, args.live_config_path),
 
         .io = io,
     };

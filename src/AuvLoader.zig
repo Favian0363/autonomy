@@ -9,8 +9,8 @@ auv_tmp_path: []const u8,
 prev_dynlib: ?std.DynLib,
 use_tmp: bool,
 
-pub fn init(gpa: std.mem.Allocator, auv_path: []const u8) !AuvLoader {
-    const auv_tmp_path = try std.fmt.allocPrintSentinel(gpa, "{s}.tmp", .{auv_path}, 0);
+pub fn init(arena: std.mem.Allocator, auv_path: []const u8) !AuvLoader {
+    const auv_tmp_path = try std.fmt.allocPrintSentinel(arena, "{s}.tmp", .{auv_path}, 0);
     return .{
         .auv_path = auv_path,
         .auv_tmp_path = auv_tmp_path,

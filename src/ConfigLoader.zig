@@ -20,12 +20,12 @@ pub const Config = struct {
     tam: []math.Vector6f,
 };
 
-pub fn init(gpa: std.mem.Allocator, config_path: []const u8) !MissionLoader {
+pub fn init(arena: std.mem.Allocator, config_path: []const u8) !MissionLoader {
     return .{
         .config_path = config_path,
         .use_ping = false,
-        .ping = .init(try gpa.alloc(u8, 4098)),
-        .pong = .init(try gpa.alloc(u8, 4098)),
+        .ping = .init(try arena.alloc(u8, 4098)),
+        .pong = .init(try arena.alloc(u8, 4098)),
         .reader_buf = undefined,
     };
 }
