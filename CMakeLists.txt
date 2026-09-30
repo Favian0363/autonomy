@@ -33,14 +33,35 @@ target_include_directories(auv_hydrus_sim PRIVATE
   "${STONEFISH_DIR}/include/Stonefish"
 )
 
+target_compile_definitions(auv_hydrus_sim PRIVATE
+  _GNU_SOURCE
+  BT_EULER_DEFAULT_ZYX
+  BT_USE_DOUBLE_PRECISION
+  SHADER_DIR_PATH="${STONEFISH_DIR}/share/Stonefish/shaders/"
+)
+
+target_compile_options(auv_hydrus_sim PRIVATE
+  -fopenmp
+)
+
 target_link_directories(auv_hydrus_sim PRIVATE
   "${STONEFISH_DIR}/lib"
 )
 
 target_link_libraries(auv_hydrus_sim PRIVATE
   Stonefish
+  SDL2
+  freetype
+  OpenGL
+  GLX
+  GLU
+  gomp
+)
+
+set_target_properties(auv_hydrus_sim PROPERTIES
+  BUILD_RPATH "${STONEFISH_DIR}/lib"
 )
 
 install(
-    TARGETS auv_hydrus_sim
+  TARGETS auv_hydrus_sim
 )

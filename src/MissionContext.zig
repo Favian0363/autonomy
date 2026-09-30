@@ -50,6 +50,8 @@ pub fn init(gpa: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext {
 
     var auv_loader: AuvLoader = try .init(gpa, args.auv_dynlib_path);
     const auv = auv_loader.load(io) catch |err| {
+        const dl_err = std.mem.span(std.c.dlerror()) orelse "NO_DL_ERROR";
+        std.log.err("dlerror: `{s}`", .{dl_err});
         std.log.err("failed to load auv: {s}", .{auv_loader.auv_path});
         return err;
     };
