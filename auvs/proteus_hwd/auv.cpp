@@ -9,6 +9,8 @@
 //AUV_ZED_SVO         recording to replay instead of the live camera
 //AUV_ZED_RESOLUTION  HD720 (default), HD1080, HD2K, VGA
 //AUV_ZED_FPS         30
+//AUV_ZED_DEPTH       NEURAL (default), NEURAL_LIGHT, NEURAL_PLUS
+//AUV_ZED_AREA_MEMORY 1 (default) or 0 to disable tracking area memory
 //AUV_LOG_CLS         1 to print model labels and their mapped classes
 //AUV_ZED_METRICS     1 to print per frame timing rows on stderr
 
@@ -38,9 +40,12 @@ struct Config {
   const char *onnx;
   const char *svo;
   sl::RESOLUTION resolution;
+  sl::DEPTH_MODE depth_mode;
+  const char *depth_name;
   int fps;
   bool log_classes;
   bool metrics;
+  bool area_memory;
   std::vector<ClassMapping> classes;
 };
 
@@ -85,16 +90,17 @@ void auv_init(void) {
     sl::InitParameters params;
     params.coordinate_units = sl::UNIT::METER;
     params.coordinate_system = sl::COORDINATE_SYSTEM::RIGHT_HANDED_Z_UP_X_FWD;
-    params.depth_mode = sl::DEPTH_MODE::NEURAL;
+    params.depth_mode = config.depth_mode;
     params.camera_resolution = config.resolution;
     params.camera_fps = config.fps;
     params.sdk_gpu_id = 0;
     if (*config.svo) params.input.setFromSVOFile(config.svo);
 
+    std::fprintf(stderr, "[zed] depth=%s area_memory=%d\n", config.depth_name, config.area_memory ? 1 : 0);
     check(zed.open(params), "open camera");
     zed_open = true;
     sl::PositionalTrackingParameters tracking;
-    tracking.enable_area_memory = true;
+    tracking.enable_area_memory = config.area_memory;
     check(zed.enablePositionalTracking(tracking), "enable positional tracking");
 
     if (*config.onnx) {
@@ -210,8 +216,8 @@ static int parse_nonnegative(std::string_view text) {
   return value;
 }
 
-static bool env_flag(const char *name) {
-  const std::string_view value = env_or(name, "0");
+static bool env_flag(const char *name, const char *fallback = "0") {
+  const std::string_view value = env_or(name, fallback);
   if (value != "0" && value != "1")
     throw std::runtime_error("boolean environment settings must be 0 or 1");
   return value == "1";
@@ -238,6 +244,16 @@ static Config load_config() {
   else if (resolution == "HD2K") config.resolution = sl::RESOLUTION::HD2K;
   else if (resolution == "VGA") config.resolution = sl::RESOLUTION::VGA;
   else throw std::runtime_error("unknown AUV_ZED_RESOLUTION");
+
+  config.depth_name = env_or("AUV_ZED_DEPTH", "NEURAL");
+  const std::string_view depth = config.depth_name;
+  if (depth == "NEURAL") config.depth_mode = sl::DEPTH_MODE::NEURAL;
+  else if (depth == "NEURAL_PLUS") config.depth_mode = sl::DEPTH_MODE::NEURAL_PLUS;
+#if defined(ZED_SDK_MAJOR_VERSION) && ZED_SDK_MAJOR_VERSION >= 5
+  else if (depth == "NEURAL_LIGHT") config.depth_mode = sl::DEPTH_MODE::NEURAL_LIGHT;
+#endif
+  else throw std::runtime_error("unknown AUV_ZED_DEPTH");
+  config.area_memory = env_flag("AUV_ZED_AREA_MEMORY", "1");
 
   if (*config.onnx) check_file(config.onnx);
   if (*config.svo) check_file(config.svo);
