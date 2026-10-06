@@ -90,8 +90,16 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
     };
 }
 
+/// Invalidates `seen_objects`
+pub fn reset(ctx: *MissionContext) void {
+    ctx.seen_objects_len = 0;
+    ctx.pid_sum_err = @splat(0);
+    ctx.pid_prev_pose_err = @splat(0);
+    ctx.pid_prev_timestamp_ns = null;
+}
+
 const linux = std.os.linux;
-pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) void {
+pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     var start: linux.timespec = undefined;
     var end: linux.timespec = undefined;
 
@@ -142,6 +150,7 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) void {
             std.log.debug("{any}", .{auv});
             ctx.auv = auv;
             std.log.debug("restarted auv loop", .{});
+            return error.RestartMission;
         } else |err| {
             std.log.err("failed to reload auv: {s}/{s}", .{ ctx.auv_watcher.dir, ctx.auv_watcher.name });
             std.log.err("{s}", .{@errorName(err)});
@@ -338,7 +347,7 @@ fn pidStep(ctx: *MissionContext) void {
     ctx.pid_prev_pose_err = pose_err;
 }
 
-fn yieldUntilObjectWithCls(ctx: *MissionContext, clss: []const Auv.ObjectCls, start: usize) *const Auv.Object {
+fn yieldUntilObjectWithCls(ctx: *MissionContext, clss: []const Auv.ObjectCls, start: usize) !*const Auv.Object {
     var seen = start;
 
     while (true) {
@@ -351,23 +360,23 @@ fn yieldUntilObjectWithCls(ctx: *MissionContext, clss: []const Auv.ObjectCls, st
             seen += 1;
         }
 
-        ctx.yieldUntilNextFrameAndUpdate();
+        try ctx.yieldUntilNextFrameAndUpdate();
     }
 }
 
 /// yield until getting first object with any of the `cls` in `clss`
-pub fn yieldUntilFirstObjectWithAnyCls(ctx: *MissionContext, clss: []const Auv.ObjectCls) *const Auv.Object {
-    return yieldUntilObjectWithCls(ctx, clss, 0);
+pub fn yieldUntilFirstObjectWithAnyCls(ctx: *MissionContext, clss: []const Auv.ObjectCls) !*const Auv.Object {
+    return try yieldUntilObjectWithCls(ctx, clss, 0);
 }
 
 /// yield until getting first object wit `cls`
-pub fn yieldUntilFirstObjectWithCls(ctx: *MissionContext, cls: Auv.ObjectCls) *const Auv.Object {
-    return yieldUntilFirstObjectWithAnyCls(ctx, &.{cls});
+pub fn yieldUntilFirstObjectWithCls(ctx: *MissionContext, cls: Auv.ObjectCls) !*const Auv.Object {
+    return try yieldUntilFirstObjectWithAnyCls(ctx, &.{cls});
 }
 
 /// yield until getting next object with any of the `cls` in `clss` (ignoring any seen before)
-pub fn yieldUntilNewObjectWithAnyCls(ctx: *MissionContext, clss: []const Auv.ObjectCls) *const Auv.Object {
-    return yieldUntilObjectWithCls(ctx, clss, ctx.seen_objects_len);
+pub fn yieldUntilNewObjectWithAnyCls(ctx: *MissionContext, clss: []const Auv.ObjectCls) !*const Auv.Object {
+    return try yieldUntilObjectWithCls(ctx, clss, ctx.seen_objects_len);
 }
 
 /// yield until getting next object wit `cls` (ignoring any seen before)
@@ -376,7 +385,7 @@ pub fn yieldUntilNewObjectWithCls(ctx: *MissionContext, cls: Auv.ObjectCls) *con
 }
 
 /// yield until at `ctx.frame.camera_pose.pos` is at `goal_threshold` distance from `goal_pos`
-pub fn yieldUntilReachGoal(ctx: *MissionContext, goal_pos: math.Vector3f) void {
+pub fn yieldUntilReachGoal(ctx: *MissionContext, goal_pos: math.Vector3f) !void {
     ctx.goal[0] = goal_pos[0];
     ctx.goal[1] = goal_pos[1];
     ctx.goal[2] = goal_pos[2];
@@ -388,6 +397,6 @@ pub fn yieldUntilReachGoal(ctx: *MissionContext, goal_pos: math.Vector3f) void {
             break;
         }
 
-        ctx.yieldUntilNextFrameAndUpdate();
+        try ctx.yieldUntilNextFrameAndUpdate();
     }
 }

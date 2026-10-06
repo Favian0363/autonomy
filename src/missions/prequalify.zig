@@ -4,18 +4,18 @@ const MissionContext = @import("../MissionContext.zig");
 const MissionArgs = @import("../MissionArgs.zig");
 const Auv = @import("../Auv.zig");
 
-pub fn mission(ctx: *MissionContext) void {
-    const gate_object = ctx.yieldUntilFirstObjectWithCls(.gate);
-    goThrough(ctx, gate_object);
+pub fn mission(ctx: *MissionContext) !void {
+    const gate_object = try ctx.yieldUntilFirstObjectWithCls(.gate);
+    try goThrough(ctx, gate_object);
 
-    const cube_or_rect_object = ctx.yieldUntilFirstObjectWithAnyCls(&.{.cube, .rect});
-    goAround(ctx, cube_or_rect_object);
+    const cube_or_rect_object = try ctx.yieldUntilFirstObjectWithAnyCls(&.{.cube, .rect});
+    try goAround(ctx, cube_or_rect_object);
 }
 
 const FAR_ENOUGH: f64 = 2.0;
 const OVERSHOOT: f64 = 2.0;
 
-fn goThrough(ctx: *MissionContext, object: *const Auv.Object) void {
+fn goThrough(ctx: *MissionContext, object: *const Auv.Object) !void {
     const sub_pose = ctx.frame.camera_pose;
 
     const object_pos = object.bbox.pose.pos;
@@ -31,15 +31,15 @@ fn goThrough(ctx: *MissionContext, object: *const Auv.Object) void {
     std.log.info("before sub_pos {any}", .{sub_pos_2d});
     std.log.info("before {any}", .{before});
 
-    ctx.yieldUntilReachGoal(before);
+    try ctx.yieldUntilReachGoal(before);
 
     const overshoot_2d = object_pos_2d + direction_2d * @as(math.Vector2f, @splat(OVERSHOOT));
     const overshoot: math.Vector3f = .{overshoot_2d[0], overshoot_2d[1], object_pos[2]};
 
-    ctx.yieldUntilReachGoal(overshoot);
+    try ctx.yieldUntilReachGoal(overshoot);
 }
 
-fn goAround(ctx: *MissionContext, object: *const Auv.Object) void {
+fn goAround(ctx: *MissionContext, object: *const Auv.Object) !void {
     const object_pos = object.bbox.pose.pos;
     const object_rot = object.bbox.pose.quat;
 
@@ -80,7 +80,7 @@ fn goAround(ctx: *MissionContext, object: *const Auv.Object) void {
     }
 
     for (0..corner_pluss.len) |i| {
-        ctx.yieldUntilReachGoal(corner_pluss[(starting_i + i) % corner_pluss.len]);
+        try ctx.yieldUntilReachGoal(corner_pluss[(starting_i + i) % corner_pluss.len]);
     }
-    ctx.yieldUntilReachGoal(initial_sub_pos);
+    try ctx.yieldUntilReachGoal(initial_sub_pos);
 }
