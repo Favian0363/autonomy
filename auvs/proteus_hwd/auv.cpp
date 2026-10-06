@@ -119,7 +119,7 @@ void auv_init(void) {
       std::fputs("[zed] pose-only mode: AUV_ZED_ONNX is not configured\n", stderr);
     }
     if (config.metrics)
-      std::fputs("zed_frame,timestamp_ns,sdk_ns,conversion_ns,retries,objects\n", stderr);
+      std::fputs("zed_frame,timestamp_ns,sdk_ns,conversion_ns,retries,objects,enter_ns\n", stderr);
   } catch (const std::exception &error) {
     fail(error.what());
   } catch (...) {
@@ -171,10 +171,12 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
     }
     *frame = next;
     last_timestamp = next.timestamp;
+    // enter_ns is the monotonic time this call started, so the gap between calls
+    // shows how long the mission loop spent outside the camera code
     if (config.metrics)
-      std::fprintf(stderr, "zed_frame,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u\n",
+      std::fprintf(stderr, "zed_frame,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%" PRIu64 "\n",
                     next.timestamp, sdk_done - started, now_ns() - sdk_done,
-                    retries, static_cast<unsigned>(next.objects_len));
+                    retries, static_cast<unsigned>(next.objects_len), started);
   } catch (const std::exception &error) {
     fail(error.what());
   } catch (...) {

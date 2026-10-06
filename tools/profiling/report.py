@@ -31,8 +31,10 @@ def load_frames(path):
     frames = []
     for line in open(path, errors="ignore"):
         p = line.strip().split(",")
-        if len(p) == 6 and p[0] == "zed_frame" and p[1].isdigit():
-            frames.append((int(p[1]) / 1e9, int(p[2]) / 1e6, int(p[5])))
+        # timestamp_ns, sdk_ns, conversion_ns, retries, objects[, enter_ns]
+        if len(p) in (6, 7) and p[0] == "zed_frame" and p[1].isdigit():
+            enter = int(p[6]) / 1e9 if len(p) == 7 else None
+            frames.append((int(p[1]) / 1e9, int(p[2]) / 1e6, int(p[5]), int(p[3]) / 1e6, enter))
     return frames
 
 
@@ -81,6 +83,9 @@ def analyze(run):
     stalls = [(i, d) for i, d in enumerate(dt) if d > STALL_MS]
     stall_times = [ts[i + 1] for i, _ in stalls]
     gaps = [b - a for a, b in zip(stall_times, stall_times[1:])]
+    # time the mission loop spent between camera calls (needs the enter_ns column)
+    runner = ([(b[4] - a[4]) * 1000 - a[1] - a[3] for a, b in zip(steady, steady[1:])]
+              if steady[0][4] is not None else [])
     tegra = [s for s in load_tegra(os.path.join(run, "tegra.log")) if ts[0] <= s["t"] <= ts[-1]]
     first = [s for s in tegra if s["t"] < ts[0] + 60]
     last = [s for s in tegra if s["t"] > ts[-1] - 60]
@@ -98,7 +103,10 @@ def analyze(run):
         "stall_median_ms": st.median(d for _, d in stalls) if stalls else NAN,
         "frames_lost": sum(max(0, round(d / nominal) - 1) for _, d in stalls),
         "stall_in_sdk_%": 100 * mean(min(1, steady[i + 1][1] / d) for i, d in stalls) if stalls else NAN,
+        "stall_in_runner_%": 100 * mean(min(1, max(0, runner[i]) / d) for i, d in stalls) if stalls and runner else NAN,
         "sdk_p99_ms": pct([f[1] for f in steady], 99),
+        "runner_p99_ms": pct(runner, 99),
+        "runner_max_ms": max(runner, default=NAN),
         "objects": mean(f[2] for f in steady),
         "tegra_samples": len(tegra),
         "gpu_mean_%": mean(col(tegra, "gpu")),
@@ -150,7 +158,7 @@ def compare(root):
 
     print(f"== per run (first {WARMUP_S:.0f}s of each run excluded; stall = frame interval > {STALL_MS:.0f} ms)")
     table(results, ["run", "minutes", "fps", "p50_ms", "p99_ms", "p99.9_ms", "max_ms", "stalls_per_min",
-                    "stall_every_s", "frames_lost", "stall_in_sdk_%", "gpu_mean_%", "gpu_p95_%", "cpu_mean_%",
+                    "stall_every_s", "frames_lost", "stall_in_sdk_%", "stall_in_runner_%", "runner_max_ms", "gpu_mean_%", "gpu_p95_%", "cpu_mean_%",
                     "ram_max_mb", "ram_growth_mb", "power_mean_w", "temp_max_c", "objects"])
 
     configs = list(dict.fromkeys(r["config"] for r in results))
