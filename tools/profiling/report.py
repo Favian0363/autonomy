@@ -39,7 +39,13 @@ def load_log(path):
     """Rows of a driver metrics log as dicts keyed by header name, plus clock info and error events."""
     header, rows, clock, errors = OLD_HEADER, [], None, {}
     for line in open(path, errors="ignore"):
-        p = line.strip().split(",")
+        # Other output on stderr can share a line with ours: the mission runner writes a
+        # clear-screen escape with no newline every 120 frames, which glued itself to the
+        # start of the next zed_frame line and made those frames look dropped.
+        start = line.find("zed_")
+        if start < 0:
+            continue
+        p = line[start:].strip().split(",")
         if p[0] == "zed_clock" and len(p) == 4:
             clock = (p[1], int(p[2]), int(p[3]))
         elif p[0] == "zed_error" and len(p) >= 4:

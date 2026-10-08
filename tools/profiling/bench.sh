@@ -83,7 +83,7 @@ else
 fi
 
 kill $tegra_pid 2>/dev/null || true
-frames=$(grep -c '^zed_frame,[0-9]' "$out/zed.log" || true)
+frames=$(grep -c 'zed_frame,[0-9]' "$out/zed.log" || true)
 echo "[bench] $(date +%H:%M:%S) $name: $frames frames recorded -> $out"
 if [ "$frames" -eq 0 ]; then
   echo "[bench] no frames; first errors:" >&2
