@@ -9,13 +9,14 @@ env: WARMUP_S     seconds excluded at the start of each run (default 30)
      BIN_S        timeline bin width in seconds (default 60)
      DEADLINE_MS  mission loop budget; longer loop periods count as deadline misses (default 100)
      MIN_RATE_HZ  minimum effective system rate the KPI must meet at p99 (default 10)
-A stall is a frame interval above STALL_MS. Stalls in the warm-up are excluded too.
+A stall is a frame interval above STALL_FACTOR x the run's median interval (50 ms at 30 FPS,
+25 ms at 60 FPS), so one missed frame counts at any frame rate. Warm-up stalls are excluded.
 Columns are read by name from the zed_frame header, so logs from older driver versions
 still work; KPIs that need newer columns are reported as "-".
 """
 import csv, math, os, re, statistics as st, sys, time
 
-STALL_MS = 50.0
+STALL_FACTOR = 1.5
 WARMUP_S = float(os.environ.get("WARMUP_S", 30))
 BIN_S = float(os.environ.get("BIN_S", 60))
 DEADLINE_MS = float(os.environ.get("DEADLINE_MS", 100))
@@ -154,7 +155,7 @@ def analyze(run):
         return None
     span = ts[-1] - ts[0]
     nominal = pct(dt, 50)
-    stalls = [(i, d) for i, d in enumerate(dt) if d > STALL_MS]
+    stalls = [(i, d) for i, d in enumerate(dt) if d > STALL_FACTOR * nominal]
     stall_times = [ts[i + 1] for i, _ in stalls]
     gaps = [b - a for a, b in zip(stall_times, stall_times[1:])]
     # time the mission loop spent between camera calls (needs the enter_ns column)
@@ -234,7 +235,7 @@ def compare(root):
     if not results:
         sys.exit(f"no runs found in {root}")
 
-    print(f"== per run (first {WARMUP_S:.0f}s of each run excluded; stall = frame interval > {STALL_MS:.0f} ms)")
+    print(f"== per run (first {WARMUP_S:.0f}s of each run excluded; stall = frame interval > {STALL_FACTOR}x the median)")
     table(results, ["run", "minutes", "fps", "p50_ms", "p99_ms", "p99.9_ms", "max_ms", "stalls_per_min",
                     "stall_every_s", "frames_lost", "stall_in_sdk_%", "stall_in_runner_%", "runner_max_ms", "gpu_mean_%", "gpu_p95_%", "cpu_mean_%",
                     "ram_max_mb", "ram_growth_mb", "power_mean_w", "temp_max_c", "objects"])
@@ -289,6 +290,8 @@ def timeline(run):
         sys.exit(f"no usable frames in {run}")
     tegra = load_tegra(os.path.join(run, "tegra.log"))
     t0 = frames[0][0]
+    all_ts = [f[0] for f in frames]
+    threshold = STALL_FACTOR * pct([(b - a) * 1000 for a, b in zip(all_ts, all_ts[1:])], 50)
     rows = []
     for b in range(int((frames[-1][0] - t0) // BIN_S) + 1):
         lo, hi = t0 + b * BIN_S, t0 + (b + 1) * BIN_S
@@ -298,7 +301,7 @@ def timeline(run):
         if len(dt) < 2:
             continue
         rows.append({"start_min": f"{b * BIN_S / 60:.1f}", "fps": len(dt) / (ts[-1] - ts[0]),
-                     "p99_ms": pct(dt, 99), "max_ms": max(dt), "stalls": sum(d > STALL_MS for d in dt),
+                     "p99_ms": pct(dt, 99), "max_ms": max(dt), "stalls": sum(d > threshold for d in dt),
                      "gpu_mean_%": mean(col(tg, "gpu")), "cpu_mean_%": mean(col(tg, "cpu")),
                      "ram_mb": mean(col(tg, "ram")), "power_w": mean(col(tg, "power")),
                      "temp_max_c": max(col(tg, "temp"), default=NAN)})
