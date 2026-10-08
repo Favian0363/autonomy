@@ -39,6 +39,13 @@ if command -v lsusb >/dev/null && ! lsusb | grep -qi '2b03:'; then
 fi
 mkdir -p "$out"
 
+# a remote desktop session costs CPU/GPU for screen capture and encoding, so it is recorded
+# with every run and flagged; disconnect NoMachine/VNC for runs that will be compared
+remote_desktop=$(pgrep -l '^(nxnode.bin|x11vnc)$' | awk '{print $2}' | sort -u | paste -sd, - || true)
+if [ -n "$remote_desktop" ]; then
+  echo "[bench] warning: remote desktop running ($remote_desktop); results include its load" >&2
+fi
+
 sdk_version=$(grep -h -E 'define ZED_SDK_(MAJOR|MINOR|PATCH)_VERSION' /usr/local/zed/include/sl/*.hpp 2>/dev/null \
   | awk '{print $3}' | paste -sd. - || true)
 {
@@ -48,6 +55,7 @@ sdk_version=$(grep -h -E 'define ZED_SDK_(MAJOR|MINOR|PATCH)_VERSION' /usr/local
   echo "l4t: $(head -1 /etc/nv_tegra_release 2>/dev/null || echo unknown)"
   echo "zed_sdk: ${sdk_version:-unknown}"
   echo "power_mode: $(nvpmodel -q 2>/dev/null | head -1 || echo unknown)"
+  echo "remote_desktop: ${remote_desktop:-none}"
   echo "duration_s: $duration"
   echo "settings: $*"
   echo "program: ${checker:-src_3 mission runner}"

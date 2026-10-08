@@ -5,15 +5,22 @@ usage:
   python3 tools/profiling/report.py [runs-dir]        per-run table, per-config summary, summary.csv
   python3 tools/profiling/report.py --timeline <run>  per-minute timeline of one run
 
-env: WARMUP_S  seconds excluded at the start of each run (default 30)
-     BIN_S     timeline bin width in seconds (default 60)
+env: WARMUP_S     seconds excluded at the start of each run (default 30)
+     BIN_S        timeline bin width in seconds (default 60)
+     DEADLINE_MS  mission loop budget; longer loop periods count as deadline misses (default 100)
+     MIN_RATE_HZ  minimum effective system rate the KPI must meet at p99 (default 10)
 A stall is a frame interval above STALL_MS. Stalls in the warm-up are excluded too.
+Columns are read by name from the zed_frame header, so logs from older driver versions
+still work; KPIs that need newer columns are reported as "-".
 """
 import csv, math, os, re, statistics as st, sys, time
 
 STALL_MS = 50.0
 WARMUP_S = float(os.environ.get("WARMUP_S", 30))
 BIN_S = float(os.environ.get("BIN_S", 60))
+DEADLINE_MS = float(os.environ.get("DEADLINE_MS", 100))
+MIN_RATE_HZ = float(os.environ.get("MIN_RATE_HZ", 10))
+OLD_HEADER = ["timestamp_ns", "sdk_ns", "conversion_ns", "retries", "objects", "enter_ns"]
 NAN = float("nan")
 
 
@@ -27,15 +34,82 @@ def mean(xs):
     return st.mean(xs) if xs else NAN
 
 
-def load_frames(path):
-    frames = []
+def load_log(path):
+    """Rows of a driver metrics log as dicts keyed by header name, plus clock info and error events."""
+    header, rows, clock, errors = OLD_HEADER, [], None, {}
     for line in open(path, errors="ignore"):
         p = line.strip().split(",")
-        # timestamp_ns, sdk_ns, conversion_ns, retries, objects[, enter_ns]
-        if len(p) in (6, 7) and p[0] == "zed_frame" and p[1].isdigit():
-            enter = int(p[6]) / 1e9 if len(p) == 7 else None
-            frames.append((int(p[1]) / 1e9, int(p[2]) / 1e6, int(p[5]), int(p[3]) / 1e6, enter))
-    return frames
+        if p[0] == "zed_clock" and len(p) == 4:
+            clock = (p[1], int(p[2]), int(p[3]))
+        elif p[0] == "zed_error" and len(p) >= 4:
+            key = f"{p[2]}:{','.join(p[3:])}"
+            errors[key] = errors.get(key, 0) + 1
+        elif p[0] == "zed_frame" and len(p) > 1 and not p[1].isdigit():
+            header = p[1:]
+        elif p[0] == "zed_frame" and len(p) > 1 and p[1].isdigit():
+            values = p[1:]
+            if len(values) <= len(header):
+                rows.append(dict(zip(header, (int(v) for v in values))))
+    return rows, clock, errors
+
+
+def sdk_to_wall_s(ns, clock):
+    """SDK timestamps are wall clock unless the driver logged a MONOTONIC zed_clock reference."""
+    if clock and clock[0] == "MONOTONIC":
+        return (ns - clock[1] + clock[2]) / 1e9
+    return ns / 1e9
+
+
+def sdk_to_mono_ns(ns, clock):
+    """SDK timestamp on the monotonic clock used by enter_ns/exit_ns; None if it cannot be known."""
+    if not clock:
+        return None
+    return ns if clock[0] == "MONOTONIC" else ns - clock[2] + clock[1]
+
+
+def load_frames(path):
+    rows, clock, _ = load_log(path)
+    return [(sdk_to_wall_s(r["timestamp_ns"], clock), r["sdk_ns"] / 1e6, r.get("objects", 0),
+             r.get("conversion_ns", 0) / 1e6, r["enter_ns"] / 1e9 if "enter_ns" in r else None)
+            for r in rows if "timestamp_ns" in r and "sdk_ns" in r]
+
+
+def kpi_stats(run, steady_start):
+    """Cesar's KPIs: effective rate, data age, loop determinism, errors. Needs the newer driver columns."""
+    rows, clock, errors = load_log(os.path.join(run, "zed.log"))
+    out = {"errors": errors}
+    if not rows or "exit_ns" not in rows[0]:
+        return out
+    rows = [r for r in rows if sdk_to_wall_s(r["timestamp_ns"], clock) >= steady_start] or rows
+    span_s = (rows[-1]["exit_ns"] - rows[0]["exit_ns"]) / 1e9
+    period = [(b["enter_ns"] - a["enter_ns"]) / 1e6 for a, b in zip(rows, rows[1:])]
+    out.update({
+        "loop_p50_ms": pct(period, 50), "loop_p99_ms": pct(period, 99), "loop_max_ms": max(period, default=NAN),
+        "deadline_miss": sum(p > DEADLINE_MS for p in period),
+        "grab_fail": sum(r["grab_fail"] for r in rows), "track_bad": sum(r["track_bad"] for r in rows),
+    })
+    age = lambda key: [(r["exit_ns"] - sdk_to_mono_ns(r[key], clock)) / 1e6 for r in rows
+                       if r[key] and sdk_to_mono_ns(r[key], clock) is not None]
+    img_age, pose_age = age("timestamp_ns"), age("pose_ns")
+    out.update({"img_age_p50_ms": pct(img_age, 50), "img_age_p99_ms": pct(img_age, 99),
+                "pose_age_p99_ms": pct(pose_age, 99),
+                "pose_stale_%": 100 * mean(r["pose_ns"] != r["timestamp_ns"] for r in rows)})
+    detection = [r for r in rows if r["objects_ns"]]
+    if detection:
+        new = [r["objects_ns"] for r in detection if r["objects_new"]]
+        gaps = [(b - a) / 1e6 for a, b in zip(new, new[1:])]
+        det_age = age("objects_ns")
+        out.update({"det_rate_hz": len(new) / span_s if span_s else NAN,
+                    "det_gap_p99_ms": pct(gaps, 99), "det_gap_max_ms": max(gaps, default=NAN),
+                    "det_age_p50_ms": pct(det_age, 50), "det_age_p99_ms": pct(det_age, 99)})
+        slowest_gap = out["det_gap_p99_ms"]
+    else:
+        slowest_gap = out["loop_p99_ms"]
+    # KPI 1: rate of the slowest output the mission depends on, judged at p99 rather than on average
+    out["eff_rate_p99_hz"] = 1000 / slowest_gap if slowest_gap and not math.isnan(slowest_gap) else NAN
+    out["kpi_min_rate"] = ("PASS" if out["eff_rate_p99_hz"] >= MIN_RATE_HZ else "FAIL") \
+        if not math.isnan(out["eff_rate_p99_hz"]) else "-"
+    return out
 
 
 def load_tegra(path):
@@ -89,7 +163,9 @@ def analyze(run):
     tegra = [s for s in load_tegra(os.path.join(run, "tegra.log")) if ts[0] <= s["t"] <= ts[-1]]
     first = [s for s in tegra if s["t"] < ts[0] + 60]
     last = [s for s in tegra if s["t"] > ts[-1] - 60]
+    kpi = kpi_stats(run, ts[0])
     return {
+        **kpi,
         "frames": len(steady),
         "minutes": span / 60,
         "fps": len(dt) / span,
@@ -161,15 +237,25 @@ def compare(root):
                     "stall_every_s", "frames_lost", "stall_in_sdk_%", "stall_in_runner_%", "runner_max_ms", "gpu_mean_%", "gpu_p95_%", "cpu_mean_%",
                     "ram_max_mb", "ram_growth_mb", "power_mean_w", "temp_max_c", "objects"])
 
+    print(f"\n== KPIs (deadline {DEADLINE_MS:.0f} ms, minimum effective rate {MIN_RATE_HZ:.0f} Hz at p99; "
+          f"ages are capture -> handed to the mission)")
+    table(results, ["run", "eff_rate_p99_hz", "kpi_min_rate", "loop_p50_ms", "loop_p99_ms", "loop_max_ms",
+                    "deadline_miss", "img_age_p50_ms", "img_age_p99_ms", "pose_age_p99_ms", "pose_stale_%",
+                    "det_rate_hz", "det_gap_p99_ms", "det_age_p99_ms", "grab_fail", "track_bad"])
+    for r in results:
+        if r.get("errors"):
+            print(f"  {r['run']} error events: " + ", ".join(f"{k} x{v}" for k, v in sorted(r["errors"].items())))
+
     configs = list(dict.fromkeys(r["config"] for r in results))
-    keys = ["fps", "p99_ms", "p99.9_ms", "stalls_per_min", "frames_lost", "gpu_mean_%", "gpu_p95_%",
+    keys = ["fps", "p99_ms", "p99.9_ms", "stalls_per_min", "frames_lost", "eff_rate_p99_hz", "loop_p99_ms",
+            "deadline_miss", "img_age_p99_ms", "det_rate_hz", "det_age_p99_ms", "gpu_mean_%", "gpu_p95_%",
             "cpu_mean_%", "ram_max_mb", "power_mean_w", "temp_max_c"]
     summary = []
     for c in configs:
         group = [r for r in results if r["config"] == c]
         row = {"config": c, "n": len(group)}
         for k in keys:
-            vals = [r[k] for r in group if not math.isnan(r[k])]
+            vals = [r[k] for r in group if isinstance(r.get(k), (int, float)) and not math.isnan(r[k])]
             row[k] = (f"{fmt(st.mean(vals))}±{fmt(st.stdev(vals))}" if len(vals) > 1
                       else fmt(vals[0]) if vals else "-")
         summary.append(row)
@@ -190,7 +276,8 @@ def compare(root):
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for r in results for k in r)))
         w.writeheader()
-        w.writerows(results)
+        w.writerows({k: "; ".join(f"{e} x{n}" for e, n in v.items()) if isinstance(v, dict) else v
+                     for k, v in r.items()} for r in results)
     print(f"\nwrote {out}")
 
 
