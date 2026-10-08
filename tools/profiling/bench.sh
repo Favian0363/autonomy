@@ -28,7 +28,7 @@ duration=${DURATION:-300}
 [ -e "$out" ] && { echo "refusing to overwrite $out" >&2; exit 1; }
 
 # the ZED can only be opened by one program, and other ZED tools would skew the measurements
-if others=$(pgrep -l '^(ZED_|ZEDfu|src_3$|camera_check$)'); then
+if others=$(pgrep -l '^(ZED_|ZEDfu|src_3$|camera_check$|plugin_loop$)'); then
   echo "[bench] another ZED program is running, not starting $name:" >&2
   echo "$others" >&2
   exit 1
