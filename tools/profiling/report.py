@@ -217,6 +217,8 @@ def table(rows, cols):
 
 
 def compare(root):
+    if not os.path.isdir(root):
+        sys.exit(f"no runs directory {root} (did the benchmark start? check the bench.sh output)")
     results = []
     for name in sorted(os.listdir(root)):
         run = os.path.join(root, name)

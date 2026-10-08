@@ -33,8 +33,12 @@ if others=$(pgrep -l '^(ZED_|ZEDfu|src_3$|camera_check$)'); then
   echo "$others" >&2
   exit 1
 fi
-if command -v lsusb >/dev/null && ! lsusb | grep -qi '2b03:'; then
-  echo "[bench] no ZED camera on USB (lsusb shows no 2b03 device), not starting $name" >&2
+# a ZED 2i shows up on USB (Stereolabs vendor id 2b03); ZED X cameras are on GMSL and
+# show up as zedx video devices once the ZED Link driver has bound them
+zed_on_usb() { command -v lsusb >/dev/null && lsusb | grep -qi '2b03:'; }
+zed_on_gmsl() { grep -qsi 'zedx' /sys/class/video4linux/video*/name; }
+if ! zed_on_usb && ! zed_on_gmsl; then
+  echo "[bench] no ZED camera found (no Stereolabs USB device, no GMSL zedx video device), not starting $name" >&2
   exit 1
 fi
 mkdir -p "$out"
