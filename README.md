@@ -10,7 +10,7 @@ zig build run -- \
 
 ```sh
 zig build -Dstonefish run -- \
-    ./zig-out/lib/libauv_hydrus_sim.so  \
+    ./zig-out/lib/libauv_stonefish_sim.so  \
     prequalify \
-    ./auvs/hydrus_sim/auv.json
+    ./auvs/stonefish_sim/auv.json
 ```

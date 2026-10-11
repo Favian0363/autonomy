@@ -26,20 +26,20 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <optional>
-#include <print>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 
-static std::filesystem::path dataPath = "auvs/hydrus_sim/data/";
+static std::filesystem::path dataPath = "auvs/stonefish_sim/data/";
 static std::string scenario_file = "scenarios/hydrus_env.scn";
 static constexpr sf::Scalar kStepsPerSecond = 360.0;
 static constexpr sf::Scalar kPhysicsDt = sf::Scalar(1) / kStepsPerSecond;
-static constexpr sf::Scalar kRealtimeFactorCap = 8.0;
-static constexpr sf::Scalar kTrackingOkSeconds = 1.0;
+static constexpr sf::Scalar kRealtimeFactorCap = 1.0;
+static constexpr sf::Scalar kTrackingOkSeconds = 1000.0;
 static constexpr auto kMinRenderInterval = std::chrono::milliseconds(16);
 static constexpr bool kConsoleApp = false;
 
@@ -218,19 +218,19 @@ protected:
 
         if(cls == nullptr || *cls == '\0')
         {
-            std::println(stderr, "[hydrus_sim] static object '{}' is missing a cls tag", display_name);
+            std::cerr << "[stonefish_sim] static object '" << display_name << "' is missing a cls tag\n";
             return false;
         }
 
         const auto mapped = ParseObjectClass(cls);
         if(!mapped)
         {
-            std::println(stderr, "[hydrus_sim] static object '{}' has unknown cls '{}'", display_name, cls);
+            std::cerr << "[stonefish_sim] static object '" << display_name << "' has unknown cls '" << cls << "'\n";
             return false;
         }
         if(name == nullptr)
         {
-            std::println(stderr, "[hydrus_sim] static object with cls '{}' is missing a name", cls);
+            std::cerr << "[stonefish_sim] static object with cls '" << cls << "' is missing a name\n";
             return false;
         }
 
@@ -253,7 +253,7 @@ public:
         AuvScenarioParser parser(this);
         if(!parser.Parse(scenarioPath.string()))
         {
-            std::println(stderr, "Failed to parse scenario {}", scenarioPath.string());
+            std::cerr << "Failed to parse scenario " << scenarioPath.string() << '\n';
             return;
         }
         const auto objectClasses = std::move(parser.objectClasses);
@@ -306,7 +306,7 @@ public:
         sf::Robot* robot = getRobot(0u);
         if(robot == nullptr)
         {
-            std::println(stdout, "[hydrus_sim] no robot in scenario; thrusters will not run");
+            std::cout << "[stonefish_sim] no robot in scenario; thrusters will not run\n";
             return;
         }
         for(size_t i = 0; sf::Actuator* actuator = robot->getActuator(i); ++i)
@@ -365,7 +365,7 @@ public:
         if(!frame.tracking_ok && !logged_tracking_loss)
         {
             logged_tracking_loss = true;
-            std::println(stdout, "[hydrus_sim] tracking_ok false after {} s", kTrackingOkSeconds);
+            std::cout << "[stonefish_sim] tracking_ok false after " << kTrackingOkSeconds << " s\n";
         }
         if(have_odometry)
         {
@@ -401,7 +401,7 @@ class SimApp : public sf::GraphicalSimulationApp
 {
 public:
     SimApp(std::string dataPath, sf::RenderSettings render_setting, sf::HelperSettings helper_settings, sf::SimulationManager* sim_manager)
-        : sf::GraphicalSimulationApp("hydrus_sim", dataPath, render_setting, helper_settings, sim_manager)
+        : sf::GraphicalSimulationApp("stonefish_sim", dataPath, render_setting, helper_settings, sim_manager)
     {
     }
 
@@ -452,7 +452,7 @@ class ConsoleSimApp : public sf::ConsoleSimulationApp
 {
 public:
     ConsoleSimApp(std::string dataPath, sf::SimulationManager* sim_manager)
-        : sf::ConsoleSimulationApp("hydrus_sim", dataPath, sim_manager)
+        : sf::ConsoleSimulationApp("stonefish_sim", dataPath, sim_manager)
     {
     }
 
@@ -564,13 +564,13 @@ void auv_init(void)
     g_simulation_context->sim = new SimManager(kStepsPerSecond, dataPath / scenario_file);
     if(kConsoleApp)
     {
-        std::println(stdout, "[hydrus_sim] app=console");
+        std::cout << "[stonefish_sim] app=console\n";
         g_simulation_context->console = new ConsoleSimApp(dataPath.string(), g_simulation_context->sim);
         g_simulation_context->console->start(kPhysicsDt);
     }
     else
     {
-        std::println(stdout, "[hydrus_sim] app=graphical");
+        std::cout << "[stonefish_sim] app=graphical\n";
         g_simulation_context->graphical = new SimApp(
             dataPath.string(), DefaultRenderSettings(), DefaultHelperSettings(), g_simulation_context->sim);
         g_simulation_context->graphical->start(kPhysicsDt);
@@ -594,7 +594,7 @@ void auv_yield_until_next_frame(AuvFrame* frame)
             && g_simulation_context->console->getState() == sf::SimulationState::FINISHED);
     if(finished)
     {
-        std::println(stderr, "[hydrus_sim] simulation finished; restart for another run");
+        std::cerr << "[stonefish_sim] simulation finished; restart for another run\n";
         auv_deinit();
         return;
     }

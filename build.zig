@@ -184,21 +184,6 @@ pub fn build(b: *std.Build) !void {
 
 
 
-    const lib_auv_proteus_sim = b.addLibrary(.{
-        .name = "auv_proteus_sim",
-        .root_module = b.createModule(.{
-            .target = b.graph.host,
-            .optimize = optimize,
-        }),
-        .linkage = .dynamic,
-    });
-    lib_auv_proteus_sim.root_module.link_libcpp = true;
-    lib_auv_proteus_sim.root_module.addCSourceFile(.{
-        .file = b.path("auvs/proteus_sim/auv.cpp"),
-        .flags = &.{"-fPIC", "-std=c++17"},
-    });
-    b.installArtifact(lib_auv_proteus_sim);
-
     // the zed sdk exposes c++ types, so this one has to be built with the
     // system g++ to match its libstdc++ abi. off by default so that machines
     // without the sdk and cuda can still build everything else.
@@ -257,20 +242,20 @@ pub fn build(b: *std.Build) !void {
     });
     cmake_build.step.dependOn(&cmake_configure.step);
 
-    const stonefish = b.option(bool, "stonefish", "Build the Stonefish hydrus_sim plugin") orelse false;
+    const stonefish = b.option(bool, "stonefish", "Build the Stonefish simulator plugin") orelse false;
     if (stonefish) {
-        const cmake_target = "auv_hydrus_sim";
+        const cmake_target = "auv_stonefish_sim";
         cmake_build.addArg(cmake_target);
 
-        _ = try cmake_build.step.addDirectoryWatchInput(b.path("auvs/hydrus_sim"));
+        _ = try cmake_build.step.addDirectoryWatchInput(b.path("auvs/stonefish_sim"));
 
         const cmake_dynlib_file = b.fmt("lib{s}{s}", .{cmake_target, target.result.dynamicLibSuffix()});
         const cmake_dynlib_path = b.path(b.fmt("build/{s}", .{cmake_dynlib_file}));
 
-        const install_hydrus_sim = b.addInstallFileWithDir(cmake_dynlib_path, .lib, cmake_dynlib_file);
-        install_hydrus_sim.step.dependOn(&cmake_build.step);
+        const install_stonefish_sim = b.addInstallFileWithDir(cmake_dynlib_path, .lib, cmake_dynlib_file);
+        install_stonefish_sim.step.dependOn(&cmake_build.step);
 
-        b.getInstallStep().dependOn(&install_hydrus_sim.step);
+        b.getInstallStep().dependOn(&install_stonefish_sim.step);
     }
 
     cmake_build.step.dependOn(&cmake_configure.step);
