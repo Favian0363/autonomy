@@ -95,6 +95,27 @@ pub fn build(b: *std.Build) !void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // Optional SDL2 keyboard teleop sender. Build with `zig build teleop-sender`.
+    // This separate step keeps SDL2 out of the normal Zig build requirements.
+    const teleop_sender = b.addExecutable(.{
+        .name = "teleop_sender",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        }),
+    });
+    teleop_sender.root_module.addCSourceFile(.{
+        .file = b.path("tools/teleop_sender/main.cpp"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
+    });
+    teleop_sender.root_module.linkSystemLibrary("SDL2", .{ .use_pkg_config = .force });
+
+    const install_teleop_sender = b.addInstallArtifact(teleop_sender, .{});
+    const teleop_sender_step = b.step("teleop-sender", "Build the optional SDL2 keyboard teleop sender");
+    teleop_sender_step.dependOn(&install_teleop_sender.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

@@ -5,6 +5,51 @@ pub const Vector3f = @Vector(3, f32);
 pub const Vector6f = @Vector(6, f32);
 pub const Quaternionf = @Vector(4, f32);
 
+/// Preserve the current heading while the XY goal is changing or still far
+/// away. Once reached, use the latest goal yaw until another XY goal arrives.
+pub fn targetYaw(
+    last_xy_goal: ?Vector2f,
+    held_yaw: ?f32,
+    xy_reached: bool,
+    goal: Vector6f,
+    xy_distance: f32,
+    current_yaw: f32,
+    arrival_radius: f32,
+) struct {
+    yaw: f32,
+    last_xy_goal: ?Vector2f,
+    held_yaw: ?f32,
+    xy_reached: bool,
+} {
+    const xy_goal: Vector2f = .{ goal[0], goal[1] };
+    const changed = if (last_xy_goal) |last|
+        xy_goal[0] != last[0] or xy_goal[1] != last[1]
+    else
+        false;
+    var next_held_yaw = held_yaw;
+    var next_xy_reached = xy_reached;
+
+    if (changed) {
+        if (next_xy_reached) next_held_yaw = current_yaw;
+        next_xy_reached = false;
+    }
+    if (!next_xy_reached and xy_distance <= arrival_radius) {
+        next_xy_reached = true;
+        next_held_yaw = null;
+    }
+    const target_yaw = if (next_xy_reached) goal[5] else blk: {
+        if (next_held_yaw == null) next_held_yaw = current_yaw;
+        break :blk next_held_yaw.?;
+    };
+
+    return .{
+        .yaw = target_yaw,
+        .last_xy_goal = xy_goal,
+        .held_yaw = next_held_yaw,
+        .xy_reached = next_xy_reached,
+    };
+}
+
 pub const Pose = extern struct {
     pos: Vector3f,
     quat: Quaternionf,
@@ -16,7 +61,7 @@ pub const BoundingBox = extern struct {
 };
 
 pub inline fn xy(v: Vector3f) Vector2f {
-    return .{v[0], v[1]};
+    return .{ v[0], v[1] };
 }
 
 pub inline fn dot2f(a: Vector2f, b: Vector2f) f32 {
@@ -186,7 +231,6 @@ pub fn tamMul(tam: []const Vector6f, v: Vector6f, out: []f32) []f32 {
     return result;
 }
 
-
 pub const max_thrusters = 8;
 /// Linear map from 6-DOF command to per-thruster values: t_i = dot(tam[i], input).
 /// Clamps to ±`thrustor_saturate`, then divides by 5 (backend scale in MissionContext).
@@ -207,7 +251,6 @@ pub fn tamToThrusters(
     }
     return thruster_values;
 }
-
 
 /// Per-axis PID on a 6-DOF error vector, producing a wrench command.
 ///
@@ -238,9 +281,6 @@ pub fn pidWrench(
     return wrench;
 }
 
-
-
-
 /// Maps a 6-DOF PID wrench into the 6-DOF command vector expected by `math.tamMul`.
 ///
 /// Pose `orientation` (unit quaternion `rot`) rotates body vectors into world:
@@ -268,9 +308,6 @@ pub fn wrenchToThrusterInput(
     if (@abs(yaw_error) > close_enough_yaw_gate) {
         body_force[0] = 0.0;
         body_force[1] = 0.0;
-    } else {
-        body_force[0] = @max(body_force[0], 0.0); // This clamping force the auv to always move forward
-        body_force[1] = @max(body_force[1], 0.0);
     }
     return .{
         body_force[0],
@@ -281,10 +318,6 @@ pub fn wrenchToThrusterInput(
         wrench[5],
     };
 }
-
-
-
-
 
 pub fn debug3f(comptime s: []const u8, v: Vector3f) void {
     std.log.debug(s ++ " {{ {d:5.2} {d:5.2} {d:5.2} }}", .{
