@@ -153,6 +153,41 @@ pub fn build(b: *std.Build) !void {
     // test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    const arduino_cli = b.option([]const u8, "arduino-cli", "Arduino CLI executable") orelse "arduino-cli";
+    const arduino_fqbn = b.option([]const u8, "arduino-fqbn", "Arduino board FQBN") orelse "arduino:avr:uno";
+    const arduino_compile = b.addSystemCommand(&.{ arduino_cli, "compile", "--fqbn", arduino_fqbn });
+    arduino_compile.addArg("--libraries");
+    arduino_compile.addDirectoryArg(b.path("arduino/libraries"));
+    arduino_compile.addDirectoryArg(b.path("arduino/sketches/Proteus"));
+    _ = try arduino_compile.step.addDirectoryWatchInput(b.path("arduino/sketches/Proteus"));
+    _ = try arduino_compile.step.addDirectoryWatchInput(b.path("arduino/libraries"));
+
+    const arduino_step = b.step("arduino", "Compile the Proteus Arduino sketch");
+    arduino_step.dependOn(&arduino_compile.step);
+
+    const arduino_sender = b.addExecutable(.{
+        .name = "arduino_sender",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    arduino_sender.root_module.link_libc = true;
+    arduino_sender.root_module.link_libcpp = true;
+    arduino_sender.root_module.addCSourceFile(.{
+        .file = b.path("auvs/proteus_hwd/arduino_sender.cpp"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
+    arduino_sender.root_module.addCSourceFile(.{
+        .file = b.path("auvs/proteus_hwd/arduino.cpp"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
+    const install_arduino_sender = b.addInstallArtifact(arduino_sender, .{});
+    b.getInstallStep().dependOn(&install_arduino_sender.step);
+
+    const arduino_sender_step = b.step("arduino-sender", "Build the Arduino sender executable");
+    arduino_sender_step.dependOn(&install_arduino_sender.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
@@ -201,6 +236,8 @@ pub fn build(b: *std.Build) !void {
         lib_auv_proteus_hwd.addArg("-o");
         const lib_auv_proteus_hwd_so = lib_auv_proteus_hwd.addOutputFileArg("libauv_proteus_hwd.so");
         lib_auv_proteus_hwd.addFileArg(b.path("auvs/proteus_hwd/auv.cpp"));
+        lib_auv_proteus_hwd.addFileArg(b.path("auvs/proteus_hwd/arduino.cpp"));
+        lib_auv_proteus_hwd.addFileInput(b.path("auvs/proteus_hwd/arduino.hpp"));
         lib_auv_proteus_hwd.addFileInput(b.path("include/auv.h"));
         lib_auv_proteus_hwd.addFileInput(b.path("include/math.h"));
         lib_auv_proteus_hwd.addArgs(&.{
