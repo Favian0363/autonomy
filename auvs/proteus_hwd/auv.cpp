@@ -45,7 +45,6 @@ static bool surface_pressure_set = false;
 static uint64_t frames = 0;
 static std::thread arduino_reader_thread;
 static std::thread arduino_writer_thread;
-static uint64_t frames = 0;
 static constexpr float kWaterDensity = 997.0f;
 static constexpr float kGravity = 9.80665f;
 static constexpr uintmax_t kMinFreeDisk = 1ULL << 30;
