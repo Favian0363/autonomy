@@ -156,11 +156,8 @@ pub fn build(b: *std.Build) !void {
     const arduino_cli = b.option([]const u8, "arduino-cli", "Arduino CLI executable") orelse "arduino-cli";
     const arduino_fqbn = b.option([]const u8, "arduino-fqbn", "Arduino board FQBN") orelse "arduino:avr:uno";
     const arduino_compile = b.addSystemCommand(&.{ arduino_cli, "compile", "--fqbn", arduino_fqbn });
-    arduino_compile.addArg("--libraries");
-    arduino_compile.addDirectoryArg(b.path("arduino/libraries"));
     arduino_compile.addDirectoryArg(b.path("arduino/sketches/Proteus"));
     _ = try arduino_compile.step.addDirectoryWatchInput(b.path("arduino/sketches/Proteus"));
-    _ = try arduino_compile.step.addDirectoryWatchInput(b.path("arduino/libraries"));
 
     const arduino_step = b.step("arduino", "Compile the Proteus Arduino sketch");
     arduino_step.dependOn(&arduino_compile.step);
