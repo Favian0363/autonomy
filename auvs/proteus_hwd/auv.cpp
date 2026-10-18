@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <inttypes.h>
 #include <limits>
 #include <stdexcept>
@@ -58,8 +59,10 @@ static bool detection_enabled = false;
 static uint64_t last_timestamp = 0;
 static float surface_pressure_hpa = 0.f;
 static bool surface_pressure_set = false;
+static uint64_t frames = 0;
 static constexpr float kWaterDensity = 997.0f;
 static constexpr float kGravity = 9.80665f;
+static constexpr uintmax_t kMinFreeDisk = 1ULL << 30;
 
 static Config load_config();
 static int map_class(const Config &config, int label);
@@ -144,6 +147,15 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
   if (!frame || !zed_open) {
     std::fprintf(stderr, "Error Zed has not been initialized yet and we dont have our first grabbed frame\n");
     return;
+  }
+
+  if (*config.record && ++frames % 30 == 0) {
+    std::error_code err;
+    const auto disk = std::filesystem::space(config.record, err);
+    if (!err && disk.available < kMinFreeDisk && zed.getRecordingStatus().is_recording) {
+      std::fputs("[zed] disk almost full, stopped recording\n", stderr);
+      zed.disableRecording();
+    }
   }
 
   sl::RuntimeParameters runtime;
