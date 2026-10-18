@@ -63,12 +63,15 @@ int main(int argc, char **argv) {
     float pose[7] = {};
     float thr[8] = {};
     char step[64];
+    const bool tracking = std::strstr(line, "\"tracking\":true") != nullptr;
+    const char *depth = std::strstr(line, "\"depth\":");
+    const bool depth_ok = depth && depth[8] != 'n';
     read_array(line, "\"pose\":[", pose, 7);
     const int thr_len = read_array(line, "\"thr\":[", thr, 8);
     read_string(line, "\"step\":\"", step, sizeof(step));
 
     int objects = 0;
-    for (const char *p = std::strstr(line, "\"id\":"); p; p = std::strstr(p + 1, "\"id\":"))
+    for (const char *p = std::strstr(line, "\"size\":"); p; p = std::strstr(p + 1, "\"size\":"))
       objects++;
 
     BeginDrawing();
@@ -84,9 +87,12 @@ int main(int argc, char **argv) {
     DrawText(TextFormat("quat  %.2f %.2f %.2f %.2f", pose[3], pose[4], pose[5], pose[6]), 20, 120, 20,
              RAYWHITE);
     DrawText(TextFormat("objs  %d", objects), 20, 150, 20, RAYWHITE);
+    DrawText(tracking ? "tracking  ok" : "tracking  lost", 20, 180, 20, tracking ? GREEN : ORANGE);
+    DrawText(depth_ok ? TextFormat("depth %.2f m", std::strtof(depth + 8, nullptr)) : "depth -", 20, 210,
+             20, RAYWHITE);
 
     for (int i = 0; i < thr_len; i++) {
-      const int y = 200 + i * 30;
+      const int y = 260 + i * 30;
       const int w = static_cast<int>(thr[i] * 150);
       DrawText(TextFormat("t%d %+.2f", i, thr[i]), 20, y, 20, RAYWHITE);
       DrawRectangle(w < 0 ? 300 + w : 300, y, w < 0 ? -w : w, 20, SKYBLUE);
