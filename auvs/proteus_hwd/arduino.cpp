@@ -30,7 +30,7 @@ constexpr size_t kCommandPacketMaxSize = 6 + kFloat32Size * kThrusterCount;
 constexpr size_t kCommandQueueCapacity = 32;
 constexpr auto kReadyTimeout = std::chrono::seconds(10);
 constexpr const char *kPort = "/tmp/autonomy-sim/arduino-auv";
-constexpr uint32_t kBaudRate = 115200;
+constexpr uint32_t kBaudRateBps = 115200;
 
 static_assert(sizeof(float) == kFloat32Size);
 static_assert(std::numeric_limits<float>::is_iec559);
@@ -42,6 +42,12 @@ enum class ErrorCode : uint8_t {
   InvalidCount = 4,
   CommandTimeout = 9,
 };
+
+enum class BaudRate : speed_t {
+  Baud115200 = B115200,
+};
+
+constexpr BaudRate kBaudRate = BaudRate::Baud115200;
 
 struct CommandPacket {
   std::array<uint8_t, kCommandPacketMaxSize> bytes{};
@@ -287,38 +293,7 @@ void arduino_init() {
   settings.c_cc[VMIN] = 0;
   settings.c_cc[VTIME] = 1;
 
-  speed_t baud_rate = 0;
-  switch (kBaudRate) {
-  case 9600:
-    baud_rate = B9600;
-    break;
-  case 19200:
-    baud_rate = B19200;
-    break;
-  case 38400:
-    baud_rate = B38400;
-    break;
-  case 57600:
-    baud_rate = B57600;
-    break;
-  case 115200:
-    baud_rate = B115200;
-    break;
-#ifdef B230400
-  case 230400:
-    baud_rate = B230400;
-    break;
-#endif
-  default:
-    break;
-  }
-
-  if (baud_rate == 0) {
-    std::fprintf(stderr, "[arduino] unsupported baud rate: %u\n", kBaudRate);
-    arduino_deinit();
-    return;
-  }
-
+  const speed_t baud_rate = static_cast<speed_t>(kBaudRate);
   if (cfsetispeed(&settings, baud_rate) < 0 ||
       cfsetospeed(&settings, baud_rate) < 0) {
     std::fprintf(stderr, "[arduino] setting baud rate failed: %s\n",
@@ -333,7 +308,8 @@ void arduino_init() {
     arduino_deinit();
     return;
   }
-  std::fprintf(stderr, "[arduino] opened %s at %u baud\n", kPort, kBaudRate);
+  std::fprintf(stderr, "[arduino] opened %s at %u baud\n", kPort,
+               kBaudRateBps);
 
   if (sem_init(&command_semaphore, 0, 0) < 0) {
     std::fprintf(stderr, "[arduino] sem_init failed: %s\n", std::strerror(errno));
