@@ -1,21 +1,64 @@
 #include <Arduino.h>
-#include <Servo.h>
+#include <avr/interrupt.h>
 #include <string.h>
 
-#define PULSE_WIDTH_MIN 1400
-#define PULSE_WIDTH_MAX 1600
-#define PULSE_WIDTH_NEUTRAL 1500
-// original delta
-// #define PULSE_WIDTH_DELTA 400
+/*
+ * The Timer1 servo pulse scheduler below is derived from Arduino's Servo
+ * library AVR implementation, Copyright (c) 2009 Michael Margolis.
+ * It is distributed under the GNU LGPL 2.1 or later; the full license is in
+ * arduino/libraries/Servo/LICENSE.txt.
+ */
 
-// reduced delta
+#define PULSE_WIDTH_NEUTRAL 1500
 #define PULSE_WIDTH_DELTA 100
 #define PULSE_WIDTH_MIN PULSE_WIDTH_NEUTRAL - PULSE_WIDTH_DELTA
 #define PULSE_WIDTH_MAX PULSE_WIDTH_NEUTRAL + PULSE_WIDTH_DELTA
 #define PINS_COUNT 6
 
 const int PINS[PINS_COUNT] = {7, 6, 3, 2, 4, 5};
-Servo servos[PINS_COUNT];
+
+const uint16_t SERVO_REFRESH_US = 20000;
+const uint8_t SERVO_TIMER_PRESCALER = 8;
+const uint8_t SERVO_WRITE_TRIM_US = 2;
+
+volatile uint16_t thrusterPulseTicks[PINS_COUNT];
+volatile int8_t activeThrusterPulse = -1;
+
+uint16_t microsecondsToTimerTicks(uint16_t microseconds) {
+  return (clockCyclesPerMicrosecond() * microseconds) /
+         SERVO_TIMER_PRESCALER;
+}
+
+void writeThrusterMicroseconds(uint8_t thruster, uint16_t microseconds) {
+  const uint16_t ticks =
+      microsecondsToTimerTicks(microseconds - SERVO_WRITE_TRIM_US);
+
+  // A 16-bit store is not atomic on the 8-bit ATmega328P. Prevent Timer1's
+  // interrupt from seeing one byte from the old value and one from the new.
+  const uint8_t savedStatus = SREG;
+  cli();
+  thrusterPulseTicks[thruster] = ticks;
+  SREG = savedStatus;
+}
+
+ISR(TIMER1_COMPA_vect) {
+  if (activeThrusterPulse < 0)
+    TCNT1 = 0;
+  else
+    digitalWrite(PINS[activeThrusterPulse], LOW);
+
+  ++activeThrusterPulse;
+  if (activeThrusterPulse < PINS_COUNT) {
+    OCR1A = TCNT1 + thrusterPulseTicks[activeThrusterPulse];
+    digitalWrite(PINS[activeThrusterPulse], HIGH);
+    return;
+  }
+
+  const uint16_t refreshTicks =
+      microsecondsToTimerTicks(SERVO_REFRESH_US);
+  OCR1A = TCNT1 + 4 < refreshTicks ? refreshTicks : TCNT1 + 4;
+  activeThrusterPulse = -1;
+}
 
 const uint8_t PACKET_MAGIC_0 = 0xA5;
 const uint8_t PACKET_MAGIC_1 = 0x5A;
@@ -33,6 +76,10 @@ enum class ErrorCode : uint8_t {
   InvalidCount = 4,
   CommandTimeout = 9,
 };
+
+// Keep Arduino's automatic prototype generator from declaring this function
+// before ErrorCode is defined.
+void sendErrorPacket(ErrorCode errorCode, uint8_t detail);
 
 uint8_t packetBuffer[PACKET_MAX_SIZE];
 size_t packetLength = 0;
@@ -88,7 +135,7 @@ void sendErrorPacket(ErrorCode errorCode, uint8_t detail) {
 
 void neutralizeThrusters() {
   for (uint8_t i = 0; i < PINS_COUNT; ++i)
-    servos[i].writeMicroseconds(PULSE_WIDTH_NEUTRAL);
+    writeThrusterMicroseconds(i, PULSE_WIDTH_NEUTRAL);
 }
 
 void applyThrusterPacket() {
@@ -113,7 +160,7 @@ void applyThrusterPacket() {
   for (uint8_t i = 0; i < count; ++i) {
     const long pulseWidth = PULSE_WIDTH_NEUTRAL +
                             lroundf(PULSE_WIDTH_DELTA * thrustValues[i]);
-    servos[i].writeMicroseconds(constrain(pulseWidth, PULSE_WIDTH_MIN, PULSE_WIDTH_MAX));
+    writeThrusterMicroseconds(i, pulseWidth);
   }
   lastValidCommandMs = millis();
   receivedCommand = true;
@@ -163,10 +210,21 @@ void consumeSerialByte(uint8_t value) {
 void setup() {
   Serial.begin(115200);
 
-  for (int i = 0; i < PINS_COUNT; i += 1){
-      servos[i].attach(PINS[i]);
-      servos[i].writeMicroseconds(PULSE_WIDTH_NEUTRAL);  // This sets the thrusters output force to 0 lbf
+  for (uint8_t i = 0; i < PINS_COUNT; ++i) {
+    pinMode(PINS[i], OUTPUT);
+    writeThrusterMicroseconds(i, PULSE_WIDTH_NEUTRAL);
   }
+
+  // Timer1 runs at 2 MHz (16 MHz / 8). Its compare interrupt raises each
+  // thruster output in turn, keeps it high for its configured pulse width,
+  // then waits until the 20 ms servo frame is complete.
+  TCCR1A = 0;
+  TCCR1B = _BV(CS11);
+  TCNT1 = 0;
+  OCR1A = 4;
+  TIFR1 = _BV(OCF1A);
+  TIMSK1 |= _BV(OCIE1A);
+
   delay(5000);
   sendReadyPacket();
 }
