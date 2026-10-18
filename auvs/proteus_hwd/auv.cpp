@@ -16,8 +16,9 @@
 //AUV_ZED_METRICS     1 to print per frame timing rows on stderr
 
 #include "../../include/auv.h"
+#include "arduino.hpp"
+#include <cstdint>
 #include <sl/Camera.hpp>
-#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -27,11 +28,14 @@
 #include <inttypes.h>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <thread>
 #include <time.h>
-#include <unistd.h>
 #include <vector>
+#include <cinttypes>
+
 
 struct ClassMapping {
   int label;
@@ -61,6 +65,8 @@ static uint64_t last_timestamp = 0;
 static float surface_pressure_hpa = 0.f;
 static bool surface_pressure_set = false;
 static uint64_t frames = 0;
+static std::thread arduino_reader_thread;
+static std::thread arduino_writer_thread;
 static constexpr float kWaterDensity = 997.0f;
 static constexpr float kGravity = 9.80665f;
 static constexpr uintmax_t kMinFreeDisk = 1ULL << 30;
@@ -78,7 +84,7 @@ static uint64_t now_ns() {
   timespec now{};
   if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
     fail("monotonic clock failed");
-  return static_cast<uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+  return static_cast<uint64_t>(now.tv_sec) * 1000000000ULL + static_cast<uint64_t>(now.tv_nsec);
 }
 
 static void check(sl::ERROR_CODE error, const char *operation) {
@@ -91,6 +97,10 @@ static void check(sl::ERROR_CODE error, const char *operation) {
 void auv_init(void) {
   try {
     auv_deinit();
+    arduino_init();
+    arduino_reader_thread = std::thread(arduino_serial_reader);
+    arduino_writer_thread = std::thread(arduino_serial_writer);
+
     config = load_config();
     sl::InitParameters params;
     params.coordinate_units = sl::UNIT::METER;
@@ -313,12 +323,17 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
 }
 
 void auv_set_thrustor_values(const float *thrustor_values, uint8_t thrustor_values_len) {
-  // Motor output is not implemented
-  (void)thrustor_values;
-  (void)thrustor_values_len;
+  enqueue_serial_command_packet(thrustor_values, thrustor_values_len);
 }
 
 void auv_deinit(void) {
+  request_stop();
+  if (arduino_reader_thread.joinable())
+    arduino_reader_thread.join();
+  if (arduino_writer_thread.joinable())
+    arduino_writer_thread.join();
+  arduino_deinit();
+
   if (zed_open) {
     zed_open = false;
     try {
@@ -407,7 +422,7 @@ static Config load_config() {
   return config;
 }
 
-static int map_class(const Config &config, int label) {
+[[maybe_unused]] static int map_class(const Config &config, int label) {
   for (const auto &item : config.classes)
     if (item.label == label) return item.cls;
   return -1;
