@@ -5,8 +5,7 @@
 /*
  * The Timer1 servo pulse scheduler below is derived from Arduino's Servo
  * library AVR implementation, Copyright (c) 2009 Michael Margolis.
- * It is distributed under the GNU LGPL 2.1 or later; the full license is in
- * arduino/libraries/Servo/LICENSE.txt.
+ * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 
 #define PULSE_WIDTH_NEUTRAL 1500
