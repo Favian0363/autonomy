@@ -108,6 +108,35 @@ pub inline fn wrapAngle(angle: f32) f32 {
     return @mod(angle + std.math.pi, 2.0 * std.math.pi) - std.math.pi;
 }
 
+pub fn withinDeadband(err: f32, deadband: f32) f32 {
+    if (@abs(err) <= deadband) return 0;
+    return err;
+}
+
+pub const BoxMetrics2d = struct {
+    cx: f32,
+    cy: f32,
+    height: f32,
+};
+
+/// Normalized image errors: cx/cy in roughly [-1, 1] from image center; height in [0, 1].
+/// `top_left` and `bottom_right` are pixel corners `{x, y}`.
+pub fn boxMetrics(
+    image_width: u32,
+    image_height: u32,
+    top_left: [2]u32,
+    bottom_right: [2]u32,
+) BoxMetrics2d {
+    const w = @as(f32, @floatFromInt(image_width));
+    const h = @as(f32, @floatFromInt(image_height));
+    const center_x = (@as(f32, @floatFromInt(top_left[0])) + @as(f32, @floatFromInt(bottom_right[0]))) * 0.5;
+    const center_y = (@as(f32, @floatFromInt(top_left[1])) + @as(f32, @floatFromInt(bottom_right[1]))) * 0.5;
+    const cx = (center_x / w - 0.5) * 2.0;
+    const cy = (center_y / h - 0.5) * 2.0;
+    const height = @as(f32, @floatFromInt(bottom_right[1] - top_left[1])) / h;
+    return .{ .cx = cx, .cy = cy, .height = height };
+}
+
 pub fn rotationBetween(forward: Vector3f, dir: Vector3f) Quaternionf {
     const dot = dot3f(forward, dir);
 
@@ -156,6 +185,106 @@ pub fn tamMul(tam: []const Vector6f, v: Vector6f, out: []f32) []f32 {
 
     return result;
 }
+
+
+pub const max_thrusters = 8;
+/// Linear map from 6-DOF command to per-thruster values: t_i = dot(tam[i], input).
+/// Clamps to ±`thrustor_saturate`, then divides by 5 (backend scale in MissionContext).
+/// `out` must be at least `tam.len` elements; returns `out[0..tam.len]`.
+pub fn tamToThrusters(
+    tam: []const Vector6f,
+    input: Vector6f,
+    thrustor_saturate: f32,
+    output_scale: f32,
+    out: []f32,
+) []f32 {
+    std.debug.assert(out.len >= tam.len);
+    std.debug.assert(output_scale > 0);
+    const thruster_values = tamMul(tam, input, out);
+    for (thruster_values) |*value| {
+        value.* = std.math.clamp(value.*, -thrustor_saturate, thrustor_saturate);
+        value.* /= output_scale;
+    }
+    return thruster_values;
+}
+
+
+/// Per-axis PID on a 6-DOF error vector, producing a wrench command.
+///
+/// For each axis: `wrench = kp·err + ki·∫err + kd·d(err)/dt`.
+/// Gains and error are element-wise (`Vector6f`), e.g. x/y/z position and roll/pitch/yaw.
+///
+/// When `dt` is non-null, the I term uses `sumError + err·dt` and D uses `(err - prevError)/dt`.
+/// When `dt` is null (missing or invalid timestep), D is zero and I uses `sumError` unchanged—
+/// same I/D skip as `MissionContext.ControllerStep`.
+///
+/// `sumError` and `prevError` are updated in place when `dt` is non-null.
+/// Returns the wrench; feed through `wrenchToThrusterInput` / `tamToThrusters` for thrusters.
+pub fn pidWrench(
+    sumError: *Vector6f,
+    prevError: *Vector6f,
+    kp: Vector6f,
+    ki: Vector6f,
+    kd: Vector6f,
+    err: Vector6f,
+    dt: ?f32,
+) Vector6f {
+    const vel_err: Vector6f = if (dt) |dt_val| blk: {
+        sumError.* += err * @as(Vector6f, @splat(dt_val));
+        break :blk (err - prevError.*) / @as(Vector6f, @splat(dt_val));
+    } else @as(Vector6f, @splat(0));
+    const wrench = kp * err + ki * sumError.* + kd * vel_err;
+    prevError.* = err;
+    return wrench;
+}
+
+
+
+
+/// Maps a 6-DOF PID wrench into the 6-DOF command vector expected by `math.tamMul`.
+///
+/// Pose `orientation` (unit quaternion `rot`) rotates body vectors into world:
+///   f_world = R(rot) · f_body     (3×1 = 3×3 · 3×1)
+///
+/// PID linear output `wrench[0..3]` is treated as force in **world** axes (from
+/// world-frame position error). Thruster mixing uses **body** X/Y after policy:
+///   f_body = R(rot)⁻¹ · f_world = R(conjugate(rot)) · f_world
+///
+/// Angular part of `wrench` is not re-rotated here; roll gets a sign fix for TAM.
+/// `yaw_error` is err[5] (heading error); if |yaw_error| > gate, body X/Y force is
+/// zeroed so the vehicle turns before surging.
+///
+/// Returns TAM input: [Fx_body, Fy_body, Fz, Mx, My, Mz].
+pub fn wrenchToThrusterInput(
+    wrench: Vector6f,
+    orientation: Quaternionf,
+    yaw_error: f32,
+    close_enough_yaw_gate: f32,
+) Vector6f {
+    const rot = normalize4f(orientation);
+    const world_force: Vector3f = .{ wrench[0], wrench[1], wrench[2] };
+    const rotated = quaternionRotate(quaternionConjugate(rot), world_force);
+    var body_force = rotated;
+    if (@abs(yaw_error) > close_enough_yaw_gate) {
+        body_force[0] = 0.0;
+        body_force[1] = 0.0;
+    } else {
+        body_force[0] = @max(body_force[0], 0.0); // This clamping force the auv to always move forward
+        body_force[1] = @max(body_force[1], 0.0);
+    }
+    return .{
+        body_force[0],
+        body_force[1],
+        wrench[2],
+        -wrench[3],
+        wrench[4],
+        wrench[5],
+    };
+}
+
+
+
+
 
 pub fn debug3f(comptime s: []const u8, v: Vector3f) void {
     std.log.debug(s ++ " {{ {d:5.2} {d:5.2} {d:5.2} }}", .{

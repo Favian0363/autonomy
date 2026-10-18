@@ -13,11 +13,24 @@ ping: std.heap.FixedBufferAllocator,
 pong: std.heap.FixedBufferAllocator,
 reader_buf: [4098]u8,
 
-pub const Config = struct {
+pub const NonOdometryPid = struct {
     kp: math.Vector6f,
     ki: math.Vector6f,
     kd: math.Vector6f,
+    center_deadband: f32,
+    target_height: f32,
+};
+
+pub const OdometryPid = struct {
+    kp: math.Vector6f,
+    ki: math.Vector6f,
+    kd: math.Vector6f,
+};
+
+pub const Config = struct {
     tam: []math.Vector6f,
+    odometry: OdometryPid,
+    non_odometry: NonOdometryPid,
 };
 
 pub fn init(arena: std.mem.Allocator, config_path: []const u8) !MissionLoader {

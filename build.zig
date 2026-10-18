@@ -121,6 +121,11 @@ pub fn build(b: *std.Build) !void {
         run_cmd.addArgs(args);
     }
 
+
+
+
+
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
@@ -161,35 +166,23 @@ pub fn build(b: *std.Build) !void {
     // and reading its source code will allow you to master it.
 
 
-    const lib_auv_sleep_sim = b.addLibrary(.{
-        .name = "auv_sleep_sim",
+
+    const lib_auv_stationary_sim = b.addLibrary(.{
+        .name = "auv_stationary_sim",
         .root_module = b.createModule(.{
             .target = b.graph.host,
             .optimize = optimize,
         }),
         .linkage = .dynamic,
     });
-    lib_auv_sleep_sim.root_module.link_libc = true;
-    lib_auv_sleep_sim.root_module.addCSourceFile(.{
-        .file = b.path("auvs/sleep_sim/auv.c"),
+    lib_auv_stationary_sim.root_module.link_libc = true;
+    lib_auv_stationary_sim.root_module.addCSourceFile(.{
+        .file = b.path("auvs/stationary_sim/auv.c"),
         .flags = &.{"-fPIC"},
     });
-    b.installArtifact(lib_auv_sleep_sim);
+    b.installArtifact(lib_auv_stationary_sim);
 
-    const lib_auv_proteus_sim = b.addLibrary(.{
-        .name = "auv_proteus_sim",
-        .root_module = b.createModule(.{
-            .target = b.graph.host,
-            .optimize = optimize,
-        }),
-        .linkage = .dynamic,
-    });
-    lib_auv_proteus_sim.root_module.link_libcpp = true;
-    lib_auv_proteus_sim.root_module.addCSourceFile(.{
-        .file = b.path("auvs/proteus_sim/auv.cpp"),
-        .flags = &.{"-fPIC", "-std=c++17"},
-    });
-    b.installArtifact(lib_auv_proteus_sim);
+
 
     // the zed sdk exposes c++ types, so this one has to be built with the
     // system g++ to match its libstdc++ abi. off by default so that machines
@@ -238,28 +231,31 @@ pub fn build(b: *std.Build) !void {
     });
     try cmake_configure.step.addWatchInput(b.path("CMakeLists.txt"));
 
+    const cpu_count = std.Thread.getCpuCount() catch 1;
     const cmake_build = b.addSystemCommand(&.{
         "cmake",
         "--build",
         "build",
+        "--parallel",
+        b.fmt("{d}", .{cpu_count}),
         "--target",
     });
     cmake_build.step.dependOn(&cmake_configure.step);
 
-    const stonefish = b.option(bool, "stonefish", "Build the Stonefish hydrus_sim plugin") orelse false;
+    const stonefish = b.option(bool, "stonefish", "Build the Stonefish simulator plugin") orelse false;
     if (stonefish) {
-        const cmake_target = "auv_hydrus_sim";
+        const cmake_target = "auv_stonefish_sim";
         cmake_build.addArg(cmake_target);
 
-        _ = try cmake_build.step.addDirectoryWatchInput(b.path("auvs/hydrus_sim"));
+        _ = try cmake_build.step.addDirectoryWatchInput(b.path("auvs/stonefish_sim"));
 
         const cmake_dynlib_file = b.fmt("lib{s}{s}", .{cmake_target, target.result.dynamicLibSuffix()});
         const cmake_dynlib_path = b.path(b.fmt("build/{s}", .{cmake_dynlib_file}));
 
-        const install_hydrus_sim = b.addInstallFileWithDir(cmake_dynlib_path, .lib, cmake_dynlib_file);
-        install_hydrus_sim.step.dependOn(&cmake_build.step);
+        const install_stonefish_sim = b.addInstallFileWithDir(cmake_dynlib_path, .lib, cmake_dynlib_file);
+        install_stonefish_sim.step.dependOn(&cmake_build.step);
 
-        b.getInstallStep().dependOn(&install_hydrus_sim.step);
+        b.getInstallStep().dependOn(&install_stonefish_sim.step);
     }
 
     cmake_build.step.dependOn(&cmake_configure.step);

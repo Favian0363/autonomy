@@ -1,6 +1,7 @@
 #ifndef AUV_H
 #define AUV_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "math.h"
 
@@ -9,6 +10,19 @@ extern "C" {
 #endif
 
 typedef uint8_t AuvObjectCls;
+
+typedef struct {
+  uint32_t x;
+  uint32_t y;
+} AuvPoint2u;
+
+typedef struct {
+  AuvPoint2u top_left;
+  AuvPoint2u bottom_right;
+  uint32_t id;
+  AuvObjectCls cls;
+} AuvObject2d;
+
 typedef struct {
   MathBoundingBox bbox;
   uint32_t id;
@@ -21,6 +35,16 @@ typedef struct {
   uint8_t objects_len;
   MathPose camera_pose;
   uint64_t timestamp;
+  bool tracking_ok;
+  MathVector3f accel;
+  MathVector3f gyro;
+  MathQuaternionf imu_quat;
+  AuvObject2d objects2d[AUV_FRAME_MAX_OBJECTS];
+  uint8_t objects2d_len;
+  uint32_t image_width;
+  uint32_t image_height;
+  float pressure_depth;
+  bool pressure_depth_ok;
 } AuvFrame;
 
 void auv_init(void);

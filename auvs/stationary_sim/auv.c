@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#define THRUSTOR_VALUES_COUNT 6
+#define THRUSTOR_VALUES_COUNT 8
 #define FRAME_INTERVAL_NS (1000000000ULL / 60)
 
 static uint64_t next_frame;
@@ -49,6 +49,7 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
     next_frame = timestamp + FRAME_INTERVAL_NS;
 
   frame->objects_len = 0;
+  frame->objects2d_len = 0;
   frame->camera_pose = (MathPose){
       .pos = {0, 0, 0},
       .quat = {0, 0, 0, 1},

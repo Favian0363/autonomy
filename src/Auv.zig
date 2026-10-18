@@ -16,6 +16,18 @@ pub const Object = extern struct {
     cls: ObjectCls,
 };
 
+pub const Point2u = extern struct {
+    x: u32,
+    y: u32,
+};
+
+pub const Object2d = extern struct {
+    top_left: Point2u,
+    bottom_right: Point2u,
+    id: u32,
+    cls: ObjectCls,
+};
+
 pub const Frame = extern struct {
     pub const max_objects = c.AUV_FRAME_MAX_OBJECTS;
 
@@ -23,6 +35,16 @@ pub const Frame = extern struct {
     objects_len: u8,
     camera_pose: math.Pose,
     timestamp: u64,
+    tracking_ok: bool,
+    accel: math.Vector3f,
+    gyro: math.Vector3f,
+    imu_quat: math.Quaternionf,
+    objects2d: [max_objects]Object2d,
+    objects2d_len: u8,
+    image_width: u32,
+    image_height: u32,
+    pressure_depth: f32,
+    pressure_depth_ok: bool,
 };
 
 pub const InitFunc = fn () callconv(.c) void;
@@ -120,6 +142,8 @@ comptime {
     assertSameLayout(math.BoundingBox, c.MathBoundingBox);
     assertSameLayout(ObjectCls, c.AuvObjectCls);
     assertSameLayout(Object, c.AuvObject);
+    assertSameLayout(Point2u, c.AuvPoint2u);
+    assertSameLayout(Object2d, c.AuvObject2d);
     assertSameLayout(Frame, c.AuvFrame);
 
     assertSameFunctionLayout(InitFunc, c.AuvInitFunc);

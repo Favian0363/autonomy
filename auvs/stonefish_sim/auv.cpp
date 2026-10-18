@@ -18,25 +18,28 @@
 #include "Stonefish/graphics/OpenGLPipeline.h"
 #include "Stonefish/sensors/Sensor.h"
 #include "Stonefish/sensors/ScalarSensor.h"
+#include "Stonefish/sensors/vision/Camera.h"
 
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <optional>
-#include <print>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 
-static std::filesystem::path dataPath = "auvs/hydrus_sim/data/";
+static std::filesystem::path dataPath = "auvs/stonefish_sim/data/";
 static std::string scenario_file = "scenarios/hydrus_env.scn";
 static constexpr sf::Scalar kStepsPerSecond = 360.0;
 static constexpr sf::Scalar kPhysicsDt = sf::Scalar(1) / kStepsPerSecond;
-static constexpr sf::Scalar kRealtimeFactorCap = 8.0;
+static constexpr sf::Scalar kRealtimeFactorCap = 1.0;
+static constexpr sf::Scalar kTrackingOkSeconds = 1000.0;
 static constexpr auto kMinRenderInterval = std::chrono::milliseconds(16);
 static constexpr bool kConsoleApp = false;
 
@@ -124,6 +127,73 @@ bool FillObjectBBox(sf::Entity* entity, MathBoundingBox& bbox)
     return true;
 }
 
+// Stonefish camera frame: +X right, +Y down, +Z along the optical axis.
+bool ProjectObjectBox(
+    sf::Camera* camera,
+    unsigned int image_width,
+    unsigned int image_height,
+    float focal_px,
+    sf::Entity* entity,
+    AuvObject2d& box)
+{
+    if(camera == nullptr || image_width == 0 || image_height == 0 || focal_px <= 0.f)
+        return false;
+
+    sf::Vector3 min;
+    sf::Vector3 max;
+    entity->getAABB(min, max);
+    const sf::Transform world_to_camera = camera->getSensorFrame().inverse();
+    const float cx = static_cast<float>(image_width) * 0.5f;
+    const float cy = static_cast<float>(image_height) * 0.5f;
+
+    float u_min = 1.0e9f;
+    float v_min = 1.0e9f;
+    float u_max = -1.0e9f;
+    float v_max = -1.0e9f;
+    bool any_in_front = false;
+
+    for(int corner = 0; corner < 8; ++corner)
+    {
+        const sf::Vector3 world(
+            (corner & 1) != 0 ? max.x() : min.x(),
+            (corner & 2) != 0 ? max.y() : min.y(),
+            (corner & 4) != 0 ? max.z() : min.z());
+        const sf::Vector3 local = world_to_camera * world;
+        if(local.z() <= sf::Scalar(0.05))
+            continue;
+
+        const float u = cx + focal_px * static_cast<float>(local.x() / local.z());
+        const float v = cy + focal_px * static_cast<float>(local.y() / local.z());
+        u_min = std::min(u_min, u);
+        v_min = std::min(v_min, v);
+        u_max = std::max(u_max, u);
+        v_max = std::max(v_max, v);
+        any_in_front = true;
+    }
+
+    if(!any_in_front)
+        return false;
+    if(u_max < 0.f || v_max < 0.f
+       || u_min >= static_cast<float>(image_width)
+       || v_min >= static_cast<float>(image_height))
+        return false;
+
+    const auto clamp_pixel = [](float value, unsigned int limit) -> uint32_t {
+        if(value <= 0.f)
+            return 0;
+        const float last = static_cast<float>(limit - 1);
+        if(value >= last)
+            return limit - 1;
+        return static_cast<uint32_t>(value);
+    };
+
+    box.top_left.x = clamp_pixel(u_min, image_width);
+    box.top_left.y = clamp_pixel(v_min, image_height);
+    box.bottom_right.x = clamp_pixel(u_max, image_width);
+    box.bottom_right.y = clamp_pixel(v_max, image_height);
+    return box.bottom_right.x > box.top_left.x && box.bottom_right.y > box.top_left.y;
+}
+
 class AuvScenarioParser : public sf::ScenarioParser
 {
 public:
@@ -148,19 +218,19 @@ protected:
 
         if(cls == nullptr || *cls == '\0')
         {
-            std::println(stderr, "[hydrus_sim] static object '{}' is missing a cls tag", display_name);
+            std::cerr << "[stonefish_sim] static object '" << display_name << "' is missing a cls tag\n";
             return false;
         }
 
         const auto mapped = ParseObjectClass(cls);
         if(!mapped)
         {
-            std::println(stderr, "[hydrus_sim] static object '{}' has unknown cls '{}'", display_name, cls);
+            std::cerr << "[stonefish_sim] static object '" << display_name << "' has unknown cls '" << cls << "'\n";
             return false;
         }
         if(name == nullptr)
         {
-            std::println(stderr, "[hydrus_sim] static object with cls '{}' is missing a name", cls);
+            std::cerr << "[stonefish_sim] static object with cls '" << cls << "' is missing a name\n";
             return false;
         }
 
@@ -183,15 +253,34 @@ public:
         AuvScenarioParser parser(this);
         if(!parser.Parse(scenarioPath.string()))
         {
-            std::println(stderr, "Failed to parse scenario {}", scenarioPath.string());
+            std::cerr << "Failed to parse scenario " << scenarioPath.string() << '\n';
             return;
         }
         const auto objectClasses = std::move(parser.objectClasses);
 
         odometry = nullptr;
         have_odometry = false;
+        camera = nullptr;
+        image_width = 0;
+        image_height = 0;
+        focal_px = 0.f;
         for(unsigned int i = 0; sf::Sensor* sensor = getSensor(i); ++i)
         {
+            if(sensor->getType() == sf::SensorType::VISION)
+            {
+                if(auto* color_camera = dynamic_cast<sf::Camera*>(sensor))
+                {
+                    camera = color_camera;
+                    camera->getResolution(image_width, image_height);
+                    const float half_width = static_cast<float>(image_width) * 0.5f;
+                    const float half_hfov_rad =
+                        static_cast<float>(camera->getHorizontalFOV()) * (static_cast<float>(M_PI) / 360.f);
+                    if(half_width > 0.f && half_hfov_rad > 0.f)
+                        focal_px = half_width / std::tan(half_hfov_rad);
+                }
+                continue;
+            }
+
             if(sensor->getType() != sf::SensorType::LINK)
                 continue;
             auto* scalar = static_cast<sf::ScalarSensor*>(sensor);
@@ -199,7 +288,6 @@ public:
             {
                 odometry = scalar;
                 have_odometry = odometry->getNumOfChannels() >= 10;
-                break;
             }
         }
 
@@ -218,7 +306,7 @@ public:
         sf::Robot* robot = getRobot(0u);
         if(robot == nullptr)
         {
-            std::println(stdout, "[hydrus_sim] no robot in scenario; thrusters will not run");
+            std::cout << "[stonefish_sim] no robot in scenario; thrusters will not run\n";
             return;
         }
         for(size_t i = 0; sf::Actuator* actuator = robot->getActuator(i); ++i)
@@ -260,6 +348,30 @@ public:
             object.id = tracked.id;
             object.cls = static_cast<AuvObjectCls>(tracked.cls);
             frame.objects[frame.objects_len++] = object;
+
+            if(frame.objects2d_len >= AUV_FRAME_MAX_OBJECTS)
+                continue;
+            AuvObject2d box{};
+            if(!ProjectObjectBox(camera, image_width, image_height, focal_px, tracked.entity, box))
+                continue;
+            box.id = tracked.id;
+            box.cls = static_cast<AuvObjectCls>(tracked.cls);
+            frame.objects2d[frame.objects2d_len++] = box;
+        }
+
+        frame.image_width = image_width;
+        frame.image_height = image_height;
+        frame.tracking_ok = getSimulationTime() < kTrackingOkSeconds;
+        if(!frame.tracking_ok && !logged_tracking_loss)
+        {
+            logged_tracking_loss = true;
+            std::cout << "[stonefish_sim] tracking_ok false after " << kTrackingOkSeconds << " s\n";
+        }
+        if(have_odometry)
+        {
+            // Scenario is NED, so odometry Z is depth, positive down.
+            frame.pressure_depth = static_cast<float>(odometry->getLastValue(2));
+            frame.pressure_depth_ok = true;
         }
 
         return frame;
@@ -276,6 +388,11 @@ public:
     std::filesystem::path scenarioPath;
     bool have_odometry = false;
     sf::ScalarSensor* odometry = nullptr;
+    sf::Camera* camera = nullptr;
+    unsigned int image_width = 0;
+    unsigned int image_height = 0;
+    float focal_px = 0.f;
+    bool logged_tracking_loss = false;
     std::vector<TrackedObject> tracked_objects;
     std::vector<sf::Thruster*> thrusters;
 };
@@ -284,7 +401,7 @@ class SimApp : public sf::GraphicalSimulationApp
 {
 public:
     SimApp(std::string dataPath, sf::RenderSettings render_setting, sf::HelperSettings helper_settings, sf::SimulationManager* sim_manager)
-        : sf::GraphicalSimulationApp("hydrus_sim", dataPath, render_setting, helper_settings, sim_manager)
+        : sf::GraphicalSimulationApp("stonefish_sim", dataPath, render_setting, helper_settings, sim_manager)
     {
     }
 
@@ -335,7 +452,7 @@ class ConsoleSimApp : public sf::ConsoleSimulationApp
 {
 public:
     ConsoleSimApp(std::string dataPath, sf::SimulationManager* sim_manager)
-        : sf::ConsoleSimulationApp("hydrus_sim", dataPath, sim_manager)
+        : sf::ConsoleSimulationApp("stonefish_sim", dataPath, sim_manager)
     {
     }
 
@@ -447,13 +564,13 @@ void auv_init(void)
     g_simulation_context->sim = new SimManager(kStepsPerSecond, dataPath / scenario_file);
     if(kConsoleApp)
     {
-        std::println(stdout, "[hydrus_sim] app=console");
+        std::cout << "[stonefish_sim] app=console\n";
         g_simulation_context->console = new ConsoleSimApp(dataPath.string(), g_simulation_context->sim);
         g_simulation_context->console->start(kPhysicsDt);
     }
     else
     {
-        std::println(stdout, "[hydrus_sim] app=graphical");
+        std::cout << "[stonefish_sim] app=graphical\n";
         g_simulation_context->graphical = new SimApp(
             dataPath.string(), DefaultRenderSettings(), DefaultHelperSettings(), g_simulation_context->sim);
         g_simulation_context->graphical->start(kPhysicsDt);
@@ -477,12 +594,14 @@ void auv_yield_until_next_frame(AuvFrame* frame)
             && g_simulation_context->console->getState() == sf::SimulationState::FINISHED);
     if(finished)
     {
-        std::println(stderr, "[hydrus_sim] simulation finished; restart for another run");
+        std::cerr << "[stonefish_sim] simulation finished; restart for another run\n";
         auv_deinit();
         return;
     }
     *frame = g_simulation_context->sim->getAuvFrame();
 }
+
+
 
 void auv_set_thrustor_values(const float* thrustor_values, uint8_t thrustor_values_len)
 {

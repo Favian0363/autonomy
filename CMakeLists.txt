@@ -22,33 +22,33 @@ ExternalProject_Add(stonefish
     "${STONEFISH_DIR}/lib/libStonefish.so"
 )
 
-add_library(auv_hydrus_sim SHARED
-    auvs/hydrus_sim/auv.cpp
+add_library(auv_stonefish_sim SHARED
+    auvs/stonefish_sim/auv.cpp
 )
 
-add_dependencies(auv_hydrus_sim stonefish)
+add_dependencies(auv_stonefish_sim stonefish)
 
-target_include_directories(auv_hydrus_sim PRIVATE
+target_include_directories(auv_stonefish_sim PRIVATE
   "${STONEFISH_DIR}/include"
   "${STONEFISH_DIR}/include/Stonefish"
 )
 
-target_compile_definitions(auv_hydrus_sim PRIVATE
+target_compile_definitions(auv_stonefish_sim PRIVATE
   _GNU_SOURCE
   BT_EULER_DEFAULT_ZYX
   BT_USE_DOUBLE_PRECISION
   SHADER_DIR_PATH="${STONEFISH_DIR}/share/Stonefish/shaders/"
 )
 
-target_compile_options(auv_hydrus_sim PRIVATE
+target_compile_options(auv_stonefish_sim PRIVATE
   -fopenmp
 )
 
-target_link_directories(auv_hydrus_sim PRIVATE
+target_link_directories(auv_stonefish_sim PRIVATE
   "${STONEFISH_DIR}/lib"
 )
 
-target_link_libraries(auv_hydrus_sim PRIVATE
+target_link_libraries(auv_stonefish_sim PRIVATE
   Stonefish
   SDL2
   freetype
@@ -58,10 +58,10 @@ target_link_libraries(auv_hydrus_sim PRIVATE
   gomp
 )
 
-set_target_properties(auv_hydrus_sim PROPERTIES
+set_target_properties(auv_stonefish_sim PROPERTIES
   BUILD_RPATH "${STONEFISH_DIR}/lib"
 )
 
 install(
-  TARGETS auv_hydrus_sim
+  TARGETS auv_stonefish_sim
 )
