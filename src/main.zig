@@ -32,9 +32,15 @@ pub fn main(init: std.process.Init) !void {
                 std.log.info("restaring mission", .{});
                 continue;
             },
+            error.Stopped => {
+                std.log.info("stopped", .{});
+                break;
+            },
         };
 
         std.log.info("succesfully completed mission", .{});
         break;
     }
+
+    ctx.auv.deinit();
 }

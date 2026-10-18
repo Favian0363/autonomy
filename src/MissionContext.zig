@@ -12,6 +12,12 @@ const MissionContext = @This();
 const print_stuff = true;
 const clear_print_stuff = true;
 
+var stop_requested = std.atomic.Value(bool).init(false);
+
+fn requestStop(_: std.posix.SIG) callconv(.c) void {
+    stop_requested.store(true, .monotonic);
+}
+
 io: Io,
 
 frame: Auv.Frame,
@@ -57,6 +63,10 @@ config_loader: ConfigLoader,
 config_watcher: FileWatcher,
 
 pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs, telemetry: Telemetry) !MissionContext {
+    const stop: std.posix.Sigaction = .{ .handler = .{ .handler = requestStop }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(.INT, &stop, null);
+    std.posix.sigaction(.TERM, &stop, null);
+
     var config_loader: ConfigLoader = try .init(arena, args.live_config_path);
     const config = config_loader.load(io) catch |err| {
         std.log.err("failed to load config: {s}", .{config_loader.config_path});
@@ -127,6 +137,8 @@ pub fn reset(ctx: *MissionContext) void {
 
 pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     ctx.auv.yieldUntilNextFrame(&ctx.frame);
+    if (stop_requested.load(.monotonic)) return error.Stopped;
+
     const start = Io.Clock.Timestamp.now(ctx.io, .awake);
 
     // std.log.debug("updating seen_objects...", .{});
