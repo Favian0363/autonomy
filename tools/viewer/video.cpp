@@ -11,6 +11,9 @@ static std::atomic<bool> running;
 static std::mutex lock;
 static std::vector<unsigned char> latest;
 static bool fresh = false;
+static bool opened = false;
+
+void video_close();
 
 static void grab_loop() {
   sl::Mat image;
@@ -44,6 +47,8 @@ static void grab_loop() {
 }
 
 bool video_open(const char *source, int *width, int *height) {
+  video_close();
+
   sl::InitParameters init;
   init.depth_mode = sl::DEPTH_MODE::NONE;
   init.svo_real_time_mode = true;
@@ -70,6 +75,7 @@ bool video_open(const char *source, int *width, int *height) {
   latest.resize(size.width * size.height * 4);
 
   running = true;
+  opened = true;
   grabber = std::thread(grab_loop);
   return true;
 }
@@ -84,7 +90,12 @@ bool video_frame(unsigned char *out) {
 }
 
 void video_close() {
+  if (!opened) return;
+
   running = false;
   if (grabber.joinable()) grabber.join();
   zed.close();
+  opened = false;
+  fresh = false;
+  latest.clear();
 }

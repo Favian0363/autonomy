@@ -42,8 +42,12 @@ static void read_string(const char *line, const char *key, char *out, int size) 
   out[n] = '\0';
 }
 
+// ZED streaming binds an even port and the next one; keep separate from telemetry udp (5600).
+static constexpr int kDefaultTelemetryPort = 5600;
+static constexpr int kDefaultStreamPort = 5610;
+
 int main(int argc, char **argv) {
-  const int port = argc > 1 ? std::atoi(argv[1]) : 5600;
+  const int port = argc > 1 ? std::atoi(argv[1]) : kDefaultTelemetryPort;
   const int fd = udp_open(port);
   if (fd < 0) {
     std::fprintf(stderr, "can't listen on udp port %d\n", port);
@@ -53,23 +57,36 @@ int main(int argc, char **argv) {
   InitWindow(1280, 720, "viewer");
   SetTargetFPS(60);
 
-  int video_w = 0, video_h = 0;
-  if (argc > 2 && !video_open(argv[2], &video_w, &video_h)) return 1;
+  char default_video[64];
+  const char *video_source = argc > 2 ? argv[2] : nullptr;
+  if (!video_source) {
+    std::snprintf(default_video, sizeof(default_video), "127.0.0.1:%d", kDefaultStreamPort);
+    video_source = default_video;
+  }
 
+  int video_w = 0, video_h = 0;
   Texture2D video{};
   unsigned char *pixels = nullptr;
-  if (video_w) {
-    Image blank = GenImageColor(video_w, video_h, BLACK);
-    video = LoadTextureFromImage(blank);
-    pixels = static_cast<unsigned char *>(blank.data);
-  }
 
   static char packet[64 * 1024];
   static char line[64 * 1024];
   double last_packet = -1;
   double last_frame = -1;
+  double last_video_try = -10;
 
   while (!WindowShouldClose()) {
+    if (!video_w && GetTime() - last_video_try > 2.0) {
+      last_video_try = GetTime();
+      int w = 0, h = 0;
+      if (video_open(video_source, &w, &h)) {
+        video_w = w;
+        video_h = h;
+        Image blank = GenImageColor(video_w, video_h, BLACK);
+        video = LoadTextureFromImage(blank);
+        pixels = static_cast<unsigned char *>(blank.data);
+        std::fprintf(stderr, "zed stream connected: %s\n", video_source);
+      }
+    }
     while (udp_read(fd, packet, sizeof(packet))) {
       std::strcpy(line, packet);
       last_packet = GetTime();
@@ -110,7 +127,9 @@ int main(int argc, char **argv) {
       }
 
       if (last_frame < 0 || GetTime() - last_frame > 1.0)
-        DrawText(TextFormat("no video from %s", argv[2]), 20, 20, 20, RED);
+        DrawText(TextFormat("no frames from %s", video_source), 20, 20, 20, RED);
+    } else {
+      DrawText(TextFormat("video: connecting to %s", video_source), 20, 20, 20, YELLOW);
     }
 
     const int x = 920;
@@ -119,6 +138,7 @@ int main(int argc, char **argv) {
     else
       DrawText(TextFormat("udp %d", port), x, 20, 20, GREEN);
 
+    DrawText(TextFormat("zed  %s", video_source), x, 40, 18, video_w ? GREEN : ORANGE);
     DrawText(TextFormat("step  %s", step), x, 60, 20, RAYWHITE);
     DrawText(TextFormat("pos   %.2f %.2f %.2f", pose[0], pose[1], pose[2]), x, 90, 20, RAYWHITE);
     DrawText(TextFormat("quat  %.2f %.2f %.2f %.2f", pose[3], pose[4], pose[5], pose[6]), x, 120, 20,
@@ -139,6 +159,6 @@ int main(int argc, char **argv) {
     EndDrawing();
   }
 
-  if (video_w) video_close();
+  video_close();
   CloseWindow();
 }

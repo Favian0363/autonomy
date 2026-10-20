@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
     const telemetry: Telemetry = try .init(
         init.io,
         init.environ_map.get("AUV_TELEMETRY_LOG"),
-        init.environ_map.get("AUV_TELEMETRY_ADDR"),
+        init.environ_map.get("AUV_TELEMETRY_ADDR") orelse "127.0.0.1:5600",
     );
     var ctx: MissionContext = try .init(init.arena.allocator(), init.io, args, telemetry);
 

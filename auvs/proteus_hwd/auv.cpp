@@ -9,7 +9,8 @@
 //AUV_ZED_SVO         recording to replay instead of the live camera
 //AUV_ZED_RESOLUTION  HD720 (default), HD1080, HD2K, VGA
 //AUV_ZED_FPS         30
-//AUV_ZED_STREAM_PORT even port to stream h264 to the laptop. unset = off
+//AUV_ZED_STREAM_PORT even port for h264 (default 5610; uses port+1 too). 0 = off.
+//                       telemetry udp is separate (default 127.0.0.1:5600). viewer video: 127.0.0.1:5610
 //AUV_ZED_RECORD      svo2 path to record h264 onboard. unset = off
 //AUV_LOG_CLS         1 to print model labels and their mapped classes
 //AUV_ZED_METRICS     1 to print per frame timing rows on stderr
@@ -106,7 +107,13 @@ void auv_init(void) {
       sl::StreamingParameters stream;
       stream.codec = sl::STREAMING_CODEC::H264;
       stream.port = static_cast<unsigned short>(config.stream_port);
-      check(zed.enableStreaming(stream), "enable streaming");
+      const auto stream_err = zed.enableStreaming(stream);
+      if (stream_err != sl::ERROR_CODE::SUCCESS) {
+        std::fprintf(stderr,
+                     "[zed] warning: streaming on port %d failed: %s (is the port free? telemetry uses udp "
+                     "5600; zed needs this even port and the next one)\n",
+                     config.stream_port, sl::toString(stream_err).c_str());
+      }
     }
     if (*config.record) {
       sl::RecordingParameters record;
@@ -177,7 +184,8 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
     std::fprintf(stderr, "Recording has ended\n");
     break;
 
-  case sl::ERROR_CODE::SUCCESS:
+  case sl::ERROR_CODE::SUCCESS: {
+    const uint64_t frame_start = config.metrics ? now_ns() : 0;
     tracking = zed.getPosition(pose, sl::REFERENCE_FRAME::WORLD);
     frame->timestamp = zed.getTimestamp(sl::TIME_REFERENCE::IMAGE).getNanoseconds();
     frame->tracking_ok = (tracking == sl::POSITIONAL_TRACKING_STATE::OK);
@@ -251,9 +259,16 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
             }
           }
 
+          const int cls = map_class(config, object.raw_label);
+          if (cls < 0) {
+            if (config.log_classes)
+              std::fprintf(stderr, "[zed] unmapped detector label %d\n", object.raw_label);
+            continue;
+          }
+
           const uint8_t i = frame->objects_len;
           frame->objects[i].id = static_cast<uint32_t>(object.id);
-          frame->objects[i].cls = static_cast<AuvObjectCls>(object.raw_label);
+          frame->objects[i].cls = static_cast<AuvObjectCls>(cls);
           frame->objects[i].bbox = {};
           frame->objects[i].bbox.pose.quat.buf[3] = 1;
           const float flip[] = {1, -1, -1};
@@ -268,6 +283,9 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
 
         if (frame->objects2d_len < AUV_FRAME_MAX_OBJECTS &&
             object.bounding_box_2d.size() >= 3) {
+          const int cls2d = map_class(config, object.raw_label);
+          if (cls2d < 0) continue;
+
           const auto &bbox = object.bounding_box_2d;
           const uint8_t j = frame->objects2d_len;
           frame->objects2d[j].top_left.x = bbox[0].x;
@@ -275,13 +293,20 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
           frame->objects2d[j].bottom_right.x = bbox[2].x;
           frame->objects2d[j].bottom_right.y = bbox[2].y;
           frame->objects2d[j].id = static_cast<uint32_t>(object.id);
-          frame->objects2d[j].cls = static_cast<AuvObjectCls>(object.raw_label);
+          frame->objects2d[j].cls = static_cast<AuvObjectCls>(cls2d);
           frame->objects2d_len++;
         }
       }
     }
     last_timestamp = frame->timestamp;
+    if (config.metrics) {
+      const uint64_t frame_end = now_ns();
+      std::fprintf(stderr, "zed_frame,%" PRIu64 ",%llu,0,0,%u\n", frame->timestamp,
+                   static_cast<unsigned long long>(frame_end - frame_start),
+                   frame->objects_len);
+    }
     break;
+  }
   default:
     break;
   }
@@ -343,7 +368,7 @@ static Config load_config() {
   config.onnx = env_or("AUV_ZED_ONNX");
   config.svo = env_or("AUV_ZED_SVO");
   config.fps = parse_nonnegative(env_or("AUV_ZED_FPS", "30"));
-  config.stream_port = parse_nonnegative(env_or("AUV_ZED_STREAM_PORT", "0"));
+  config.stream_port = parse_nonnegative(env_or("AUV_ZED_STREAM_PORT", "5610"));
   config.record = env_or("AUV_ZED_RECORD");
   if (config.fps == 0) throw std::runtime_error("AUV_ZED_FPS must be positive");
   config.log_classes = env_flag("AUV_LOG_CLS");
