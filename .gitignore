@@ -1,5 +1,19 @@
 zig-out/
 .zig-cache/
+<<<<<<< Updated upstream
 .cache/
 build
 tmp/
+=======
+demo
+frames
+build
+build-rtx
+auvs/stonefish_sim
+tmp
+tools
+
+
+
+.cache
+>>>>>>> Stashed changes
