@@ -19,17 +19,20 @@ seen_objects: [Auv.Frame.max_objects]Auv.Object,
 seen_objects_len: u8,
 
 goal_dist_threshold: f32,
-close_enough: f32,
 thrustor_saturate: f32,
 
 log_counter: u32,
 log_freq_div: u16,
 
 goal: math.Vector6f,
+// Tracks the XY goal so yaw stays at its starting heading during translation,
+// then switches to the requested yaw after arrival.
+last_xy_goal: ?math.Vector2f = null,
+held_yaw: ?f32 = null,
+xy_reached: bool = false,
 pid_sum_err: math.Vector6f,
 pid_prev_pose_err: math.Vector6f,
 pid_prev_timestamp_ns: ?u64,
-
 
 // NonOdometryState
 seen_objects2d: [Auv.Frame.max_objects]Auv.Object2d = undefined,
@@ -42,8 +45,6 @@ tracked_id: i32 = -1,
 search_yaw: f32 = 0,
 hold_depth: f32 = 2,
 //
-
-
 
 auv: Auv,
 auv_loader: AuvLoader,
@@ -84,7 +85,6 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
         .seen_objects_len = 0,
 
         .goal_dist_threshold = args.goal_dist_threshold,
-        .close_enough = 1,
         .thrustor_saturate = 5,
 
         .log_counter = 0,
@@ -114,6 +114,9 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
 /// Invalidates `seen_objects`
 pub fn reset(ctx: *MissionContext) void {
     ctx.seen_objects_len = 0;
+    ctx.last_xy_goal = null;
+    ctx.held_yaw = null;
+    ctx.xy_reached = false;
     ctx.pid_sum_err = @splat(0);
     ctx.pid_prev_pose_err = @splat(0);
     ctx.pid_prev_timestamp_ns = null;
@@ -153,7 +156,6 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
             ctx.seen_objects2d_len += 1;
         }
     }
-
 
     // std.log.debug("setting thruster_values with pid controller...", .{});
     ControllerStep(ctx);
@@ -242,101 +244,113 @@ fn ControllerStep(ctx: *MissionContext) void {
     };
 
     if (ctx.frame.tracking_ok) {
-    const pose = ctx.frame.camera_pose;
+        const pose = ctx.frame.camera_pose;
 
-    const goal = ctx.goal;
-    const current_pose = math.poseTo6f(pose);
+        const goal = ctx.goal;
+        const current_pose = math.poseTo6f(pose);
 
-    var pose_err = goal - current_pose;
+        var pose_err = goal - current_pose;
 
-    // Current orientation.
-    const rot = math.normalize4f(pose.quat);
+        // Current orientation.
+        const rot = math.normalize4f(pose.quat);
 
-    // Vehicle forward is +Y in body frame.
-    const forward = math.quaternionRotate(rot, .{ 0.0, 1.0, 0.0 });
+        // Vehicle forward is +Y in body frame.
+        const forward = math.quaternionRotate(rot, .{ 0.0, 1.0, 0.0 });
     const current_yaw = std.math.atan2(forward[1], forward[0]);
 
-    const dir = math.Vector3f{
-        pose_err[0],
-        pose_err[1],
-        0.0,
-    };
+        const dir = math.Vector3f{
+            pose_err[0],
+            pose_err[1],
+            0.0,
+        };
 
-    const xy_distance = math.length3f(dir);
+        const xy_distance = math.length3f(dir);
 
-
-    const target_yaw = if (xy_distance > ctx.close_enough)
-        std.math.atan2(dir[1], dir[0])
-    else
-        goal[5];
-
-    const yaw_error = math.wrapAngle(target_yaw - current_yaw);
-
-    pose_err[5] = yaw_error;
-
-    const vel_err: math.Vector6f = if (dt) |delta_t| blk: {
-        ctx.pid_sum_err += pose_err * @as(math.Vector6f, @splat(delta_t));
-
-        break :blk (pose_err - ctx.pid_prev_pose_err) / @as(math.Vector6f, @splat(delta_t));
-    } else @splat(0.0);
-
-    const kp = ctx.config.odometry.kp;
-    const ki = ctx.config.odometry.ki;
-    const kd = ctx.config.odometry.kd;
-
-    const wrench =
-        kp * pose_err +
-        ki * ctx.pid_sum_err +
-        kd * vel_err;
-
-    const input = math.wrenchToThrusterInput(wrench, pose.quat, yaw_error, std.math.pi / 8.0);
-    const max_thrusters = 8;
-    var thruster_buffer: [max_thrusters]f32 = undefined;
-    const thruster_values = math.tamMul(ctx.config.tam, input, &thruster_buffer);
-
-    for (thruster_values) |*value| {
-        value.* = std.math.clamp(
-            value.*,
-            -ctx.thrustor_saturate,
-            ctx.thrustor_saturate,
+        const yaw_state = math.targetYaw(
+            ctx.last_xy_goal,
+            ctx.held_yaw,
+            ctx.xy_reached,
+            goal,
+            xy_distance,
+            current_yaw,
+            ctx.config.odometry.xy_arrival_radius,
         );
+        ctx.last_xy_goal = yaw_state.last_xy_goal;
+        ctx.held_yaw = yaw_state.held_yaw;
+        ctx.xy_reached = yaw_state.xy_reached;
+        const target_yaw = yaw_state.yaw;
 
-        value.* /= 5.0;
-    }
+        const yaw_error = math.wrapAngle(target_yaw - current_yaw);
 
-    if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
-        if (clear_print_stuff) {
-            std.debug.print("\x1b[2J\x1b[H", .{});
+        pose_err[5] = yaw_error;
+
+        const vel_err: math.Vector6f = if (dt) |delta_t| blk: {
+            ctx.pid_sum_err += pose_err * @as(math.Vector6f, @splat(delta_t));
+
+            break :blk (pose_err - ctx.pid_prev_pose_err) / @as(math.Vector6f, @splat(delta_t));
+        } else @splat(0.0);
+
+        const kp = ctx.config.odometry.kp;
+        const ki = ctx.config.odometry.ki;
+        const kd = ctx.config.odometry.kd;
+
+        const wrench =
+            kp * pose_err +
+            ki * ctx.pid_sum_err +
+            kd * vel_err;
+
+        const input = math.wrenchToThrusterInput(wrench, pose.quat, yaw_error, std.math.pi / 8.0);
+        const max_thrusters = 8;
+        var thruster_buffer: [max_thrusters]f32 = undefined;
+        const thruster_values = math.tamMul(ctx.config.tam, input, &thruster_buffer);
+
+        for (thruster_values) |*value| {
+            value.* = std.math.clamp(
+                value.*,
+                -ctx.thrustor_saturate,
+                ctx.thrustor_saturate,
+            );
+
+            value.* /= 5.0;
         }
-        std.log.debug("config:", .{});
-        std.log.debug("\tclose_enough = {}", .{ctx.close_enough});
-        math.debug6f("\tkp", kp);
-        math.debug6f("\tki", ki);
-        math.debug6f("\tkd", kd);
-        for (ctx.config.tam) |row| {
-            math.debug6f("\ttam", row);
-        }
-        std.log.debug("dt = {d:6.2} ms", .{(dt orelse 0) * 1000});
-        math.debug6f("pose", current_pose);
-        math.debug6f("goal", goal);
-        std.log.debug("xy_distance = {}", .{xy_distance});
-        std.log.debug("thruster mapping:", .{});
-        math.debug6f("\twrench  ", wrench);
-        math.debug3f("\tforward ", forward);
-        math.debug3f("\tdir2d   ", dir);
-        std.log.debug(
-            "\tcurrent_yaw={d:3.2} target_yaw={d:3.2} yaw_error={d:3.2}",
-            .{ current_yaw, target_yaw, yaw_error },
-        );
-        // math.debug3f("\trotated ", rotated);
-        // math.debug3f("\tbody_force ", body_force);
-        math.debug6f("\tinput   ", input);
-        std.log.debug("\tthruster_values = {any}", .{thruster_values});
-    }
-    ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
 
-    ctx.pid_prev_pose_err = pose_err;
+        if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
+            if (clear_print_stuff) {
+                std.debug.print("\x1b[2J\x1b[H", .{});
+            }
+            std.log.debug("config:", .{});
+            std.log.debug("\txy_arrival_radius = {}", .{ctx.config.odometry.xy_arrival_radius});
+            math.debug6f("\tkp", kp);
+            math.debug6f("\tki", ki);
+            math.debug6f("\tkd", kd);
+            for (ctx.config.tam) |row| {
+                math.debug6f("\ttam", row);
+            }
+            std.log.debug("dt = {d:6.2} ms", .{(dt orelse 0) * 1000});
+            std.log.debug("timestamp_ns = {d}, xy_translation_complete = {}", .{ timestamp_ns, ctx.xy_reached });
+            math.debug6f("pose", current_pose);
+            math.debug6f("goal", goal);
+            std.log.debug("xy_distance = {}", .{xy_distance});
+            std.log.debug("thruster mapping:", .{});
+            math.debug6f("\twrench  ", wrench);
+            math.debug3f("\tforward ", forward);
+            math.debug3f("\tdir2d   ", dir);
+            std.log.debug(
+                "\tcurrent_yaw={d:3.2} target_yaw={d:3.2} yaw_error={d:3.2}",
+                .{ current_yaw, target_yaw, yaw_error },
+            );
+            // math.debug3f("\trotated ", rotated);
+            // math.debug3f("\tbody_force ", body_force);
+            math.debug6f("\tinput   ", input);
+            std.log.debug("\tthruster_values = {any}", .{thruster_values});
+        }
+        ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
+
+        ctx.pid_prev_pose_err = pose_err;
     } else {
+        ctx.last_xy_goal = null;
+        ctx.held_yaw = null;
+        ctx.xy_reached = false;
         ctx.trackFirstSeenObject2d();
 
         const non_odometry = ctx.config.non_odometry;
@@ -349,8 +363,8 @@ fn ControllerStep(ctx: *MissionContext) void {
             null
         else
             for (ctx.seen_objects2d[0..ctx.seen_objects2d_len]) |object| {
-                if (object.id == @as(u32, @intCast(ctx.tracked_id))) break object;
-            } else null;
+            if (object.id == @as(u32, @intCast(ctx.tracked_id))) break object;
+        } else null;
 
         const tam_input = if (ctx.tracked_id >= 0 and tracked_box == null) blk: {
             ctx.non_odometry_pid_sum_err = @splat(0);

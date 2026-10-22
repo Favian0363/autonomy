@@ -1,7 +1,8 @@
 #include <cmath>
 #include <cstdio>
 #include <math.h>
-
+#include <csignal>
+#include <cstdlib>
 #include "../../include/auv.h"
 
 #include "Stonefish/actuators/Actuator.h"
@@ -42,6 +43,24 @@ static constexpr sf::Scalar kRealtimeFactorCap = 1.0;
 static constexpr sf::Scalar kTrackingOkSeconds = 1000.0;
 static constexpr auto kMinRenderInterval = std::chrono::milliseconds(16);
 static constexpr bool kConsoleApp = false;
+static sf::Scalar realtimeFactorCap = kRealtimeFactorCap;
+
+
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+void requestStop(int)
+{
+    g_stop_requested = 1;
+}
+
+void stopIfRequested()
+{
+    if(g_stop_requested == 0)
+        return;
+    std::cerr << "[stonefish_sim] interrupted; shutting down" << std::endl;
+    auv_deinit();
+    std::exit(130);
+}
 
 namespace
 {
@@ -558,6 +577,8 @@ sf::HelperSettings DefaultHelperSettings()
 
 void auv_init(void)
 {
+    g_stop_requested = 0;
+    std::signal(SIGINT, requestStop);
     auv_deinit();
 
     g_simulation_context = new SimulationContext();
@@ -579,6 +600,8 @@ void auv_init(void)
 
 void auv_yield_until_next_frame(AuvFrame* frame)
 {
+
+    stopIfRequested();
     if(g_simulation_context == nullptr)
         return;
 
@@ -596,7 +619,7 @@ void auv_yield_until_next_frame(AuvFrame* frame)
     {
         std::cerr << "[stonefish_sim] simulation finished; restart for another run\n";
         auv_deinit();
-        return;
+        std::exit(0);
     }
     *frame = g_simulation_context->sim->getAuvFrame();
 }

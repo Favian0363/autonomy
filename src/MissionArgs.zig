@@ -5,6 +5,7 @@ const MissionArgs = @This();
 
 pub const MissionId = enum {
     prequalify,
+    teleop,
 };
 
 goal_dist_threshold: f32,
