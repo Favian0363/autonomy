@@ -22,12 +22,14 @@ pub const NonOdometryPid = struct {
 };
 
 pub const OdometryPid = struct {
+    xy_arrival_radius: f32 = 0.025,
     kp: math.Vector6f,
     ki: math.Vector6f,
     kd: math.Vector6f,
 };
 
 pub const Config = struct {
+    teleop_port: u16 = 8080,
     tam: []math.Vector6f,
     odometry: OdometryPid,
     non_odometry: NonOdometryPid,

@@ -11,21 +11,24 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx: MissionContext = try .init(init.arena.allocator(), init.io, args);
 
-    const mission = switch (args.mission_id) {
-        .prequalify => @import("missions/prequalify.zig").mission,
-    };
-
     while (true) {
         try ctx.yieldUntilNextFrameAndUpdate();
+        //Make sure the goal starts  with the inital measurement of the odometry
         ctx.goal = math.poseTo6f(ctx.frame.camera_pose);
 
-        mission(&ctx) catch |err| switch (err) {
+        const mission_result = switch (args.mission_id) {
+            .prequalify => @import("missions/prequalify.zig").mission(&ctx),
+            .teleop => @import("missions/prequalify.zig").teleopMission(&ctx),
+        };
+
+        mission_result catch |err| switch (err) {
             error.RestartMission => {
                 std.log.info("restaring mission context", .{});
                 ctx.reset();
                 std.log.info("restaring mission", .{});
                 continue;
             },
+            else => return err,
         };
 
         std.log.info("succesfully completed mission", .{});
