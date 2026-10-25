@@ -17,7 +17,8 @@ pub fn main(init: std.process.Init) !void {
         ctx.goal = math.poseTo6f(ctx.frame.camera_pose);
 
         const mission_result = switch (args.mission_id) {
-            .prequalify => @import("missions/prequalify.zig").mission(&ctx),
+            .prequalify_coco => @import("missions/prequalify.zig").cocoMission(&ctx),
+            .prequalify_robosub => @import("missions/prequalify.zig").robosubMission(&ctx),
             .teleop => @import("missions/prequalify.zig").teleopMission(&ctx),
         };
 
@@ -28,10 +29,16 @@ pub fn main(init: std.process.Init) !void {
                 std.log.info("restaring mission", .{});
                 continue;
             },
+            error.Stopped => {
+                std.log.info("stopped", .{});
+                break;
+            },
             else => return err,
         };
 
         std.log.info("succesfully completed mission", .{});
         break;
     }
+
+    ctx.auv.deinit();
 }

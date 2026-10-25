@@ -4,7 +4,8 @@ const Io = std.Io;
 const MissionArgs = @This();
 
 pub const MissionId = enum {
-    prequalify,
+    prequalify_coco,
+    prequalify_robosub,
     teleop,
 };
 

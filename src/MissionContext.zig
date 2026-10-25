@@ -6,10 +6,17 @@ const Auv = @import("Auv.zig");
 const AuvLoader = @import("AuvLoader.zig");
 const ConfigLoader = @import("ConfigLoader.zig");
 const FileWatcher = @import("FileWatcher.zig");
+const Telemetry = @import("Telemetry.zig");
 
 const MissionContext = @This();
 const print_stuff = true;
 const clear_print_stuff = true;
+
+var stop_requested = std.atomic.Value(bool).init(false);
+
+fn requestStop(_: std.posix.SIG) callconv(.c) void {
+    stop_requested.store(true, .monotonic);
+}
 
 io: Io,
 
@@ -34,6 +41,9 @@ pid_sum_err: math.Vector6f,
 pid_prev_pose_err: math.Vector6f,
 pid_prev_timestamp_ns: ?u64,
 
+step: []const u8,
+telemetry: Telemetry,
+
 // NonOdometryState
 seen_objects2d: [Auv.Frame.max_objects]Auv.Object2d = undefined,
 seen_objects2d_len: u8 = 0,
@@ -55,6 +65,10 @@ config_loader: ConfigLoader,
 config_watcher: FileWatcher,
 
 pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext {
+    const stop: std.posix.Sigaction = .{ .handler = .{ .handler = requestStop }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(.INT, &stop, null);
+    std.posix.sigaction(.TERM, &stop, null);
+
     var config_loader: ConfigLoader = try .init(arena, args.live_config_path);
     const config = config_loader.load(io) catch |err| {
         std.log.err("failed to load config: {s}", .{config_loader.config_path});
@@ -78,6 +92,8 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
         std.log.debug("{any}", .{auv});
     }
 
+    const telemetry: Telemetry = try .init(io);
+
     return .{
         .frame = undefined,
 
@@ -95,6 +111,9 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
         .pid_sum_err = @splat(0),
         .pid_prev_pose_err = @splat(0),
         .pid_prev_timestamp_ns = null,
+
+        .step = "",
+        .telemetry = telemetry,
 
         .non_odometry_pid_sum_err = @splat(0),
         .non_odometry_pid_prev_pose_err = @splat(0),
@@ -124,6 +143,8 @@ pub fn reset(ctx: *MissionContext) void {
 
 pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     ctx.auv.yieldUntilNextFrame(&ctx.frame);
+    if (stop_requested.load(.monotonic)) return error.Stopped;
+
     const start = Io.Clock.Timestamp.now(ctx.io, .awake);
 
     // std.log.debug("updating seen_objects...", .{});
@@ -218,6 +239,7 @@ fn setThrustersFromTamInput(ctx: *MissionContext, input: math.Vector6f) void {
         &thruster_buffer,
     );
     ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
+    ctx.telemetry.publish_to_udp(&ctx.frame, thruster_values, ctx.step);
 }
 
 fn ControllerStep(ctx: *MissionContext) void {
@@ -313,7 +335,6 @@ fn ControllerStep(ctx: *MissionContext) void {
 
             value.* /= 5.0;
         }
-
         if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
             if (clear_print_stuff) {
                 std.debug.print("\x1b[2J\x1b[H", .{});
@@ -345,6 +366,7 @@ fn ControllerStep(ctx: *MissionContext) void {
             std.log.debug("\tthruster_values = {any}", .{thruster_values});
         }
         ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
+        ctx.telemetry.publish_to_udp(&ctx.frame, thruster_values, ctx.step);
 
         ctx.pid_prev_pose_err = pose_err;
     } else {
@@ -467,7 +489,7 @@ fn trackFirstSeenObject2d(ctx: *MissionContext) void {
     ctx.trackObject2d(ctx.seen_objects2d[0].id);
 }
 
-fn yieldUntilObjectWithCls(ctx: *MissionContext, clss: []const Auv.ObjectCls, start: usize) !*const Auv.Object {
+fn yieldUntilObjectWithCls(ctx: *MissionContext, clss: []const u8, start: usize) !*const Auv.Object {
     var seen = start;
 
     while (true) {
@@ -485,22 +507,22 @@ fn yieldUntilObjectWithCls(ctx: *MissionContext, clss: []const Auv.ObjectCls, st
 }
 
 /// yield until getting first object with any of the `cls` in `clss`
-pub fn yieldUntilFirstObjectWithAnyCls(ctx: *MissionContext, clss: []const Auv.ObjectCls) !*const Auv.Object {
+pub fn yieldUntilFirstObjectWithAnyCls(ctx: *MissionContext, clss: []const u8) !*const Auv.Object {
     return try yieldUntilObjectWithCls(ctx, clss, 0);
 }
 
 /// yield until getting first object wit `cls`
-pub fn yieldUntilFirstObjectWithCls(ctx: *MissionContext, cls: Auv.ObjectCls) !*const Auv.Object {
+pub fn yieldUntilFirstObjectWithCls(ctx: *MissionContext, cls: u8) !*const Auv.Object {
     return try yieldUntilFirstObjectWithAnyCls(ctx, &.{cls});
 }
 
 /// yield until getting next object with any of the `cls` in `clss` (ignoring any seen before)
-pub fn yieldUntilNewObjectWithAnyCls(ctx: *MissionContext, clss: []const Auv.ObjectCls) !*const Auv.Object {
+pub fn yieldUntilNewObjectWithAnyCls(ctx: *MissionContext, clss: []const u8) !*const Auv.Object {
     return try yieldUntilObjectWithCls(ctx, clss, ctx.seen_objects_len);
 }
 
 /// yield until getting next object wit `cls` (ignoring any seen before)
-pub fn yieldUntilNewObjectWithCls(ctx: *MissionContext, cls: Auv.ObjectCls) !*const Auv.Object {
+pub fn yieldUntilNewObjectWithCls(ctx: *MissionContext, cls: u8) !*const Auv.Object {
     return try yieldUntilNewObjectWithAnyCls(ctx, &.{cls});
 }
 

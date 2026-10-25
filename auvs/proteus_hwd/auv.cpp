@@ -1,50 +1,35 @@
 // zed 2i camera plugin. talks to the stereolabs sdk directly
 // coordinates are meters, world frame, x forward, y right, z down
 //
-// auv_init takes no arguments, so configuration comes from the environment:
-//
-//AUV_ZED_ONNX        detector model path. unset = pose only
-//AUV_CLS_MAP         label:class pairs, comma separated. required with a
-//                       model and classes are 0 cube, 1 rect, 2 gate
-//AUV_ZED_SVO         recording to replay instead of the live camera
-//AUV_ZED_RESOLUTION  HD720 (default), HD1080, HD2K, VGA
-//AUV_ZED_FPS         30
-//AUV_LOG_CLS         1 to print model labels and their mapped classes
-//AUV_ZED_METRICS     1 to print per frame timing rows on stderr
+// Edit the kZed* constants below. Telemetry udp defaults to 127.0.0.1:5600;
+// viewer video stream defaults to 127.0.0.1:5610 (even port, uses the next port too).
 
 #include "../../include/auv.h"
 #include "arduino.hpp"
 #include <cstdint>
 #include <sl/Camera.hpp>
-#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <inttypes.h>
 #include <limits>
 #include <stdexcept>
-#include <string>
-#include <string_view>
 #include <sys/stat.h>
 #include <thread>
-#include <vector>
+#include <time.h>
 #include <cinttypes>
-
-
-struct ClassMapping {
-  int label;
-  AuvObjectCls cls;
-};
 
 struct Config {
   const char *onnx;
   const char *svo;
+  const char *record;
+  int stream_port;
   sl::RESOLUTION resolution;
   int fps;
   bool log_classes;
   bool metrics;
-  std::vector<ClassMapping> classes;
 };
 
 static sl::Camera zed;
@@ -57,18 +42,36 @@ static bool detection_enabled = false;
 static uint64_t last_timestamp = 0;
 static float surface_pressure_hpa = 0.f;
 static bool surface_pressure_set = false;
+static uint64_t frames = 0;
 static std::thread arduino_reader_thread;
 static std::thread arduino_writer_thread;
 static constexpr float kWaterDensity = 997.0f;
 static constexpr float kGravity = 9.80665f;
+static constexpr uintmax_t kMinFreeDisk = 1ULL << 30;
+
+static constexpr const char *kZedOnnx = "yolov8n.onnx";
+static constexpr const char *kZedSvo = ""; // svo replay path instead of live camera
+static constexpr const char *kZedRecord = ""; // onboard svo2 recording path; empty = off
+static constexpr int kZedFps = 30;
+static constexpr int kZedStreamPort = 5610; // 0 = off
+static constexpr bool kLogCls = false;
+static constexpr bool kZedMetrics = false;
+static constexpr sl::RESOLUTION kZedResolution = sl::RESOLUTION::HD720;
 
 static Config load_config();
-static int map_class(const Config &config, int label);
+static bool coco_class(int label, AuvObjectCls *cls);
 
 [[noreturn]] static void fail(const char *message) {
   std::fprintf(stderr, "[zed] %s\n", message);
   auv_deinit();
   std::exit(EXIT_FAILURE);
+}
+
+static uint64_t now_ns() {
+  timespec now{};
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    fail("monotonic clock failed");
+  return static_cast<uint64_t>(now.tv_sec) * 1000000000ULL + static_cast<uint64_t>(now.tv_nsec);
 }
 
 static void check(sl::ERROR_CODE error, const char *operation) {
@@ -97,6 +100,24 @@ void auv_init(void) {
 
     check(zed.open(params), "open camera");
     zed_open = true;
+    if (config.stream_port) {
+      sl::StreamingParameters stream;
+      stream.codec = sl::STREAMING_CODEC::H264;
+      stream.port = static_cast<unsigned short>(config.stream_port);
+      const auto stream_err = zed.enableStreaming(stream);
+      if (stream_err != sl::ERROR_CODE::SUCCESS) {
+        std::fprintf(stderr,
+                     "[zed] warning: streaming on port %d failed: %s (is the port free? telemetry uses udp "
+                     "5600; zed needs this even port and the next one)\n",
+                     config.stream_port, sl::toString(stream_err).c_str());
+      }
+    }
+    if (*config.record) {
+      sl::RecordingParameters record;
+      record.video_filename = sl::String(config.record);
+      record.compression_mode = sl::SVO_COMPRESSION_MODE::H264;
+      check(zed.enableRecording(record), "enable recording");
+    }
     sl::PositionalTrackingParameters tracking;
     tracking.enable_area_memory = true;
     check(zed.enablePositionalTracking(tracking), "enable positional tracking");
@@ -132,6 +153,15 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
     return;
   }
 
+  if (*config.record && ++frames % 30 == 0) {
+    std::error_code err;
+    const auto disk = std::filesystem::space(config.record, err);
+    if (!err && disk.available < kMinFreeDisk && zed.getRecordingStatus().is_recording) {
+      std::fputs("[zed] disk almost full, stopped recording\n", stderr);
+      zed.disableRecording();
+    }
+  }
+
   sl::RuntimeParameters runtime;
   runtime.measure3D_reference_frame = sl::REFERENCE_FRAME::WORLD;
   const sl::ERROR_CODE error = zed.grab(runtime);
@@ -151,7 +181,8 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
     std::fprintf(stderr, "Recording has ended\n");
     break;
 
-  case sl::ERROR_CODE::SUCCESS:
+  case sl::ERROR_CODE::SUCCESS: {
+    const uint64_t frame_start = config.metrics ? now_ns() : 0;
     tracking = zed.getPosition(pose, sl::REFERENCE_FRAME::WORLD);
     frame->timestamp = zed.getTimestamp(sl::TIME_REFERENCE::IMAGE).getNanoseconds();
     frame->tracking_ok = (tracking == sl::POSITIONAL_TRACKING_STATE::OK);
@@ -225,9 +256,16 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
             }
           }
 
+          AuvObjectCls cls;
+          if (!coco_class(object.raw_label, &cls)) {
+            if (config.log_classes)
+              std::fprintf(stderr, "[zed] label %d is outside the coco classes\n", object.raw_label);
+            continue;
+          }
+
           const uint8_t i = frame->objects_len;
           frame->objects[i].id = static_cast<uint32_t>(object.id);
-          frame->objects[i].cls = static_cast<AuvObjectCls>(object.raw_label);
+          frame->objects[i].cls = cls;
           frame->objects[i].bbox = {};
           frame->objects[i].bbox.pose.quat.buf[3] = 1;
           const float flip[] = {1, -1, -1};
@@ -242,6 +280,9 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
 
         if (frame->objects2d_len < AUV_FRAME_MAX_OBJECTS &&
             object.bounding_box_2d.size() >= 3) {
+          AuvObjectCls cls2d;
+          if (!coco_class(object.raw_label, &cls2d)) continue;
+
           const auto &bbox = object.bounding_box_2d;
           const uint8_t j = frame->objects2d_len;
           frame->objects2d[j].top_left.x = bbox[0].x;
@@ -249,13 +290,20 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
           frame->objects2d[j].bottom_right.x = bbox[2].x;
           frame->objects2d[j].bottom_right.y = bbox[2].y;
           frame->objects2d[j].id = static_cast<uint32_t>(object.id);
-          frame->objects2d[j].cls = static_cast<AuvObjectCls>(object.raw_label);
+          frame->objects2d[j].cls = cls2d;
           frame->objects2d_len++;
         }
       }
     }
     last_timestamp = frame->timestamp;
+    if (config.metrics) {
+      const uint64_t frame_end = now_ns();
+      std::fprintf(stderr, "zed_frame,%" PRIu64 ",%llu,0,0,%u\n", frame->timestamp,
+                   static_cast<unsigned long long>(frame_end - frame_start),
+                   frame->objects_len);
+    }
     break;
+  }
   default:
     break;
   }
@@ -276,6 +324,8 @@ void auv_deinit(void) {
   if (zed_open) {
     zed_open = false;
     try {
+      zed.disableRecording();
+      zed.disableStreaming();
       zed.close();
     } catch (...) {
       std::fputs("[zed] camera close failed\n", stderr);
@@ -289,24 +339,11 @@ void auv_deinit(void) {
   objects.object_list.clear();
 }
 
-static const char *env_or(const char *name, const char *fallback = "") {
-  const char *value = std::getenv(name);
-  return value ? value : fallback;
-}
-
-static int parse_nonnegative(std::string_view text) {
-  int value = 0;
-  const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || value < 0)
-    throw std::runtime_error("expected a nonnegative integer");
-  return value;
-}
-
-static bool env_flag(const char *name) {
-  const std::string_view value = env_or(name, "0");
-  if (value != "0" && value != "1")
-    throw std::runtime_error("boolean environment settings must be 0 or 1");
-  return value == "1";
+static bool coco_class(int label, AuvObjectCls *cls) {
+  if (label < static_cast<int>(AUV_COCO_PERSON) || label >= static_cast<int>(AUV_COCO_COUNT))
+    return false;
+  *cls = static_cast<AuvObjectCls>(label);
+  return true;
 }
 
 static void check_file(const char *path) {
@@ -317,48 +354,18 @@ static void check_file(const char *path) {
 
 static Config load_config() {
   Config config{};
-  config.onnx = env_or("AUV_ZED_ONNX");
-  config.svo = env_or("AUV_ZED_SVO");
-  config.fps = parse_nonnegative(env_or("AUV_ZED_FPS", "30"));
-  if (config.fps == 0) throw std::runtime_error("AUV_ZED_FPS must be positive");
-  config.log_classes = env_flag("AUV_LOG_CLS");
-  config.metrics = env_flag("AUV_ZED_METRICS");
-
-  const std::string_view resolution = env_or("AUV_ZED_RESOLUTION", "HD720");
-  if (resolution == "HD720") config.resolution = sl::RESOLUTION::HD720;
-  else if (resolution == "HD1080") config.resolution = sl::RESOLUTION::HD1080;
-  else if (resolution == "HD2K") config.resolution = sl::RESOLUTION::HD2K;
-  else if (resolution == "VGA") config.resolution = sl::RESOLUTION::VGA;
-  else throw std::runtime_error("unknown AUV_ZED_RESOLUTION");
+  config.onnx = kZedOnnx;
+  config.svo = kZedSvo;
+  config.record = kZedRecord;
+  config.fps = kZedFps;
+  config.stream_port = kZedStreamPort;
+  if (config.fps == 0) throw std::runtime_error("kZedFps must be positive");
+  config.log_classes = kLogCls;
+  config.metrics = kZedMetrics;
+  config.resolution = kZedResolution;
 
   if (*config.onnx) check_file(config.onnx);
   if (*config.svo) check_file(config.svo);
 
-  std::string_view map = env_or("AUV_CLS_MAP");
-  if (*config.onnx && map.empty())
-    throw std::runtime_error("AUV_CLS_MAP is required with AUV_ZED_ONNX");
-  while (!map.empty()) {
-    const auto comma = map.find(',');
-    const auto entry = map.substr(0, comma);
-    const auto colon = entry.find(':');
-    if (colon == std::string_view::npos)
-      throw std::runtime_error("AUV_CLS_MAP entries must be label:class");
-    const int label = parse_nonnegative(entry.substr(0, colon));
-    const int cls = parse_nonnegative(entry.substr(colon + 1));
-    // src/Auv.zig: cube = 0, rect = 1, gate = 2
-    if (cls > 2) throw std::runtime_error("unknown mission class in AUV_CLS_MAP");
-    for (const auto &item : config.classes)
-      if (item.label == label) throw std::runtime_error("duplicate label in AUV_CLS_MAP");
-    config.classes.push_back({label, static_cast<AuvObjectCls>(cls)});
-    if (comma == std::string_view::npos) break;
-    map.remove_prefix(comma + 1);
-    if (map.empty()) throw std::runtime_error("trailing comma in AUV_CLS_MAP");
-  }
   return config;
-}
-
-[[maybe_unused]] static int map_class(const Config &config, int label) {
-  for (const auto &item : config.classes)
-    if (item.label == label) return item.cls;
-  return -1;
 }

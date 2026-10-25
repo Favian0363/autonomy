@@ -64,28 +64,41 @@ void stopIfRequested()
 
 namespace
 {
-enum class ObjectCls : AuvObjectCls
+// Scenario text for AuvRobosubCls. Local to the simulator.
+struct RobosubTag
 {
-    cube = 0,
-    rect = 1,
-    gate = 2,
+    const char* name;
+    AuvRobosubCls cls;
 };
 
-std::optional<ObjectCls> ParseObjectClass(const char* text)
+const RobosubTag kRobosubTags[] = {
+    {"gate", AUV_ROBOSUB_GATE},
+    {"marker", AUV_ROBOSUB_MARKER},
+};
+static_assert(std::size(kRobosubTags) == static_cast<size_t>(AUV_ROBOSUB_COUNT),
+              "stonefish robosub tags must match AuvRobosubCls");
+
+std::optional<AuvObjectCls> ParseObjectClass(const char* text)
 {
     if(text == nullptr || *text == '\0')
         return std::nullopt;
 
     std::string cls{text};
     for(char& c : cls)
+    {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if(c == ' ' || c == '-')
+            c = '_';
+    }
 
-    if(cls == "cube" || cls == "0")
-        return ObjectCls::cube;
-    if(cls == "rect" || cls == "rectangle" || cls == "1")
-        return ObjectCls::rect;
-    if(cls == "gate" || cls == "2")
-        return ObjectCls::gate;
+    for(const RobosubTag& tag : kRobosubTags)
+        if(cls == tag.name)
+            return static_cast<AuvObjectCls>(tag.cls);
+
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(cls.c_str(), &end, 10);
+    if(end != cls.c_str() && *end == '\0' && value < static_cast<unsigned long>(AUV_ROBOSUB_COUNT))
+        return static_cast<AuvObjectCls>(value);
     return std::nullopt;
 }
 
@@ -217,7 +230,7 @@ class AuvScenarioParser : public sf::ScenarioParser
 {
 public:
     using ScenarioParser::ScenarioParser;
-    std::unordered_map<std::string, ObjectCls> objectClasses;
+    std::unordered_map<std::string, AuvObjectCls> objectClasses;
 
 protected:
     bool ParseStatic(XMLElement* element) override
@@ -401,7 +414,7 @@ public:
     {
         sf::Entity* entity;
         uint32_t id;
-        ObjectCls cls;
+        AuvObjectCls cls;
     };
 
     std::filesystem::path scenarioPath;

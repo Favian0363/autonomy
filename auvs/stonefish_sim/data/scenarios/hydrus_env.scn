@@ -79,7 +79,7 @@
 
 
 	<!-- Marker -->
-	<static name="Marker" type="cylinder" cls="cube">
+	<static name="Marker" type="cylinder" cls="marker">
 		<dimensions radius="0.1" height="4" />
 		<world_transform rpy="0.0 0.0 0.0" xyz="1.0 20.0 2.0" />
 		<material name="pvc" />
