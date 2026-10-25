@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -29,6 +30,34 @@ int udp_open(int port) {
 #endif
 
   return static_cast<int>(fd);
+}
+
+int udp_send_open(const char *ip, int port) {
+  const auto fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) return -1;
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<unsigned short>(port));
+  if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1 ||
+      connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+    return -1;
+  }
+
+  return static_cast<int>(fd);
+}
+
+int udp_send(int fd, const void *buf, int size) {
+#ifdef _WIN32
+  return send(fd, reinterpret_cast<const char *>(buf), size, 0);
+#else
+  return static_cast<int>(send(fd, buf, static_cast<size_t>(size), 0));
+#endif
 }
 
 int udp_read(int fd, char *buf, int size) {

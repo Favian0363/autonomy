@@ -1,69 +1,109 @@
 const std = @import("std");
 const Io = std.Io;
 const Auv = @import("Auv.zig");
+const math = @import("math.zig");
 
 const Telemetry = @This();
+
+const default_log_path: ?[]const u8 = null;
+const default_addr: []const u8 = "127.0.0.1:5600";
 
 io: Io,
 file: ?Io.File = null,
 socket: ?Io.net.Socket = null,
 dest: Io.net.IpAddress = undefined,
 
-pub fn init(io: Io, log_path: ?[]const u8, addr: ?[]const u8) !Telemetry {
+pub fn init(io: Io) !Telemetry {
     var t: Telemetry = .{ .io = io };
-    if (log_path) |path| t.file = try Io.Dir.cwd().createFile(io, path, .{});
-    if (addr) |text| {
-        t.dest = try .parseLiteral(text);
-        const any: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
-        t.socket = try any.bind(io, .{ .mode = .dgram });
-    }
+    if (default_log_path) |path| t.file = try Io.Dir.cwd().createFile(io, path, .{});
+    t.dest = try .parseLiteral(default_addr);
+    const any: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+    t.socket = try any.bind(io, .{ .mode = .dgram });
     return t;
 }
 
-pub fn emit(t: *Telemetry, frame: *const Auv.Frame, thrusters: []const f32, step: []const u8) void {
+// Field order is the little-endian packet. A slice is a u8 count, then its items.
+// Struct fields are written without the alignment padding of the C layout.
+const Packet = struct {
+    magic: [4]u8 = "AUV1".*,
+    version: u8 = 1,
+    timestamp: u64,
+    camera_pose: math.Pose,
+    tracking_ok: bool,
+    depth_ok: bool,
+    depth: f32,
+    objects: []const Auv.Object,
+    boxes: []const Auv.Object2d,
+    thrusters: []const f32,
+    step: []const u8,
+};
+
+pub fn publish_to_udp(t: *Telemetry, frame: *const Auv.Frame, thrusters: []const f32, step: []const u8) void {
     if (t.file == null and t.socket == null) return;
+
+    const nobj = @min(frame.objects_len, Auv.Frame.max_objects);
+    const nbox = @min(frame.objects2d_len, Auv.Frame.max_objects);
+
     var buf: [64 * 1024]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    writeLine(&w, frame, thrusters, step) catch return;
-    const line = w.buffered();
+    write(&w, Packet{
+        .timestamp = frame.timestamp,
+        .camera_pose = frame.camera_pose,
+        .tracking_ok = frame.tracking_ok,
+        .depth_ok = frame.pressure_depth_ok,
+        .depth = frame.pressure_depth,
+        .objects = frame.objects[0..nobj],
+        .boxes = frame.objects2d[0..nbox],
+        .thrusters = thrusters[0..@min(thrusters.len, 255)],
+        .step = step[0..@min(step.len, 255)],
+    }) catch return;
+    const packet = w.buffered();
 
-    if (t.file) |file| file.writeStreamingAll(t.io, line) catch |err| {
+    if (t.file) |file| file.writeStreamingAll(t.io, packet) catch |err| {
         std.log.err("telemetry log write failed: {s}", .{@errorName(err)});
     };
     // udp never blocks, even with the laptop unplugged
-    if (t.socket) |*socket| socket.send(t.io, &t.dest, line) catch {};
+    if (t.socket) |*socket| socket.send(t.io, &t.dest, packet) catch {};
 }
 
-pub fn writeLine(w: *Io.Writer, frame: *const Auv.Frame, thrusters: []const f32, step: []const u8) !void {
-    const Object = struct { id: u32, cls: u8, pos: [3]f32, size: [3]f32 };
-    var objects: [Auv.Frame.max_objects]Object = undefined;
-    const len = @min(frame.objects_len, Auv.Frame.max_objects);
-    for (frame.objects[0..len], objects[0..len]) |from, *to| to.* = .{
-        .id = from.id,
-        .cls = @intFromEnum(from.cls),
-        .pos = from.bbox.pose.pos,
-        .size = from.bbox.size,
-    };
-
-    const Box = struct { id: u32, cls: u8, box: [4]u32 };
-    var boxes: [Auv.Frame.max_objects]Box = undefined;
-    const boxes_len = @min(frame.objects2d_len, Auv.Frame.max_objects);
-    for (frame.objects2d[0..boxes_len], boxes[0..boxes_len]) |from, *to| to.* = .{
-        .id = from.id,
-        .cls = @intFromEnum(from.cls),
-        .box = .{ from.top_left.x, from.top_left.y, from.bottom_right.x, from.bottom_right.y },
-    };
-
-    const pose = frame.camera_pose;
-    try std.json.Stringify.value(.{
-        .t = frame.timestamp,
-        .pose = @as([3]f32, pose.pos) ++ @as([4]f32, pose.quat),
-        .tracking = frame.tracking_ok,
-        .depth = if (frame.pressure_depth_ok) frame.pressure_depth else null,
-        .objs = objects[0..len],
-        .boxes = boxes[0..boxes_len],
-        .thr = thrusters,
-        .step = step,
-    }, .{}, w);
-    try w.writeByte('\n');
+fn write(w: *Io.Writer, value: anytype) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .int => {
+            var buf: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &buf, value, .little);
+            try w.writeAll(&buf);
+        },
+        .float => |info| {
+            const Bits = std.meta.Int(.unsigned, info.bits);
+            try write(w, @as(Bits, @bitCast(value)));
+        },
+        .bool => try write(w, @as(u8, @intFromBool(value))),
+        .@"enum" => |info| try write(w, @as(info.tag_type, @intFromEnum(value))),
+        .array => |info| {
+            if (info.child == u8) {
+                try w.writeAll(&value);
+            } else {
+                for (value) |item| try write(w, item);
+            }
+        },
+        .vector => |info| {
+            const array: [info.len]info.child = value;
+            try write(w, array);
+        },
+        .pointer => |info| {
+            if (info.size != .slice) @compileError("only slices can be written");
+            if (value.len > std.math.maxInt(u8)) return error.TooLong;
+            try write(w, @as(u8, @intCast(value.len)));
+            if (info.child == u8) {
+                try w.writeAll(value);
+            } else {
+                for (value) |item| try write(w, item);
+            }
+        },
+        .@"struct" => |info| inline for (info.fields) |field| {
+            try write(w, @field(value, field.name));
+        },
+        else => @compileError("unsupported telemetry type " ++ @typeName(T)),
+    }
 }

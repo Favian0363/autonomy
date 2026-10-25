@@ -3,38 +3,22 @@ const math = @import("../math.zig");
 const MissionContext = @import("../MissionContext.zig");
 const MissionArgs = @import("../MissionArgs.zig");
 const Auv = @import("../Auv.zig");
+const c = Auv.c;
 const net = std.Io.net;
 
 pub fn teleopMission(ctx: *MissionContext) !void {
     const port = ctx.config.teleop_port;
     const addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(port) };
-    const retry_interval_ms: i64 = 1_000;
-    const retry_interval: std.Io.Clock.Duration = .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(retry_interval_ms),
-    };
 
-    var sock = while (true) {
-        const bound_sock = addr.bind(ctx.io, .{
-            .mode = .dgram,
-            .protocol = .udp,
-        }) catch |err| {
-            std.log.debug(
-                "teleop could not bind UDP port {d}: {s}. The port may already be in use; change `teleop_port` in auv.json. Retrying in {d} ms",
-                .{ port, @errorName(err), retry_interval_ms },
-            );
-
-            const retry_at = std.Io.Clock.Timestamp.now(ctx.io, .awake).addDuration(retry_interval);
-            while (std.Io.Clock.Timestamp.compare(
-                std.Io.Clock.Timestamp.now(ctx.io, .awake),
-                .lt,
-                retry_at,
-            )) {
-                try ctx.yieldUntilNextFrameAndUpdate();
-            }
-            continue;
-        };
-        break bound_sock;
+    var sock = addr.bind(ctx.io, .{
+        .mode = .dgram,
+        .protocol = .udp,
+    }) catch |err| switch (err) {
+        error.AddressInUse => {
+            std.log.err("teleop UDP port {d} is already in use", .{port});
+            return error.AddressInUse;
+        },
+        else => return err,
     };
     defer sock.close(ctx.io);
 
@@ -64,16 +48,28 @@ pub fn teleopMission(ctx: *MissionContext) !void {
     }
 }
 
-pub fn mission(ctx: *MissionContext) !void {
+pub fn cocoMission(ctx: *MissionContext) !void {
+    ctx.step = "find_person";
+    const person = try ctx.yieldUntilFirstObjectWithCls(@intCast(c.AUV_COCO_PERSON));
+    ctx.step = "go_through_person";
+    try goThrough(ctx, person);
+
+    ctx.step = "find_bottle";
+    const bottle = try ctx.yieldUntilFirstObjectWithCls(@intCast(c.AUV_COCO_BOTTLE));
+    ctx.step = "go_around_bottle";
+    try goAround(ctx, bottle);
+}
+
+pub fn robosubMission(ctx: *MissionContext) !void {
     ctx.step = "find_gate";
-    const gate_object = try ctx.yieldUntilFirstObjectWithCls(.gate);
+    const gate = try ctx.yieldUntilFirstObjectWithCls(@intCast(c.AUV_ROBOSUB_GATE));
     ctx.step = "go_through_gate";
-    try goThrough(ctx, gate_object);
+    try goThrough(ctx, gate);
 
     ctx.step = "find_marker";
-    const cube_or_rect_object = try ctx.yieldUntilFirstObjectWithAnyCls(&.{.cube, .rect});
+    const marker = try ctx.yieldUntilFirstObjectWithCls(@intCast(c.AUV_ROBOSUB_MARKER));
     ctx.step = "go_around_marker";
-    try goAround(ctx, cube_or_rect_object);
+    try goAround(ctx, marker);
 }
 
 const FAR_ENOUGH: f64 = 2.0;

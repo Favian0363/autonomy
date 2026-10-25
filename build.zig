@@ -257,6 +257,7 @@ pub fn build(b: *std.Build) !void {
         lib_auv_proteus_hwd.addFileArg(b.path("auvs/proteus_hwd/arduino.cpp"));
         lib_auv_proteus_hwd.addFileInput(b.path("auvs/proteus_hwd/arduino.hpp"));
         lib_auv_proteus_hwd.addFileInput(b.path("include/auv.h"));
+        lib_auv_proteus_hwd.addFileInput(b.path("include/object_classes.h"));
         lib_auv_proteus_hwd.addFileInput(b.path("include/math.h"));
         lib_auv_proteus_hwd.addArgs(&.{
             "-isystem",

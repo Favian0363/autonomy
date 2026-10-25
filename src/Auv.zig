@@ -1,19 +1,14 @@
 const std = @import("std");
 const math = @import("math.zig");
 
-const c = @cImport({
+pub const c = @cImport({
     @cInclude("auv.h");
 });
 
-pub const ObjectCls = enum(u8) {
-    cube,
-    rect,
-    gate,
-};
 pub const Object = extern struct {
     bbox: math.BoundingBox,
     id: u32,
-    cls: ObjectCls,
+    cls: u8,
 };
 
 pub const Point2u = extern struct {
@@ -25,7 +20,7 @@ pub const Object2d = extern struct {
     top_left: Point2u,
     bottom_right: Point2u,
     id: u32,
-    cls: ObjectCls,
+    cls: u8,
 };
 
 pub const Frame = extern struct {
@@ -135,12 +130,18 @@ fn assertSameFunctionLayout(comptime Zig: type, comptime C: type) void {
 }
 
 comptime {
+    if (c.AUV_COCO_TOOTHBRUSH != 79)
+        @compileError("coco class ids must stay in dataset order");
+    if (c.AUV_COCO_COUNT != 80)
+        @compileError("coco class count must be 80");
+    if (c.AUV_ROBOSUB_GATE != 0)
+        @compileError("robosub gate must be 0");
+
     assertSameLayout(math.Vector3f, c.MathVector3f);
     assertSameLayout(math.Quaternionf, c.MathQuaternionf);
     assertSameLayout(math.Vector6f, c.MathVector6f);
     assertSameLayout(math.Pose, c.MathPose);
     assertSameLayout(math.BoundingBox, c.MathBoundingBox);
-    assertSameLayout(ObjectCls, c.AuvObjectCls);
     assertSameLayout(Object, c.AuvObject);
     assertSameLayout(Point2u, c.AuvPoint2u);
     assertSameLayout(Object2d, c.AuvObject2d);

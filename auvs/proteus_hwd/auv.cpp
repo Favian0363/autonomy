@@ -1,25 +1,13 @@
 // zed 2i camera plugin. talks to the stereolabs sdk directly
 // coordinates are meters, world frame, x forward, y right, z down
 //
-// auv_init takes no arguments, so configuration comes from the environment:
-//
-//AUV_ZED_ONNX        detector model path. unset = pose only
-//AUV_CLS_MAP         label:class pairs, comma separated. required with a
-//                       model and classes are 0 cube, 1 rect, 2 gate
-//AUV_ZED_SVO         recording to replay instead of the live camera
-//AUV_ZED_RESOLUTION  HD720 (default), HD1080, HD2K, VGA
-//AUV_ZED_FPS         30
-//AUV_ZED_STREAM_PORT even port for h264 (default 5610; uses port+1 too). 0 = off.
-//                       telemetry udp is separate (default 127.0.0.1:5600). viewer video: 127.0.0.1:5610
-//AUV_ZED_RECORD      svo2 path to record h264 onboard. unset = off
-//AUV_LOG_CLS         1 to print model labels and their mapped classes
-//AUV_ZED_METRICS     1 to print per frame timing rows on stderr
+// Edit the kZed* constants below. Telemetry udp defaults to 127.0.0.1:5600;
+// viewer video stream defaults to 127.0.0.1:5610 (even port, uses the next port too).
 
 #include "../../include/auv.h"
 #include "arduino.hpp"
 #include <cstdint>
 #include <sl/Camera.hpp>
-#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -28,19 +16,10 @@
 #include <inttypes.h>
 #include <limits>
 #include <stdexcept>
-#include <string>
-#include <string_view>
 #include <sys/stat.h>
 #include <thread>
 #include <time.h>
-#include <vector>
 #include <cinttypes>
-
-
-struct ClassMapping {
-  int label;
-  AuvObjectCls cls;
-};
 
 struct Config {
   const char *onnx;
@@ -51,7 +30,6 @@ struct Config {
   int fps;
   bool log_classes;
   bool metrics;
-  std::vector<ClassMapping> classes;
 };
 
 static sl::Camera zed;
@@ -72,8 +50,17 @@ static constexpr float kWaterDensity = 997.0f;
 static constexpr float kGravity = 9.80665f;
 static constexpr uintmax_t kMinFreeDisk = 1ULL << 30;
 
+static constexpr const char *kZedOnnx = "yolov8n.onnx";
+static constexpr const char *kZedSvo = ""; // svo replay path instead of live camera
+static constexpr const char *kZedRecord = ""; // onboard svo2 recording path; empty = off
+static constexpr int kZedFps = 30;
+static constexpr int kZedStreamPort = 5610; // 0 = off
+static constexpr bool kLogCls = false;
+static constexpr bool kZedMetrics = false;
+static constexpr sl::RESOLUTION kZedResolution = sl::RESOLUTION::HD720;
+
 static Config load_config();
-static int map_class(const Config &config, int label);
+static bool coco_class(int label, AuvObjectCls *cls);
 
 [[noreturn]] static void fail(const char *message) {
   std::fprintf(stderr, "[zed] %s\n", message);
@@ -270,16 +257,16 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
             }
           }
 
-          const int cls = map_class(config, object.raw_label);
-          if (cls < 0) {
+          AuvObjectCls cls;
+          if (!coco_class(object.raw_label, &cls)) {
             if (config.log_classes)
-              std::fprintf(stderr, "[zed] unmapped detector label %d\n", object.raw_label);
+              std::fprintf(stderr, "[zed] label %d is outside the coco classes\n", object.raw_label);
             continue;
           }
 
           const uint8_t i = frame->objects_len;
           frame->objects[i].id = static_cast<uint32_t>(object.id);
-          frame->objects[i].cls = static_cast<AuvObjectCls>(cls);
+          frame->objects[i].cls = cls;
           frame->objects[i].bbox = {};
           frame->objects[i].bbox.pose.quat.buf[3] = 1;
           const float flip[] = {1, -1, -1};
@@ -294,8 +281,8 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
 
         if (frame->objects2d_len < AUV_FRAME_MAX_OBJECTS &&
             object.bounding_box_2d.size() >= 3) {
-          const int cls2d = map_class(config, object.raw_label);
-          if (cls2d < 0) continue;
+          AuvObjectCls cls2d;
+          if (!coco_class(object.raw_label, &cls2d)) continue;
 
           const auto &bbox = object.bounding_box_2d;
           const uint8_t j = frame->objects2d_len;
@@ -304,7 +291,7 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
           frame->objects2d[j].bottom_right.x = bbox[2].x;
           frame->objects2d[j].bottom_right.y = bbox[2].y;
           frame->objects2d[j].id = static_cast<uint32_t>(object.id);
-          frame->objects2d[j].cls = static_cast<AuvObjectCls>(cls2d);
+          frame->objects2d[j].cls = cls2d;
           frame->objects2d_len++;
         }
       }
@@ -353,24 +340,11 @@ void auv_deinit(void) {
   objects.object_list.clear();
 }
 
-static const char *env_or(const char *name, const char *fallback = "") {
-  const char *value = std::getenv(name);
-  return value ? value : fallback;
-}
-
-static int parse_nonnegative(std::string_view text) {
-  int value = 0;
-  const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || value < 0)
-    throw std::runtime_error("expected a nonnegative integer");
-  return value;
-}
-
-static bool env_flag(const char *name) {
-  const std::string_view value = env_or(name, "0");
-  if (value != "0" && value != "1")
-    throw std::runtime_error("boolean environment settings must be 0 or 1");
-  return value == "1";
+static bool coco_class(int label, AuvObjectCls *cls) {
+  if (label < static_cast<int>(AUV_COCO_PERSON) || label >= static_cast<int>(AUV_COCO_COUNT))
+    return false;
+  *cls = static_cast<AuvObjectCls>(label);
+  return true;
 }
 
 static void check_file(const char *path) {
@@ -381,50 +355,18 @@ static void check_file(const char *path) {
 
 static Config load_config() {
   Config config{};
-  config.onnx = env_or("AUV_ZED_ONNX");
-  config.svo = env_or("AUV_ZED_SVO");
-  config.fps = parse_nonnegative(env_or("AUV_ZED_FPS", "30"));
-  config.stream_port = parse_nonnegative(env_or("AUV_ZED_STREAM_PORT", "5610"));
-  config.record = env_or("AUV_ZED_RECORD");
-  if (config.fps == 0) throw std::runtime_error("AUV_ZED_FPS must be positive");
-  config.log_classes = env_flag("AUV_LOG_CLS");
-  config.metrics = env_flag("AUV_ZED_METRICS");
-
-  const std::string_view resolution = env_or("AUV_ZED_RESOLUTION", "HD720");
-  if (resolution == "HD720") config.resolution = sl::RESOLUTION::HD720;
-  else if (resolution == "HD1080") config.resolution = sl::RESOLUTION::HD1080;
-  else if (resolution == "HD2K") config.resolution = sl::RESOLUTION::HD2K;
-  else if (resolution == "VGA") config.resolution = sl::RESOLUTION::VGA;
-  else throw std::runtime_error("unknown AUV_ZED_RESOLUTION");
+  config.onnx = kZedOnnx;
+  config.svo = kZedSvo;
+  config.record = kZedRecord;
+  config.fps = kZedFps;
+  config.stream_port = kZedStreamPort;
+  if (config.fps == 0) throw std::runtime_error("kZedFps must be positive");
+  config.log_classes = kLogCls;
+  config.metrics = kZedMetrics;
+  config.resolution = kZedResolution;
 
   if (*config.onnx) check_file(config.onnx);
   if (*config.svo) check_file(config.svo);
 
-  std::string_view map = env_or("AUV_CLS_MAP");
-  if (*config.onnx && map.empty())
-    throw std::runtime_error("AUV_CLS_MAP is required with AUV_ZED_ONNX");
-  while (!map.empty()) {
-    const auto comma = map.find(',');
-    const auto entry = map.substr(0, comma);
-    const auto colon = entry.find(':');
-    if (colon == std::string_view::npos)
-      throw std::runtime_error("AUV_CLS_MAP entries must be label:class");
-    const int label = parse_nonnegative(entry.substr(0, colon));
-    const int cls = parse_nonnegative(entry.substr(colon + 1));
-    // src/Auv.zig: cube = 0, rect = 1, gate = 2
-    if (cls > 2) throw std::runtime_error("unknown mission class in AUV_CLS_MAP");
-    for (const auto &item : config.classes)
-      if (item.label == label) throw std::runtime_error("duplicate label in AUV_CLS_MAP");
-    config.classes.push_back({label, static_cast<AuvObjectCls>(cls)});
-    if (comma == std::string_view::npos) break;
-    map.remove_prefix(comma + 1);
-    if (map.empty()) throw std::runtime_error("trailing comma in AUV_CLS_MAP");
-  }
   return config;
-}
-
-[[maybe_unused]] static int map_class(const Config &config, int label) {
-  for (const auto &item : config.classes)
-    if (item.label == label) return item.cls;
-  return -1;
 }

@@ -2,7 +2,6 @@ const std = @import("std");
 const math = @import("math.zig");
 const MissionContext = @import("MissionContext.zig");
 const MissionArgs = @import("MissionArgs.zig");
-const Telemetry = @import("Telemetry.zig");
 
 pub fn main(init: std.process.Init) !void {
     const args_slice = try init.minimal.args.toSlice(init.arena.allocator());
@@ -10,12 +9,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("args = {f}", .{args});
 
-    const telemetry: Telemetry = try .init(
-        init.io,
-        init.environ_map.get("AUV_TELEMETRY_LOG"),
-        init.environ_map.get("AUV_TELEMETRY_ADDR") orelse "127.0.0.1:5600",
-    );
-    var ctx: MissionContext = try .init(init.arena.allocator(), init.io, args, telemetry);
+    var ctx: MissionContext = try .init(init.arena.allocator(), init.io, args);
 
     while (true) {
         try ctx.yieldUntilNextFrameAndUpdate();
@@ -23,7 +17,8 @@ pub fn main(init: std.process.Init) !void {
         ctx.goal = math.poseTo6f(ctx.frame.camera_pose);
 
         const mission_result = switch (args.mission_id) {
-            .prequalify => @import("missions/prequalify.zig").mission(&ctx),
+            .prequalify_coco => @import("missions/prequalify.zig").cocoMission(&ctx),
+            .prequalify_robosub => @import("missions/prequalify.zig").robosubMission(&ctx),
             .teleop => @import("missions/prequalify.zig").teleopMission(&ctx),
         };
 
