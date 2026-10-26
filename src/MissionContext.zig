@@ -6,11 +6,13 @@ const Auv = @import("Auv.zig");
 const AuvLoader = @import("AuvLoader.zig");
 const ConfigLoader = @import("ConfigLoader.zig");
 const FileWatcher = @import("FileWatcher.zig");
-const Telemetry = @import("Telemetry.zig");
+const SerialBinaryWriter = @import("SerialBinaryWriter.zig");
 
 const MissionContext = @This();
 const print_stuff = true;
 const clear_print_stuff = true;
+const telemetry_log_path: ?[]const u8 = null;
+const telemetry_addr: []const u8 = "127.0.0.1:5600";
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -42,7 +44,9 @@ pid_prev_pose_err: math.Vector6f,
 pid_prev_timestamp_ns: ?u64,
 
 step: []const u8,
-telemetry: Telemetry,
+telemetry_file: ?Io.File = null,
+telemetry_socket: Io.net.Socket = undefined,
+telemetry_dest: Io.net.IpAddress = undefined,
 
 // NonOdometryState
 seen_objects2d: [Auv.Frame.max_objects]Auv.Object2d = undefined,
@@ -92,7 +96,13 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
         std.log.debug("{any}", .{auv});
     }
 
-    const telemetry: Telemetry = try .init(io);
+    const telemetry_dest = try Io.net.IpAddress.parseLiteral(telemetry_addr);
+    const telemetry_bind: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+    const telemetry_socket = try telemetry_bind.bind(io, .{ .mode = .dgram });
+    const telemetry_file: ?Io.File = if (telemetry_log_path) |path|
+        try Io.Dir.cwd().createFile(io, path, .{})
+    else
+        null;
 
     return .{
         .frame = undefined,
@@ -113,7 +123,9 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
         .pid_prev_timestamp_ns = null,
 
         .step = "",
-        .telemetry = telemetry,
+        .telemetry_file = telemetry_file,
+        .telemetry_socket = telemetry_socket,
+        .telemetry_dest = telemetry_dest,
 
         .non_odometry_pid_sum_err = @splat(0),
         .non_odometry_pid_prev_pose_err = @splat(0),
@@ -229,17 +241,46 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
 }
 
 const math = @import("math.zig");
-fn setThrustersFromTamInput(ctx: *MissionContext, input: math.Vector6f) void {
-    var thruster_buffer: [math.max_thrusters]f32 = undefined;
-    const thruster_values = math.tamToThrusters(
-        ctx.config.tam,
-        input,
-        ctx.thrustor_saturate,
-        5.0,
-        &thruster_buffer,
-    );
-    ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
-    ctx.telemetry.publish_to_udp(&ctx.frame, thruster_values, ctx.step);
+
+// Field order is the little-endian packet.
+const TelemetryPacket = struct {
+    magic: [4]u8 = "AUV1".*,
+    version: u8 = 1,
+    timestamp: u64,
+    camera_pose: math.Pose,
+    tracking_ok: bool,
+    depth_ok: bool,
+    depth: f32,
+    objects: []const Auv.Object,
+    boxes: []const Auv.Object2d,
+    thrusters: []const f32,
+    step: []const u8,
+};
+
+fn publishToUdp(ctx: *MissionContext, thrusters: []const f32) void {
+    const nobj = @min(@as(usize, ctx.seen_objects_len), ctx.seen_objects.len);
+    const nbox = @min(@as(usize, ctx.seen_objects2d_len), ctx.seen_objects2d.len);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    SerialBinaryWriter.write(&w, TelemetryPacket{
+        .timestamp = ctx.frame.timestamp,
+        .camera_pose = ctx.frame.camera_pose,
+        .tracking_ok = ctx.frame.tracking_ok,
+        .depth_ok = ctx.frame.pressure_depth_ok,
+        .depth = ctx.frame.pressure_depth,
+        .objects = ctx.seen_objects[0..nobj],
+        .boxes = ctx.seen_objects2d[0..nbox],
+        .thrusters = thrusters[0..@min(thrusters.len, 255)],
+        .step = ctx.step[0..@min(ctx.step.len, 255)],
+    }) catch return;
+    const packet = w.buffered();
+
+    if (ctx.telemetry_file) |file| file.writeStreamingAll(ctx.io, packet) catch |err| {
+        std.log.err("telemetry log write failed: {s}", .{@errorName(err)});
+    };
+    // udp never blocks, even with the laptop unplugged
+    ctx.telemetry_socket.send(ctx.io, &ctx.telemetry_dest, packet) catch {};
 }
 
 fn ControllerStep(ctx: *MissionContext) void {
@@ -265,7 +306,7 @@ fn ControllerStep(ctx: *MissionContext) void {
         break :blk null;
     };
 
-    if (ctx.frame.tracking_ok) {
+    const tam_input: math.Vector6f = if (ctx.frame.tracking_ok) command: {
         const pose = ctx.frame.camera_pose;
 
         const goal = ctx.goal;
@@ -278,7 +319,7 @@ fn ControllerStep(ctx: *MissionContext) void {
 
         // Vehicle forward is +Y in body frame.
         const forward = math.quaternionRotate(rot, .{ 0.0, 1.0, 0.0 });
-    const current_yaw = std.math.atan2(forward[1], forward[0]);
+        const current_yaw = std.math.atan2(forward[1], forward[0]);
 
         const dir = math.Vector3f{
             pose_err[0],
@@ -322,19 +363,6 @@ fn ControllerStep(ctx: *MissionContext) void {
             kd * vel_err;
 
         const input = math.wrenchToThrusterInput(wrench, pose.quat, yaw_error, std.math.pi / 8.0);
-        const max_thrusters = 8;
-        var thruster_buffer: [max_thrusters]f32 = undefined;
-        const thruster_values = math.tamMul(ctx.config.tam, input, &thruster_buffer);
-
-        for (thruster_values) |*value| {
-            value.* = std.math.clamp(
-                value.*,
-                -ctx.thrustor_saturate,
-                ctx.thrustor_saturate,
-            );
-
-            value.* /= 5.0;
-        }
         if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
             if (clear_print_stuff) {
                 std.debug.print("\x1b[2J\x1b[H", .{});
@@ -363,13 +391,11 @@ fn ControllerStep(ctx: *MissionContext) void {
             // math.debug3f("\trotated ", rotated);
             // math.debug3f("\tbody_force ", body_force);
             math.debug6f("\tinput   ", input);
-            std.log.debug("\tthruster_values = {any}", .{thruster_values});
         }
-        ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
-        ctx.telemetry.publish_to_udp(&ctx.frame, thruster_values, ctx.step);
 
         ctx.pid_prev_pose_err = pose_err;
-    } else {
+        break :command input;
+    } else command: {
         ctx.last_xy_goal = null;
         ctx.held_yaw = null;
         ctx.xy_reached = false;
@@ -471,8 +497,22 @@ fn ControllerStep(ctx: *MissionContext) void {
             math.debug6f("\tinput  ", tam_input);
         }
 
-        setThrustersFromTamInput(ctx, tam_input);
+        break :command tam_input;
+    };
+
+    var thruster_buffer: [math.max_thrusters]f32 = undefined;
+    const thruster_values = math.tamToThrusters(
+        ctx.config.tam,
+        tam_input,
+        ctx.thrustor_saturate,
+        5.0,
+        &thruster_buffer,
+    );
+    if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
+        std.log.debug("\tthruster_values = {any}", .{thruster_values});
     }
+    ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
+    ctx.publishToUdp(thruster_values);
 }
 
 /// Stop search and follow the 2D object `id`. The next non-odometry step uses the tracking branch.

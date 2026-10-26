@@ -78,7 +78,7 @@ static bool read_vec3(Cursor *c, float out[3]) {
   return read_f32(c, &out[0]) && read_f32(c, &out[1]) && read_f32(c, &out[2]);
 }
 
-// Matches Packet field order in src/Telemetry.zig. A slice is a u8 count, then its items.
+// Matches TelemetryPacket field order in src/MissionContext.zig. A slice is a u8 count, then its items.
 static bool parse_telemetry(const unsigned char *bytes, int size, Telemetry *out) {
   Cursor c{bytes, bytes + size};
   const unsigned char *magic;
