@@ -90,6 +90,7 @@ typedef enum {
 typedef enum {
     AUV_ROBOSUB_GATE = 0,
     AUV_ROBOSUB_MARKER,
+    AUV_ROBOSUB_GATE_OPENING,
     AUV_ROBOSUB_COUNT
 } AuvRobosubCls;
 

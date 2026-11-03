@@ -78,6 +78,20 @@
 
 
 
+	<!-- Openings. Collision is turned off after load so the vehicle can pass through. -->
+	<static name="GateOpeningLeft" type="box" cls="gate_opening">
+		<dimensions xyz="1.05 0.20 1.25" />
+		<world_transform rpy="0.0 0.0 0.0" xyz="0.325 8.0 2.225" />
+		<material name="acrylic" />
+		<look name="clear" />
+	</static>
+	<static name="GateOpeningRight" type="box" cls="gate_opening">
+		<dimensions xyz="1.15 0.20 1.25" />
+		<world_transform rpy="0.0 0.0 0.0" xyz="1.725 8.0 2.225" />
+		<material name="acrylic" />
+		<look name="clear" />
+	</static>
+
 	<!-- Marker -->
 	<static name="Marker" type="cylinder" cls="marker">
 		<dimensions radius="0.1" height="4" />

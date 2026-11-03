@@ -80,9 +80,9 @@ pub fn cocoMission(ctx: *MissionContext) !void {
 
 pub fn robosubMission(ctx: *MissionContext) !void {
     ctx.step = "find_gate";
-    const gate = try ctx.yieldFind(@intCast(c.AUV_ROBOSUB_GATE));
+    const opening = try ctx.yieldFind(@intCast(c.AUV_ROBOSUB_GATE_OPENING));
     ctx.step = "pass_gate";
-    try ctx.yieldPass(gate);
+    try ctx.yieldPass(opening);
 
     ctx.step = "find_marker";
     const marker = try ctx.yieldFind(@intCast(c.AUV_ROBOSUB_MARKER));
