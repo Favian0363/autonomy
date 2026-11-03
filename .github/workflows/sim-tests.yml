@@ -1,0 +1,66 @@
+# Builds everything and runs the simulator tests on every push and pull request: the waypoints
+# mission on 10 random courses under perfect, jetson65 and jetson115 (tests/sim/run_courses.py).
+# Fails if any run fails. The summary shows on the run's page; the logs and results.csv are
+# attached to the run as "sim-results".
+name: sim tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sim:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ccache python3 \
+            libsdl2-dev libfreetype-dev libgl-dev libglx-dev libopengl-dev libglu1-mesa-dev libglm-dev
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # ccache keeps compiled Stonefish files between runs, keyed by their contents, so only
+      # changed files are compiled again (CMake's own build folder can't be reused: a fresh
+      # checkout makes every file look new)
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Build
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          zig build -Dstonefish
+          ccache --show-stats
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Simulator tests
+        run: python3 tests/sim/run_courses.py --seeds 10 --jobs 4 --out sim_results
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f sim_results/summary.txt ]; then
+            { echo '```'; cat sim_results/summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sim-results
+          path: sim_results
+          if-no-files-found: ignore

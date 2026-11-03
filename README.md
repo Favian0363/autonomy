@@ -116,6 +116,11 @@ python3 tests/sim/run_courses.py --seeds 20 --out sim_results
 python3 tests/sim/run_courses.py --seeds 30 --conditions delay0 delay99 delay198 delay297 --out sweep
 ```
 
+CI (`.github/workflows/sim-tests.yml`) runs the same on every push and pull request: it builds
+everything, runs `zig build test`, then `run_courses.py --seeds 10` under the three conditions,
+and fails if any run fails. The summary shows on the run's page on GitHub, and the logs and
+`results.csv` are attached to the run as `sim-results`.
+
 ## Build & Run: Proteus hardware (ZED 2i + Arduino)
 
 ```sh
