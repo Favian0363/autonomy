@@ -92,7 +92,8 @@ Same test headless, and with frames like the real robot's: the fault layer
 mission, each one 65 ms old, which is what the Jetson measured. The delay is rounded up to whole
 frames, so 65 ms becomes about 67 ms; the layer prints the delay it applied. With
 `AUV_FAULT_FRESH_IMU=1` the IMU fields stay current while the rest is late, as when the IMU is
-read at the current time:
+read at the current time; set `"attitude_from_imu": true` under `odometry` in the config to have
+the controller take roll and pitch from the IMU:
 
 ```sh
 AUV_SIM_HEADLESS=1 AUV_SIM_REALTIME=0 AUV_WAYPOINTS_SEED=1 \

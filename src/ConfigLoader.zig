@@ -23,6 +23,10 @@ pub const NonOdometryPid = struct {
 
 pub const OdometryPid = struct {
     xy_arrival_radius: f32 = 0.025,
+    /// Take roll and pitch from the frame's IMU orientation instead of the camera pose. The
+    /// camera pose arrives late (65-115 ms on the Jetson), and late roll and pitch make the
+    /// robot rock; yaw and position stay from the camera, since an IMU's yaw drifts.
+    attitude_from_imu: bool = false,
     kp: math.Vector6f,
     ki: math.Vector6f,
     kd: math.Vector6f,

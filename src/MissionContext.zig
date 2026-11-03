@@ -310,7 +310,14 @@ fn ControllerStep(ctx: *MissionContext) void {
         const pose = ctx.frame.camera_pose;
 
         const goal = ctx.goal;
-        const current_pose = math.poseTo6f(pose);
+        var current_pose = math.poseTo6f(pose);
+        // a zero quaternion means the plugin gives no IMU orientation: keep the camera's
+        const imu_quat = ctx.frame.imu_quat;
+        if (ctx.config.odometry.attitude_from_imu and @reduce(.Add, imu_quat * imu_quat) > 0.5) {
+            const roll, const pitch, _ = math.quaternionToEuler(math.normalize4f(imu_quat));
+            current_pose[3] = roll;
+            current_pose[4] = pitch;
+        }
 
         var pose_err = goal - current_pose;
 
