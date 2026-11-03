@@ -235,6 +235,23 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(lib_auv_stationary_sim);
 
+    // test plugin that wraps another plugin (usually a simulator) and makes its frames look like
+    // the real robot's: fewer per second and delivered late (see auvs/fault_layer/auv.c)
+    const lib_auv_fault_layer = b.addLibrary(.{
+        .name = "auv_fault_layer",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+        .linkage = .dynamic,
+    });
+    lib_auv_fault_layer.root_module.link_libc = true;
+    lib_auv_fault_layer.root_module.addCSourceFile(.{
+        .file = b.path("auvs/fault_layer/auv.c"),
+        .flags = &.{ "-fPIC", "-Wall", "-Wextra", "-Werror" },
+    });
+    b.installArtifact(lib_auv_fault_layer);
+
 
 
     // the zed sdk exposes c++ types, so this one has to be built with the
