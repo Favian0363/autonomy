@@ -58,6 +58,58 @@ zig build -Dstonefish run -- \
     ./auvs/stonefish_sim/auv.json
 ```
 
+Headless and faster than real time (for batch runs and machines without a display), stopping
+after 60 simulated seconds and writing the pose of every frame to `trace.csv`:
+
+```sh
+AUV_SIM_HEADLESS=1 AUV_SIM_REALTIME=0 AUV_SIM_DURATION=60 AUV_SIM_TRACE=trace.csv \
+zig build -Dstonefish run -- \
+    ./zig-out/lib/libauv_stonefish_sim.so  \
+    prequalify_robosub \
+    ./auvs/stonefish_sim/auv.json
+```
+
+Headless runs skip the camera sensor (Stonefish needs graphics for it), so frames have no 2D boxes.
+
+Waypoint test: the `waypoints` mission makes a random course from a seed (sharp turns, points
+behind the robot, depth changes; the same seed always gives the same course and the same run)
+and drives to each point in order. `AUV_WAYPOINTS_SEED` picks the course (default 1) and
+`AUV_WAYPOINTS_COUNT` its length (default 8). Each point must be reached (within 1 m) before the
+timeout and then held for 5 s. The mission prints one `waypoint,...` line per point (time to
+reach, overshoot, final distance, largest roll and pitch) and exits with an error if any point is
+missed or the simulation diverges:
+
+```sh
+AUV_WAYPOINTS_SEED=1 \
+zig build -Dstonefish run -- \
+    ./zig-out/lib/libauv_stonefish_sim.so  \
+    waypoints \
+    ./auvs/stonefish_sim/auv.json
+```
+
+Same test headless, and with frames like the real robot's: the fault layer
+(`libauv_fault_layer.so`) loads the simulator and passes only 30 frames per second to the
+mission, each one 65 ms old (rounded up to whole frames, so 66.7 ms), which is what the Jetson
+measured:
+
+```sh
+AUV_SIM_HEADLESS=1 AUV_SIM_REALTIME=0 AUV_WAYPOINTS_SEED=1 \
+AUV_FAULT_TARGET=./zig-out/lib/libauv_stonefish_sim.so AUV_FAULT_RATE_HZ=30 AUV_FAULT_DELAY_MS=65 \
+zig build -Dstonefish run -- \
+    ./zig-out/lib/libauv_fault_layer.so  \
+    waypoints \
+    ./auvs/stonefish_sim/auv.json
+```
+
+Many courses at once: runs seeds 1..N under each condition (`perfect`, `jetson65`, `jetson115`),
+several at a time, headless, and prints a summary per condition. It writes one log per run and `results.csv` (one row per waypoint) to `--out` (keep it out of git), prints the
+command to watch the first failure, and exits with an error if any run failed:
+
+```sh
+zig build -Dstonefish
+python3 tests/sim/run_courses.py --seeds 20 --out sim_results
+```
+
 ## Build & Run: Proteus hardware (ZED 2i + Arduino)
 
 ```sh
