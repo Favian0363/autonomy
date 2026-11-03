@@ -7,6 +7,7 @@ pub const MissionId = enum {
     prequalify_coco,
     prequalify_robosub,
     teleop,
+    waypoints,
 };
 
 goal_dist_threshold: f32,

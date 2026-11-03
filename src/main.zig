@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
             .prequalify_coco => @import("missions/prequalify.zig").cocoMission(&ctx),
             .prequalify_robosub => @import("missions/prequalify.zig").robosubMission(&ctx),
             .teleop => @import("missions/prequalify.zig").teleopMission(&ctx),
+            .waypoints => @import("missions/waypoints.zig").mission(&ctx),
         };
 
         mission_result catch |err| switch (err) {
