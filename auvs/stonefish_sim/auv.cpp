@@ -396,6 +396,11 @@ public:
             frame.camera_pose.quat.buf[1] = static_cast<float>(odometry->getLastValue(7));
             frame.camera_pose.quat.buf[2] = static_cast<float>(odometry->getLastValue(8));
             frame.camera_pose.quat.buf[3] = static_cast<float>(odometry->getLastValue(9));
+            // an ideal IMU: the true orientation and turn rates, with no noise or drift
+            frame.imu_quat = frame.camera_pose.quat;
+            frame.gyro.buf[0] = static_cast<float>(odometry->getLastValue(10));
+            frame.gyro.buf[1] = static_cast<float>(odometry->getLastValue(11));
+            frame.gyro.buf[2] = static_cast<float>(odometry->getLastValue(12));
         }
 
         for(const TrackedObject& tracked : tracked_objects)

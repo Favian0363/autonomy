@@ -7,8 +7,9 @@
 // env: AUV_FAULT_TARGET=<plugin.so>  the plugin to wrap (required)
 //      AUV_FAULT_RATE_HZ=<hz>         frames per second the mission gets (default 0: every frame)
 //      AUV_FAULT_DELAY_MS=<ms>        how old each frame is when the mission gets it (default 0)
-//      AUV_FAULT_FRESH_ATTITUDE=1     only the position is late; the orientation is the newest
-//                                     one, as if it came from an IMU with no delay (default 0)
+//      AUV_FAULT_FRESH_IMU=1          the IMU fields (imu_quat, gyro, accel) are the newest ones
+//                                     while the rest of the frame is late, as when the IMU is read
+//                                     at the current time instead of the image's (default 0)
 #include "../../include/auv.h"
 #include <dlfcn.h>
 #include <errno.h>
@@ -26,7 +27,7 @@ static AuvDeinitFunc *target_deinit;
 static uint64_t period_ns; // 0: pass every frame
 static uint64_t due_ns;    // when the next frame is due, on a fixed schedule
 static uint64_t delay_ns;
-static int fresh_attitude;
+static int fresh_imu;
 // The delay really applied is rounded up to whole frames and varies a little with how the
 // target's frames line up with the rate; it is printed once, over the first REPORT_FRAMES frames.
 #define REPORT_FRAMES 300
@@ -103,13 +104,13 @@ void auv_init(void) {
   const double delay_ms = env_number("AUV_FAULT_DELAY_MS");
   period_ns = rate_hz > 0 ? (uint64_t)(1e9 / rate_hz) : 0;
   delay_ns = (uint64_t)(delay_ms * 1e6);
-  fresh_attitude = env_number("AUV_FAULT_FRESH_ATTITUDE") != 0;
+  fresh_imu = env_number("AUV_FAULT_FRESH_IMU") != 0;
   next = 0;
   count = 0;
   reported_frames = 0;
   delay_sum_ns = delay_max_ns = 0;
-  fprintf(stderr, "[fault] target=%s rate_hz=%g delay_ms=%g fresh_attitude=%d\n", getenv("AUV_FAULT_TARGET"),
-          rate_hz, delay_ms, fresh_attitude);
+  fprintf(stderr, "[fault] target=%s rate_hz=%g delay_ms=%g fresh_imu=%d\n", getenv("AUV_FAULT_TARGET"), rate_hz,
+          delay_ms, fresh_imu);
   target_init();
 }
 
@@ -148,8 +149,11 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
     if (now - frame_ago(k)->timestamp >= delay_ns) {
       *frame = *frame_ago(k);
       report_delay(now - frame->timestamp);
-      if (fresh_attitude)
-        frame->camera_pose.quat = frame_ago(0)->camera_pose.quat;
+      if (fresh_imu) {
+        frame->imu_quat = frame_ago(0)->imu_quat;
+        frame->gyro = frame_ago(0)->gyro;
+        frame->accel = frame_ago(0)->accel;
+      }
       return;
     }
   }

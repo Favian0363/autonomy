@@ -91,8 +91,8 @@ Same test headless, and with frames like the real robot's: the fault layer
 (`libauv_fault_layer.so`) loads the simulator and passes only 30 frames per second to the
 mission, each one 65 ms old, which is what the Jetson measured. The delay is rounded up to whole
 frames, so 65 ms becomes about 67 ms; the layer prints the delay it applied. With
-`AUV_FAULT_FRESH_ATTITUDE=1` only the position is late and the orientation is current, as if it
-came from an IMU instead of the camera:
+`AUV_FAULT_FRESH_IMU=1` the IMU fields stay current while the rest is late, as when the IMU is
+read at the current time:
 
 ```sh
 AUV_SIM_HEADLESS=1 AUV_SIM_REALTIME=0 AUV_WAYPOINTS_SEED=1 \

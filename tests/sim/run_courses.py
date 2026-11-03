@@ -43,7 +43,7 @@ NUMBERS = ["time_s", "final_dist_m", "overshoot_m", "max_roll_deg", "max_pitch_d
 
 def passed_through():
     """AUV_* settings from the caller's environment, which every run inherits (e.g.
-    AUV_FAULT_FRESH_ATTITUDE or AUV_WAYPOINTS_TIMEOUT_S), except the ones this script sets."""
+    AUV_FAULT_FRESH_IMU or AUV_WAYPOINTS_TIMEOUT_S), except the ones this script sets."""
     ours = {"AUV_SIM_HEADLESS", "AUV_SIM_REALTIME", "AUV_WAYPOINTS_SEED", "AUV_WAYPOINTS_COUNT",
             "AUV_FAULT_TARGET", "AUV_FAULT_RATE_HZ", "AUV_FAULT_DELAY_MS"}
     return {k: v for k, v in sorted(os.environ.items()) if k.startswith("AUV_") and k not in ours}
