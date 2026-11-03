@@ -45,6 +45,15 @@ static constexpr auto kMinRenderInterval = std::chrono::milliseconds(16);
 static constexpr bool kConsoleApp = false;
 static sf::Scalar realtimeFactorCap = kRealtimeFactorCap;
 
+// Run options, read from the environment in auv_init so test runs can change them without rebuilding:
+//   AUV_SIM_HEADLESS=1    no window (console app), for batch runs and machines without a display
+//   AUV_SIM_REALTIME=<x>  run at most x times real time (default 1); 0 runs as fast as possible
+//   AUV_SIM_DURATION=<s>  exit after s seconds of simulated time (default 0: run until closed)
+//   AUV_SIM_TRACE=<path>  write the pose the mission receives every frame, to compare runs
+static bool headless = kConsoleApp;
+static sf::Scalar simDuration = 0;
+static std::FILE* traceFile = nullptr;
+
 
 volatile std::sig_atomic_t g_stop_requested = 0;
 
@@ -233,6 +242,22 @@ public:
     std::unordered_map<std::string, AuvObjectCls> objectClasses;
 
 protected:
+    using ScenarioParser::ParseSensor;
+
+    // Stonefish cannot create cameras without graphics, so headless runs skip them. The camera is
+    // only used to project 2D boxes, so headless frames have no objects2d; poses and 3D objects work.
+    bool ParseSensor(XMLElement* element, sf::Robot* robot) override
+    {
+        const char* type = nullptr;
+        if(!isGraphicalSim() && element->QueryStringAttribute("type", &type) == XML_SUCCESS
+           && std::string(type) == "camera")
+        {
+            std::cout << "[stonefish_sim] headless: skipping camera sensor, frames will have no 2D boxes\n";
+            return true;
+        }
+        return ScenarioParser::ParseSensor(element, robot);
+    }
+
     bool ParseStatic(XMLElement* element) override
     {
         const char* type = nullptr;
@@ -285,8 +310,9 @@ public:
         AuvScenarioParser parser(this);
         if(!parser.Parse(scenarioPath.string()))
         {
-            std::cerr << "Failed to parse scenario " << scenarioPath.string() << '\n';
-            return;
+            // stepping a half-built world crashes later in Stonefish, so stop here with the reason
+            std::cerr << "[stonefish_sim] failed to parse scenario " << scenarioPath.string() << '\n';
+            std::exit(1);
         }
         const auto objectClasses = std::move(parser.objectClasses);
 
@@ -514,7 +540,7 @@ struct RealtimeThrottle
 {
     void wait(sf::Scalar sim_time)
     {
-        if(kRealtimeFactorCap <= sf::Scalar(0))
+        if(realtimeFactorCap <= sf::Scalar(0))
             return;
 
         const auto wall = std::chrono::steady_clock::now();
@@ -529,7 +555,7 @@ struct RealtimeThrottle
         const sf::Scalar sim_elapsed = sim_time - base_sim;
         const sf::Scalar wall_elapsed =
             std::chrono::duration<sf::Scalar>(wall - base_wall).count();
-        const sf::Scalar wall_budget = sim_elapsed / kRealtimeFactorCap;
+        const sf::Scalar wall_budget = sim_elapsed / realtimeFactorCap;
 
         if(wall_budget > wall_elapsed)
         {
@@ -575,6 +601,52 @@ sf::RenderSettings DefaultRenderSettings()
     return s;
 }
 
+// Nonnegative number from the environment, or `fallback` if unset; exits on anything else.
+sf::Scalar EnvScalar(const char* name, sf::Scalar fallback)
+{
+    const char* text = std::getenv(name);
+    if(text == nullptr || *text == '\0')
+        return fallback;
+    char* end = nullptr;
+    const double value = std::strtod(text, &end);
+    if(*end != '\0' || !(value >= 0))
+    {
+        std::cerr << "[stonefish_sim] " << name << " must be a nonnegative number, got '" << text << "'\n";
+        std::exit(1);
+    }
+    return static_cast<sf::Scalar>(value);
+}
+
+void ReadRunOptions()
+{
+    headless = EnvScalar("AUV_SIM_HEADLESS", kConsoleApp ? 1 : 0) != 0;
+    realtimeFactorCap = EnvScalar("AUV_SIM_REALTIME", kRealtimeFactorCap);
+    simDuration = EnvScalar("AUV_SIM_DURATION", 0);
+    const char* trace = std::getenv("AUV_SIM_TRACE");
+    if(trace != nullptr && *trace != '\0')
+    {
+        traceFile = std::fopen(trace, "w");
+        if(traceFile == nullptr)
+        {
+            std::cerr << "[stonefish_sim] cannot open AUV_SIM_TRACE file '" << trace << "'\n";
+            std::exit(1);
+        }
+        std::fputs("timestamp_ns,x,y,z,qx,qy,qz,qw\n", traceFile);
+    }
+    std::cout << "[stonefish_sim] app=" << (headless ? "console" : "graphical")
+              << " realtime=" << realtimeFactorCap << " duration_s=" << simDuration
+              << " trace=" << (trace != nullptr && *trace != '\0' ? trace : "off") << "\n";
+}
+
+// %.9g prints every float exactly, so two traces are identical only if the poses are bit-identical.
+void WriteTrace(const AuvFrame& frame)
+{
+    const float* p = frame.camera_pose.pos.buf;
+    const float* q = frame.camera_pose.quat.buf;
+    std::fprintf(traceFile, "%llu,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+                 static_cast<unsigned long long>(frame.timestamp), p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
+}
+
 sf::HelperSettings DefaultHelperSettings()
 {
     sf::HelperSettings h;
@@ -593,18 +665,17 @@ void auv_init(void)
     g_stop_requested = 0;
     std::signal(SIGINT, requestStop);
     auv_deinit();
+    ReadRunOptions();
 
     g_simulation_context = new SimulationContext();
     g_simulation_context->sim = new SimManager(kStepsPerSecond, dataPath / scenario_file);
-    if(kConsoleApp)
+    if(headless)
     {
-        std::cout << "[stonefish_sim] app=console\n";
         g_simulation_context->console = new ConsoleSimApp(dataPath.string(), g_simulation_context->sim);
         g_simulation_context->console->start(kPhysicsDt);
     }
     else
     {
-        std::cout << "[stonefish_sim] app=graphical\n";
         g_simulation_context->graphical = new SimApp(
             dataPath.string(), DefaultRenderSettings(), DefaultHelperSettings(), g_simulation_context->sim);
         g_simulation_context->graphical->start(kPhysicsDt);
@@ -635,6 +706,14 @@ void auv_yield_until_next_frame(AuvFrame* frame)
         std::exit(0);
     }
     *frame = g_simulation_context->sim->getAuvFrame();
+    if(traceFile != nullptr)
+        WriteTrace(*frame);
+    if(simDuration > 0 && g_simulation_context->sim->getSimulationTime() >= simDuration)
+    {
+        std::cerr << "[stonefish_sim] reached AUV_SIM_DURATION=" << simDuration << " s; exiting\n";
+        auv_deinit();
+        std::exit(0);
+    }
 }
 
 
@@ -648,6 +727,11 @@ void auv_set_thrustor_values(const float* thrustor_values, uint8_t thrustor_valu
 
 void auv_deinit(void)
 {
+    if(traceFile != nullptr)
+    {
+        std::fclose(traceFile);
+        traceFile = nullptr;
+    }
     if(g_simulation_context == nullptr)
         return;
 
