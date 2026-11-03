@@ -5,6 +5,7 @@ usage (from the repository root, after `zig build -Dstonefish`):
   python3 tests/sim/run_courses.py --seeds 20
   python3 tests/sim/run_courses.py --seeds 20 --conditions perfect jetson65
   python3 tests/sim/run_courses.py --seeds 20 --config my_gains.json   (compare controller gains)
+  python3 tests/sim/run_courses.py --seeds 20 --conditions delay0 delay200 delay400   (delay sweep)
 
 Each run is one course (one seed: the mission makes the course from it) under one condition, in
 its own process, headless and faster than real time; several run at once (--jobs). Everything goes
@@ -15,6 +16,7 @@ Conditions (what the mission sees):
   perfect   the simulator as is: 360 frames per second, no delay
   jetson65  30 frames per second, each 65 ms old: typical on the Jetson
   jetson115 30 frames per second, each 115 ms old: worst case measured with the detector
+  delay<N>  30 frames per second, each N ms old (delay0: only the lower frame rate)
 """
 import argparse
 import csv
@@ -39,10 +41,29 @@ CONFIG = "./auvs/stonefish_sim/auv.json"
 NUMBERS = ["time_s", "final_dist_m", "overshoot_m", "max_roll_deg", "max_pitch_deg"]
 
 
+def passed_through():
+    """AUV_* settings from the caller's environment, which every run inherits (e.g.
+    AUV_FAULT_FRESH_ATTITUDE or AUV_WAYPOINTS_TIMEOUT_S), except the ones this script sets."""
+    ours = {"AUV_SIM_HEADLESS", "AUV_SIM_REALTIME", "AUV_WAYPOINTS_SEED", "AUV_WAYPOINTS_COUNT",
+            "AUV_FAULT_TARGET", "AUV_FAULT_RATE_HZ", "AUV_FAULT_DELAY_MS"}
+    return {k: v for k, v in sorted(os.environ.items()) if k.startswith("AUV_") and k not in ours}
+
+
+def condition_env(name):
+    """Fault layer settings for a condition name (empty: no fault layer)."""
+    if name in CONDITIONS:
+        return CONDITIONS[name]
+    delay = re.fullmatch(r"delay(\d+)", name)
+    if delay:
+        return {"AUV_FAULT_RATE_HZ": "30", "AUV_FAULT_DELAY_MS": delay[1]}
+    raise argparse.ArgumentTypeError(f"unknown condition {name!r}: use {', '.join(CONDITIONS)} or delay<ms>")
+
+
 def mission_env(condition, seed, count):
     """Environment variables that pick the course and the condition; returns (env, plugin)."""
-    env = {"AUV_WAYPOINTS_SEED": str(seed), "AUV_WAYPOINTS_COUNT": str(count), **CONDITIONS[condition]}
-    if not CONDITIONS[condition]:
+    fault = condition_env(condition)
+    env = {"AUV_WAYPOINTS_SEED": str(seed), "AUV_WAYPOINTS_COUNT": str(count), **fault}
+    if not fault:
         return env, SIM
     return {**env, "AUV_FAULT_TARGET": SIM}, FAULT
 
@@ -81,6 +102,7 @@ def run_one(condition, seed, count, out, timeout_s, config):
 def rerun_command(condition, seed, count, config):
     """Shell command that replays one run with the window open."""
     env, plugin = mission_env(condition, seed, count)
+    env = {**passed_through(), **env}
     return " ".join(f"{k}={v}" for k, v in env.items()) + f" {RUNNER} {plugin} waypoints {config}"
 
 
@@ -91,7 +113,7 @@ def summarize(condition, statuses, rows):
     held = sum(r["held"] == "true" for r in rows)
     lines = [f"== {condition}: {runs - len(failed)}/{runs} runs passed, "
              f"waypoints reached {reached}/{len(rows)}, held {held}/{len(rows)}"]
-    if not failed:
+    if not failed and runs > 3:
         # with no failures in n runs, a failure rate above about 3/n would likely have shown one
         lines.append(f"   no failures: the failure rate is probably below {300 / runs:.0f}% (95% confidence)")
     for name in NUMBERS:
@@ -107,7 +129,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seeds", type=int, default=10, help="run seeds 1..N (default 10)")
     parser.add_argument("--count", type=int, default=8, help="waypoints per course (default 8)")
-    parser.add_argument("--conditions", nargs="+", default=list(CONDITIONS), choices=list(CONDITIONS))
+    parser.add_argument("--conditions", nargs="+", default=list(CONDITIONS), metavar="CONDITION",
+                        type=lambda name: condition_env(name) is not None and name,
+                        help="perfect, jetson65, jetson115 or delay<ms> (default: the first three)")
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     parser.add_argument("--timeout", type=float, default=900, help="seconds of real time per run")
     parser.add_argument("--out", type=Path, default=Path("sim_results"))
@@ -122,12 +146,13 @@ def main():
     (args.out / "logs").mkdir(parents=True)
 
     jobs = [(c, s) for c in args.conditions for s in range(1, args.seeds + 1)]
-    print(f"config {args.config}")
+    header = [f"config {args.config}"] + [f"env {k}={v}" for k, v in passed_through().items()]
+    print("\n".join(header))
     print(f"{len(jobs)} runs ({len(args.conditions)} conditions x {args.seeds} seeds), {args.jobs} at a time")
     with ThreadPoolExecutor(args.jobs) as pool:
         results = list(pool.map(lambda job: run_one(*job, args.count, args.out, args.timeout, args.config), jobs))
 
-    all_rows, report = [], [f"config {args.config}"]
+    all_rows, report = [], list(header)
     for condition in args.conditions:
         statuses, rows = {}, []
         for (c, seed), (status, run_rows) in zip(jobs, results):

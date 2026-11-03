@@ -89,8 +89,10 @@ zig build -Dstonefish run -- \
 
 Same test headless, and with frames like the real robot's: the fault layer
 (`libauv_fault_layer.so`) loads the simulator and passes only 30 frames per second to the
-mission, each one 65 ms old (rounded up to whole frames, so 66.7 ms), which is what the Jetson
-measured:
+mission, each one 65 ms old, which is what the Jetson measured. The delay is rounded up to whole
+frames, so 65 ms becomes about 67 ms; the layer prints the delay it applied. With
+`AUV_FAULT_FRESH_ATTITUDE=1` only the position is late and the orientation is current, as if it
+came from an IMU instead of the camera:
 
 ```sh
 AUV_SIM_HEADLESS=1 AUV_SIM_REALTIME=0 AUV_WAYPOINTS_SEED=1 \
@@ -101,13 +103,16 @@ zig build -Dstonefish run -- \
     ./auvs/stonefish_sim/auv.json
 ```
 
-Many courses at once: runs seeds 1..N under each condition (`perfect`, `jetson65`, `jetson115`),
-several at a time, headless, and prints a summary per condition. It writes one log per run and `results.csv` (one row per waypoint) to `--out` (keep it out of git), prints the
-command to watch the first failure, and exits with an error if any run failed:
+Many courses at once: runs seeds 1..N under each condition (`perfect`, `jetson65`, `jetson115`,
+or `delay<ms>` for 30 frames per second and any delay), several at a time, headless, and prints
+a summary per condition. It writes one log per run and `results.csv` (one row per waypoint) to
+`--out` (keep it out of git), prints the command to watch the first failure, and exits with an
+error if any run failed:
 
 ```sh
 zig build -Dstonefish
 python3 tests/sim/run_courses.py --seeds 20 --out sim_results
+python3 tests/sim/run_courses.py --seeds 30 --conditions delay0 delay99 delay198 delay297 --out sweep
 ```
 
 ## Build & Run: Proteus hardware (ZED 2i + Arduino)
