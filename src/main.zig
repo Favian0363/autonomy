@@ -4,6 +4,8 @@ const MissionArgs = @import("MissionArgs.zig");
 
 test {
     std.testing.refAllDecls(@import("BodyControl.zig"));
+    std.testing.refAllDecls(@import("MissionContext.zig"));
+    std.testing.refAllDecls(@import("ConfigLoader.zig"));
 }
 
 pub fn main(init: std.process.Init) !void {

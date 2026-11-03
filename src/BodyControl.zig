@@ -26,13 +26,6 @@ pub fn forwardRotation(forward_body: Vec3, alpha: f32) Error!Quat {
     return .{ v[0], v[1], v[2], std.math.cos(alpha / 2) };
 }
 
-/// Null means camera and look target coincide. Caller chooses its own fallback.
-pub fn lookDirection(camera_position_world: Vec3, look_target_world: Vec3) Error!?Vec3 {
-    const d = look_target_world - camera_position_world;
-    if (math.length3f(d) <= vec_eps) return null;
-    return math.normalize3f(d);
-}
-
 fn shortestArc(from: Vec3, to: Vec3) Error!Quat {
     const c = std.math.clamp(math.dot3f(from, to), -1, 1);
     const v = math.cross3f(from, to);

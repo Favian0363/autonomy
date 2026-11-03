@@ -36,6 +36,55 @@ pub inline fn dot3f(a: Vector3f, b: Vector3f) f32 {
     return @reduce(.Add, a * b);
 }
 
+/// Body X, Y, Z, roll, pitch, yaw.
+pub const interaction_output_len = 6;
+
+pub const InteractionMapError = error{
+    InteractionRowCountMismatch,
+    InteractionColumnCountMismatch,
+};
+
+/// Each interaction row is dotted with `error_vector`. Row count must be [`interaction_output_len`]; every row length must match `error_vector.len`.
+pub fn mapInteraction(interaction: []const []const f32, error_vector: []const f32) InteractionMapError![interaction_output_len]f32 {
+    if (interaction.len != interaction_output_len)
+        return error.InteractionRowCountMismatch;
+    var mapped: [interaction_output_len]f32 = undefined;
+    for (interaction, &mapped) |row, *out| {
+        if (row.len != error_vector.len)
+            return error.InteractionColumnCountMismatch;
+        var sum: f32 = 0;
+        for (row, error_vector) |gain, err| sum += gain * err;
+        out.* = sum;
+    }
+    return mapped;
+}
+
+pub fn add4(a: [4]f32, b: [4]f32) [4]f32 {
+    var out: [4]f32 = undefined;
+    for (&out, a, b) |*slot, left, right| slot.* = left + right;
+    return out;
+}
+
+/// Per axis: position when `position_available`, otherwise visual, otherwise zero.
+/// A null visual vector means vision is unavailable on every axis.
+pub fn greedy6(
+    position: [interaction_output_len]f32,
+    visual: ?[interaction_output_len]f32,
+    position_available: [interaction_output_len]bool,
+) [interaction_output_len]f32 {
+    var out: [interaction_output_len]f32 = undefined;
+    for (&out, position, position_available, 0..) |*slot, pos, available, i| {
+        if (available) {
+            slot.* = pos;
+        } else if (visual) |vis| {
+            slot.* = vis[i];
+        } else {
+            slot.* = 0;
+        }
+    }
+    return out;
+}
+
 pub inline fn length3f(v: Vector3f) f32 {
     return @sqrt(dot3f(v, v));
 }

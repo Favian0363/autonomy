@@ -176,7 +176,8 @@ int main(int argc, char** argv) {
                 const Uint8* keys = SDL_GetKeyboardState(nullptr);
 
                 // Body translation while the key is held. Camera forward is body +Y.
-                // Z is down, so R dives and F climbs. Releasing the keys commands zero thrust.
+                // Z is down, so R dives and F climbs. The mission tracks this as a body error
+                // with the translation PID. Releasing the keys commands nothing in translation.
                 std::array<float, 3> translation{0.f, 0.f, 0.f};
                 if (keys[SDL_SCANCODE_D]) translation[0] += 1.f;
                 if (keys[SDL_SCANCODE_A]) translation[0] -= 1.f;

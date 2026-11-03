@@ -41,13 +41,14 @@ cmake --build tools/viewer/build
 ./tools/viewer/build/viewer
 ```
 
-It listens for binary telemetry on UDP 5600 and the ZED H264 stream at `127.0.0.1:5610`. With the window focused, it sends the teleop command to `127.0.0.1:8080`.
+It listens for binary telemetry on UDP 5600. The ZED H264 stream at `127.0.0.1:5610` is optional: pass `none` to follow simulation telemetry without a camera. With the window focused, it sends the teleop command to `127.0.0.1:8080`.
 
 ```sh
 ./tools/viewer/build/viewer [telemetry_port] [video] [teleop_port]
+./tools/viewer/build/viewer 5600 none
 ```
 
-Hold keys to command a body translation direction: W/S surge, A/D sway, R/F heave. Left/Right yaws about world +Z; Up/Down pitches about body X; I/K rolls about body +Y. Each packet is 28 bytes: three little-endian floats of body translation, then a world orientation quaternion `x, y, z, w`. Identity is level with the camera along body +Y. Releasing the translation keys holds the position from the first idle frame, including depth, while the orientation keys still apply.
+Hold keys to command a body translation direction: W/S surge, A/D sway, R/F heave. Left/Right yaws about world +Z; Up/Down pitches about body X; I/K rolls about body +Y. Each packet is 28 bytes: three little-endian floats of body translation, then a world orientation quaternion `x, y, z, w`. Identity is level with the camera along body +Y. Releasing the translation keys leaves translation uncommanded. The orientation keys still apply.
 
 ## Build & Run: libauv_stonefish_sim
 

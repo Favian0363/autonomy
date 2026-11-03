@@ -16,6 +16,9 @@ reader_buf: [4098]u8,
 pub const NonOdometryPid = struct {
     center_deadband: f32,
     target_height: f32,
+    /// Rows are body X, Y, Z, roll, pitch, then yaw. Row count must match [`math.interaction_output_len`].
+    /// Each row length must match the runtime error vector passed to [`math.mapInteraction`].
+    interaction: [][]f32,
 };
 
 pub const OdometryPid = struct {

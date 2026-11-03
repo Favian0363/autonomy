@@ -39,6 +39,7 @@ struct Telemetry {
   float thr[8];
   int thr_len;
   char step[64];
+  float force_error[3];
 };
 
 struct Cursor {
@@ -83,9 +84,7 @@ static bool read_vec3(Cursor *c, float out[3]) {
 static bool parse_telemetry(const unsigned char *bytes, int size, Telemetry *out) {
   Cursor c{bytes, bytes + size};
   const unsigned char *magic;
-  unsigned char version;
-  if (!take(&c, 4, &magic) || std::memcmp(magic, "AUV1", 4) != 0 || !read_u8(&c, &version) || version != 2)
-    return false;
+  if (!take(&c, 4, &magic) || std::memcmp(magic, "AUV1", 4) != 0) return false;
 
   const unsigned char *timestamp;
   if (!take(&c, 8, &timestamp)) return false;
@@ -156,18 +155,23 @@ static bool parse_telemetry(const unsigned char *bytes, int size, Telemetry *out
   const int step_len = nstep < 63 ? nstep : 63;
   std::memcpy(out->step, step, static_cast<std::size_t>(step_len));
   out->step[step_len] = '\0';
-  return true;
+  return read_vec3(&c, out->force_error);
 }
 
 // ZED streaming binds an even port and the next one; keep separate from telemetry udp (5600).
 static constexpr int kDefaultTelemetryPort = 5600;
 static constexpr int kDefaultStreamPort = 5610;
 static constexpr int kDefaultTeleopPort = 8080;
+
+// "none", "off", or "-" skips the camera so the viewer can follow simulation telemetry.
+static bool video_disabled(const char *source) {
+  return std::strcmp(source, "none") == 0 || std::strcmp(source, "off") == 0 || std::strcmp(source, "-") == 0;
+}
 static constexpr float kTeleopStep = 0.05f;
 static constexpr double kTeleopPeriod = 0.05;
 
-// Vehicle frame is X forward, Y right, Z down. Raylib is Y up.
-static Vector3 to_ray(float x, float y, float z) { return {y, -z, -x}; }
+// Stonefish body and world: X right, Y forward, Z down. Raylib is Y up.
+static Vector3 to_ray(float x, float y, float z) { return {x, -z, -y}; }
 
 static void rotate_quat(const float q[4], float x, float y, float z, float *ox, float *oy, float *oz) {
   const float qx = q[0], qy = q[1], qz = q[2], qw = q[3];
@@ -178,6 +182,13 @@ static void rotate_quat(const float q[4], float x, float y, float z, float *ox, 
   *ox = x + qw * tx + (qy * tz - qz * ty);
   *oy = y + qw * ty + (qz * tx - qx * tz);
   *oz = z + qw * tz + (qx * ty - qy * tx);
+}
+
+static void draw_arrow(const float origin[3], float x, float y, float z, float radius, Color color) {
+  const Vector3 from = to_ray(origin[0], origin[1], origin[2]);
+  const Vector3 to = to_ray(origin[0] + x, origin[1] + y, origin[2] + z);
+  DrawCylinderEx(from, to, radius, radius, 8, color);
+  DrawSphere(to, radius * 2.5f, color);
 }
 
 static void draw_box(const float pos[3], const float quat[4], const float size[3], Color color) {
@@ -269,19 +280,23 @@ int main(int argc, char **argv) {
   else
     std::fprintf(stderr, "teleop command -> 127.0.0.1:%d\n", teleop_port);
 
-  InitWindow(1280, 1000, "viewer");
-  SetTargetFPS(60);
-  RenderTexture2D scene = LoadRenderTexture(900, 470);
-  float orbit_yaw = 0.8f;
-  float orbit_pitch = 0.55f;
-  float orbit_dist = 8.f;
-
   char default_video[64];
+  const bool read_video = !(argc > 2 && video_disabled(argv[2]));
   const char *video_source = argc > 2 ? argv[2] : nullptr;
-  if (!video_source) {
+  if (read_video && !video_source) {
     std::snprintf(default_video, sizeof(default_video), "127.0.0.1:%d", kDefaultStreamPort);
     video_source = default_video;
   }
+
+  InitWindow(1280, 1000, "viewer");
+  SetTargetFPS(60);
+  const int scene_w = 900;
+  const int scene_h = read_video ? 470 : 990;
+  RenderTexture2D scene = LoadRenderTexture(scene_w, scene_h);
+  const Rectangle view3d{0, read_video ? 520.f : 0.f, static_cast<float>(scene_w), static_cast<float>(scene_h)};
+  float orbit_yaw = 0.8f;
+  float orbit_pitch = 0.55f;
+  float orbit_dist = 8.f;
 
   int video_w = 0, video_h = 0;
   Texture2D video{};
@@ -297,7 +312,7 @@ int main(int argc, char **argv) {
   double last_teleop = -1;
 
   while (!WindowShouldClose()) {
-    if (!video_w && GetTime() - last_video_try > 2.0) {
+    if (read_video && !video_w && GetTime() - last_video_try > 2.0) {
       last_video_try = GetTime();
       int w = 0, h = 0;
       if (video_open(video_source, &w, &h)) {
@@ -361,7 +376,6 @@ int main(int argc, char **argv) {
       }
     }
 
-    const Rectangle view3d{0, 520, 900, 470};
     if (CheckCollisionPointRec(GetMousePosition(), view3d)) {
       if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
         const Vector2 delta = GetMouseDelta();
@@ -390,11 +404,22 @@ int main(int argc, char **argv) {
     rlPopMatrix();
     DrawLine3D(sub, {sub.x, 0, sub.z}, Fade(SKYBLUE, 0.45f));
     {
-      const float hull[3] = {0.8f, 0.35f, 0.22f};
+      const float hull[3] = {0.35f, 0.8f, 0.22f};
       draw_box(tel.pos, tel.quat, hull, SKYBLUE);
       float fx, fy, fz;
-      rotate_quat(tel.quat, 0.7f, 0, 0, &fx, &fy, &fz);
+      rotate_quat(tel.quat, 0, 0.7f, 0, &fx, &fy, &fz);
       DrawLine3D(sub, to_ray(tel.pos[0] + fx, tel.pos[1] + fy, tel.pos[2] + fz), ORANGE);
+
+      const float cmd[4] = {orientation.x, orientation.y, orientation.z, orientation.w};
+      float cx, cy, cz;
+      rotate_quat(cmd, 0, 2.f, 0, &cx, &cy, &cz);
+      draw_arrow(tel.pos, cx, cy, cz, 0.02f, GREEN);
+      float mx, my, mz;
+      rotate_quat(cmd, translation[0], translation[1], translation[2], &mx, &my, &mz);
+      if (mx * mx + my * my + mz * mz > 1e-6f) draw_arrow(tel.pos, mx * 1.2f, my * 1.2f, mz * 1.2f, 0.045f, MAGENTA);
+      float ex, ey, ez;
+      rotate_quat(tel.quat, tel.force_error[0], tel.force_error[1], tel.force_error[2], &ex, &ey, &ez);
+      if (ex * ex + ey * ey + ez * ez > 1e-6f) draw_arrow(tel.pos, ex, ey, ez, 0.03f, YELLOW);
     }
     for (int i = 0; i < tel.objects; i++) {
       const Object3d &obj = tel.objs[i];
@@ -405,13 +430,14 @@ int main(int argc, char **argv) {
     }
     EndMode3D();
     DrawText("sub blue   objects colored by coco class   right-drag orbit   wheel zoom", 8, 8, 16, LIGHTGRAY);
-    DrawText("x forward   y right   z down", 8, 28, 16, GRAY);
+    DrawText("y forward   x right   z down", 8, 28, 16, GRAY);
+    DrawText("orange nose   green cmd   pink move   yellow err", 8, 48, 16, GRAY);
     EndTextureMode();
 
     BeginDrawing();
     ClearBackground(BLACK);
 
-    if (video_w) {
+    if (read_video && video_w) {
       float scale = 900.0f / video_w;
       if (video_h * scale > 500.f) scale = 500.f / video_h;
       DrawTextureEx(video, {0, 0}, 0, scale, WHITE);
@@ -424,7 +450,7 @@ int main(int argc, char **argv) {
 
       if (last_frame < 0 || GetTime() - last_frame > 1.0)
         DrawText(TextFormat("no frames from %s", video_source), 20, 20, 20, RED);
-    } else {
+    } else if (read_video) {
       DrawText(TextFormat("video: connecting to %s", video_source), 20, 20, 20, YELLOW);
     }
 
@@ -434,7 +460,8 @@ int main(int argc, char **argv) {
     else
       DrawText(TextFormat("udp %d", port), x, 20, 20, GREEN);
 
-    DrawText(TextFormat("zed  %s", video_source), x, 40, 18, video_w ? GREEN : ORANGE);
+    const Color zed_color = !read_video ? GRAY : (video_w ? GREEN : ORANGE);
+    DrawText(read_video ? TextFormat("zed  %s", video_source) : "zed  off", x, 40, 18, zed_color);
     DrawText(TextFormat("step  %s", tel.step), x, 60, 20, RAYWHITE);
     DrawText(TextFormat("pos   %.2f %.2f %.2f", tel.pos[0], tel.pos[1], tel.pos[2]), x, 90, 20, RAYWHITE);
     DrawText(TextFormat("quat  %.2f %.2f %.2f %.2f", tel.quat[0], tel.quat[1], tel.quat[2], tel.quat[3]), x, 120, 20,
@@ -451,13 +478,16 @@ int main(int argc, char **argv) {
              teleop_fd >= 0 ? RAYWHITE : RED);
     DrawText(TextFormat("cmd   %.2f %.2f %.2f %.2f", orientation.x, orientation.y, orientation.z, orientation.w), x, 300,
              20, RAYWHITE);
-    DrawText(TextFormat("teleop %d  W/S surge  A/D sway  R/F heave  I/K roll", teleop_port), x, 330, 16, GRAY);
-    DrawText("arrows yaw and pitch", x, 348, 16, GRAY);
-    DrawTextureRec(scene.texture, {0, 0, 900, -470}, {view3d.x, view3d.y}, WHITE);
+    DrawText(TextFormat("err   %.2f %.2f %.2f", tel.force_error[0], tel.force_error[1], tel.force_error[2]), x, 330, 20,
+             YELLOW);
+    DrawText(TextFormat("teleop %d  W/S surge  A/D sway  R/F heave  I/K roll", teleop_port), x, 360, 16, GRAY);
+    DrawText("arrows yaw and pitch", x, 378, 16, GRAY);
+    DrawTextureRec(scene.texture, {0, 0, static_cast<float>(scene_w), -static_cast<float>(scene_h)},
+                   {view3d.x, view3d.y}, WHITE);
     DrawRectangleLinesEx(view3d, 1, GRAY);
 
     for (int i = 0; i < tel.thr_len; i++) {
-      const int y = 380 + i * 30;
+      const int y = 410 + i * 30;
       const int w = static_cast<int>(tel.thr[i] * 100);
       DrawText(TextFormat("t%d %+.2f", i, tel.thr[i]), x, y, 20, RAYWHITE);
       DrawRectangle(w < 0 ? x + 240 + w : x + 240, y, w < 0 ? -w : w, 20, SKYBLUE);
