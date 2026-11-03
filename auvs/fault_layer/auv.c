@@ -22,7 +22,26 @@ static AuvSetThrustorsInputFunc *target_set_thrustors;
 static AuvDeinitFunc *target_deinit;
 
 static uint64_t period_ns; // 0: pass every frame
+static uint64_t due_ns;    // when the next frame is due, on a fixed schedule
 static uint64_t delay_ns;
+// The delay really applied is rounded up to whole frames and varies a little with how the
+// target's frames line up with the rate; it is printed once, over the first REPORT_FRAMES frames.
+#define REPORT_FRAMES 300
+static int reported_frames;
+static uint64_t delay_sum_ns, delay_min_ns, delay_max_ns;
+
+static void report_delay(uint64_t applied_ns) {
+  if (reported_frames >= REPORT_FRAMES)
+    return;
+  delay_sum_ns += applied_ns;
+  if (reported_frames == 0 || applied_ns < delay_min_ns)
+    delay_min_ns = applied_ns;
+  if (applied_ns > delay_max_ns)
+    delay_max_ns = applied_ns;
+  if (++reported_frames == REPORT_FRAMES)
+    fprintf(stderr, "[fault] applied delay over %d frames: mean_ms=%.1f min_ms=%.1f max_ms=%.1f\n", REPORT_FRAMES,
+            delay_sum_ns / 1e6 / REPORT_FRAMES, delay_min_ns / 1e6, delay_max_ns / 1e6);
+}
 
 // Frames that passed the rate limit, kept in a ring: `next` is the slot written next and
 // `count` how many slots hold frames. frame_ago(0) is the newest, frame_ago(1) the one before.
@@ -83,21 +102,29 @@ void auv_init(void) {
   delay_ns = (uint64_t)(delay_ms * 1e6);
   next = 0;
   count = 0;
+  reported_frames = 0;
+  delay_sum_ns = delay_max_ns = 0;
   fprintf(stderr, "[fault] target=%s rate_hz=%g delay_ms=%g\n", getenv("AUV_FAULT_TARGET"), rate_hz, delay_ms);
   target_init();
 }
 
 // Reads the target's frames into `slot` until one passes the rate limit. The target's frames
 // in between are skipped, and the target keeps applying the last thruster values meanwhile.
+// Frames are due on a fixed schedule rather than one period after the last frame passed: the
+// target's frames rarely land exactly on a period (12 simulator frames are 33.32 ms, just short
+// of 33.33), and counting from the last frame would then always wait one frame too many.
 static void next_rate_limited_frame(AuvFrame *slot) {
   if (count == 0 || period_ns == 0) {
     target_yield(slot);
+    due_ns = slot->timestamp + period_ns;
     return;
   }
-  const uint64_t due = frame_ago(0)->timestamp + period_ns;
   do
     target_yield(slot);
-  while (slot->timestamp < due);
+  while (slot->timestamp < due_ns);
+  due_ns += period_ns;
+  if (due_ns <= slot->timestamp) // the target is slower than the rate: no catching up
+    due_ns = slot->timestamp + period_ns;
 }
 
 void auv_yield_until_next_frame(AuvFrame *frame) {
@@ -115,6 +142,7 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
   for (int k = 0; k < count; k++) {
     if (now - frame_ago(k)->timestamp >= delay_ns) {
       *frame = *frame_ago(k);
+      report_delay(now - frame->timestamp);
       return;
     }
   }
