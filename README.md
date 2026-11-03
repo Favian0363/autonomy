@@ -126,5 +126,12 @@ zig build -Dzed run -- \
     ./auvs/proteus_hwd/auv.json
 ```
 
+Before setting `"attitude_from_imu": true` on Proteus, check that the IMU's roll and pitch match
+the camera's. `imu_check` reads frames from the plugin, sends no thruster values, and prints both
+twice a second; tilt the robot by hand, roll then pitch, about 20 degrees each way. They should
+agree within a degree or two, with the same sign:
 
-
+```sh
+zig build -Dzed
+./zig-out/bin/imu_check ./zig-out/lib/libauv_proteus_hwd.so 30
+```

@@ -252,6 +252,21 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(lib_auv_fault_layer);
 
+    // bench check: camera vs IMU roll and pitch from a plugin, no thrusters (tests/hw/imu_check.c)
+    const imu_check = b.addExecutable(.{
+        .name = "imu_check",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    imu_check.root_module.link_libc = true;
+    imu_check.root_module.addCSourceFile(.{
+        .file = b.path("tests/hw/imu_check.c"),
+        .flags = &.{ "-Wall", "-Wextra", "-Werror" },
+    });
+    b.installArtifact(imu_check);
+
 
 
     // the zed sdk exposes c++ types, so this one has to be built with the
