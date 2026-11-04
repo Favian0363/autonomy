@@ -42,26 +42,17 @@ log_counter: u32,
 log_freq_div: u16,
 
 target_position: math.Vector3f,
-/// Saved go-to and look-at pairs. `pushBackBounded` appends; `popFront` drops the oldest.
 queue: std.Deque(Goal) = .empty,
-/// Look the vehicle is driving toward. Identity until the first valid direction, then kept when the camera reaches the target.
 target_orientation: math.Quaternionf = bc.identity,
-/// `target_position` fills body X, Y, and Z on `position_axes` when this is set.
 use_position: bool = false,
-/// `target_orientation` fills roll, pitch, and yaw when this is set.
 use_orientation: bool = false,
-/// World axes `target_position` may fill.
 position_axes: Auv.AxisOk = .{ .x = true, .y = true, .z = true },
-/// Image target. Null leaves those axes to the pose, or to zero when the pose is not in use.
-visual: ?LookForwardHeading = null,
-/// Body-frame translation error from the stick. When set, it owns X, Y, and Z.
+desired: math.Vector2f = .{ 0, 0 },
+desired_height: ?f32 = null,
 translation: ?math.Vector3f = null,
-/// Odometry PID memory in TAM order. Lanes 0..2 are body translation, lanes 3..5 are attitude.
 pid_sum_err: math.Vector6f = @splat(0),
 pid_prev_err: math.Vector6f = @splat(0),
-/// Slew-limited tilt that swings a controllable force onto a missing translation.
 tilt_correction: math.Vector3f = .{ 0, 0, 0 },
-/// Body-frame translation error the force is calculated from. X right, Y forward, Z down.
 force_error: math.Vector3f = .{ 0, 0, 0 },
 pid_prev_timestamp_ns: ?u64,
 
@@ -153,7 +144,6 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
     };
 }
 
-/// Invalidates `seen_objects`
 pub fn reset(ctx: *MissionContext) void {
     ctx.seen_objects_len = 0;
     ctx.clearQueue();
@@ -161,7 +151,8 @@ pub fn reset(ctx: *MissionContext) void {
     ctx.target_orientation = bc.identity;
     ctx.use_position = false;
     ctx.use_orientation = false;
-    ctx.visual = null;
+    ctx.desired = .{ 0, 0 };
+    ctx.desired_height = null;
     ctx.translation = null;
     ctx.pid_prev_timestamp_ns = null;
 }
@@ -304,41 +295,9 @@ pub fn resetOdometryPid(ctx: *MissionContext) void {
     ctx.tilt_correction = .{ 0, 0, 0 };
 }
 
-/// How body-forward error is chosen while a box is visible.
-pub const ImageSurge = enum {
-    /// Body Y comes from `target_height` minus the box height.
-    scale,
-    /// Body Y is a constant forward error. Yaw and heave still come from the box.
-    forward,
-};
-
-/// Body-Y error used while `ImageSurge.forward` is active.
-const forward_body_error: f32 = 2;
-
-/// Image target stored on the context. Null means this frame has no visual source.
-pub const LookForwardHeading = struct {
-    id: u32,
-    /// Desired image point. The center is `{0, 0}`.
-    desired: math.Vector2f = .{ 0, 0 },
-    /// Null uses `target_height` from the vehicle file.
-    desired_height: ?f32 = null,
-    /// Added to the scale-driven body-Y error. Ignored when `surge` is `.forward`.
-    forward_bias: f32 = 0,
-    /// Body X per unit of `desired_height - height`. Zero leaves sway to the matrix.
-    range_sway: f32 = 0,
-    surge: ImageSurge = .scale,
-};
-
 /// World direction of body +Y at a level heading. Yaw 0 looks along +Y.
 fn lookAtHeading(heading: f32) math.Vector3f {
     return .{ -@sin(heading), @cos(heading), 0 };
-}
-
-fn object2dOnFrame(ctx: *const MissionContext, id: u32) ?Auv.Object2d {
-    for (ctx.frame.objects2d[0..ctx.frame.objects2d_len]) |object| {
-        if (object.id == id) return object;
-    }
-    return null;
 }
 
 /// Point the camera at `target` from the current pose, clamped by `rotation_limit`.
@@ -401,34 +360,33 @@ fn poseAvailable(ctx: *const MissionContext) [6]bool {
     };
 }
 
-/// Visual body error. Null when the box is missing or `interaction` does not match the image error.
-/// Translation rows keep surge, forward bias, and range sway. Roll and pitch are the level-look error plus those matrix rows.
-fn visualBodyError(ctx: *MissionContext, heading: LookForwardHeading) ?[6]f32 {
-    const object = object2dOnFrame(ctx, heading.id) orelse return null;
+/// Visual body error from the first box on this frame. Null when the frame has no box or `interaction` does not match the image error.
+/// Translation rows come from the interaction matrix. Roll and pitch are the level-look error plus those matrix rows.
+fn visualBodyError(ctx: *MissionContext) ?[6]f32 {
+    if (ctx.frame.objects2d_len == 0) return null;
+    const object = ctx.frame.objects2d[0];
     const metrics = math.boxMetrics(
         ctx.frame.image_width,
         ctx.frame.image_height,
         .{ object.top_left.x, object.top_left.y },
         .{ object.bottom_right.x, object.bottom_right.y },
     );
-    const vision = ctx.config.non_odometry;
+    const ibvs = ctx.config.ibvs;
     const image_error = [_]f32{
-        math.withinDeadband(heading.desired[0] - metrics.cx, vision.center_deadband),
-        math.withinDeadband(heading.desired[1] - metrics.cy, vision.center_deadband),
-        (heading.desired_height orelse vision.target_height) - metrics.height,
+        math.withinDeadband(ctx.desired[0] - metrics.cx, ibvs.center_deadband),
+        math.withinDeadband(ctx.desired[1] - metrics.cy, ibvs.center_deadband),
+        (ctx.desired_height orelse ibvs.target_height) - metrics.height,
     };
-    var mapped = math.mapInteraction(vision.interaction, &image_error) catch |err| {
+    const mapped = math.mapInteraction(ibvs.interaction, &image_error) catch |err| {
         std.log.err(
             "interaction map failed ({s}): expected {d} rows, each with {d} columns; config has {d} rows",
-            .{ @errorName(err), math.interaction_output_len, image_error.len, vision.interaction.len },
+            .{ @errorName(err), math.interaction_output_len, image_error.len, ibvs.interaction.len },
         );
-        if (vision.interaction.len > 0) {
-            std.log.err("interaction row 0 has {d} columns", .{vision.interaction[0].len});
+        if (ibvs.interaction.len > 0) {
+            std.log.err("interaction row 0 has {d} columns", .{ibvs.interaction[0].len});
         }
         return null;
     };
-    if (heading.surge == .forward) mapped[1] = forward_body_error else mapped[1] += heading.forward_bias;
-    if (heading.desired_height) |height_ref| mapped[0] += heading.range_sway * (height_ref - metrics.height);
     const current = bc.normalizedQuat(ctx.frame.camera_pose.quat) catch unreachable;
     const yaw = math.quaternionToEuler(current)[2] + mapped[5];
     const look_q = bc.lookWithinLimits(
@@ -448,9 +406,9 @@ fn anyAxis(available: [6]bool) bool {
     return false;
 }
 
-/// Fill one body error from the pose, then vision. An axis with neither source is zero.
+/// Fill one body error from the pose, then ibvs. An axis with neither source is zero.
 fn bodyError(ctx: *MissionContext) [6]f32 {
-    const visual = if (ctx.visual) |heading| visualBodyError(ctx, heading) else null;
+    const visual = visualBodyError(ctx);
     var available = poseAvailable(ctx);
     var position_error = poseError(ctx);
     if (ctx.translation) |body| {

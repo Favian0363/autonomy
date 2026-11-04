@@ -13,7 +13,8 @@ ping: std.heap.FixedBufferAllocator,
 pong: std.heap.FixedBufferAllocator,
 reader_buf: [4098]u8,
 
-pub const NonOdometryPid = struct {
+/// Image-based visual servoing. The interaction matrix maps image error into a body error.
+pub const Ibvs = struct {
     center_deadband: f32,
     target_height: f32,
     /// Rows are body X, Y, Z, roll, pitch, then yaw. Row count must match [`math.interaction_output_len`].
@@ -37,7 +38,7 @@ pub const Config = struct {
     rotation_limit: math.Vector3f = .{std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) },
     tam: []math.Vector6f,
     odometry: OdometryPid,
-    non_odometry: NonOdometryPid,
+    ibvs: Ibvs,
 };
 
 pub fn init(arena: std.mem.Allocator, config_path: []const u8) !MissionLoader {
