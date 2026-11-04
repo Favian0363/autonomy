@@ -15,6 +15,12 @@ const print_stuff = true;
 const clear_print_stuff = true;
 const telemetry_log_path: ?[]const u8 = null;
 const telemetry_addr: []const u8 = "127.0.0.1:5600";
+const queue_capacity = 32;
+
+const Goal = struct {
+    position: math.Vector3f,
+    look_at: math.Vector3f,
+};
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -36,21 +42,25 @@ log_counter: u32,
 log_freq_div: u16,
 
 target_position: math.Vector3f,
-/// Last look. Identity until the first valid direction, then kept when the camera reaches the target.
+/// Saved go-to and look-at pairs. `pushBackBounded` appends; `popFront` drops the oldest.
+queue: std.Deque(Goal) = .empty,
+/// Look the vehicle is driving toward. Identity until the first valid direction, then kept when the camera reaches the target.
 target_orientation: math.Quaternionf = bc.identity,
-/// Goal chosen before the frame. The yield turns it into `command`.
-motion: Track = .{},
-/// Numeric command filled from the current frame. Only the yield writes this.
-command: Command = .{},
+/// `target_position` fills body X, Y, and Z on `position_axes` when this is set.
+use_position: bool = false,
+/// `target_orientation` fills roll, pitch, and yaw when this is set.
+use_orientation: bool = false,
+/// World axes `target_position` may fill.
+position_axes: Auv.AxisOk = .{ .x = true, .y = true, .z = true },
+/// Image target. Null leaves those axes to the pose, or to zero when the pose is not in use.
+visual: ?LookForwardHeading = null,
+/// Body-frame translation error from the stick. When set, it owns X, Y, and Z.
+translation: ?math.Vector3f = null,
 /// Odometry PID memory in TAM order. Lanes 0..2 are body translation, lanes 3..5 are attitude.
 pid_sum_err: math.Vector6f = @splat(0),
 pid_prev_err: math.Vector6f = @splat(0),
 /// Slew-limited tilt that swings a controllable force onto a missing translation.
 tilt_correction: math.Vector3f = .{ 0, 0, 0 },
-/// Orientation held while the command has no target orientation.
-held_q: ?math.Quaternionf = null,
-/// Last explicit target orientation. A mission-look change clears the attitude lanes of the PID.
-explicit_q: ?math.Quaternionf = null,
 /// Body-frame translation error the force is calculated from. X right, Y forward, Z down.
 force_error: math.Vector3f = .{ 0, 0, 0 },
 pid_prev_timestamp_ns: ?u64,
@@ -107,6 +117,8 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
     else
         null;
 
+    const goals = try arena.alloc(Goal, queue_capacity);
+
     return .{
         .frame = undefined,
 
@@ -120,6 +132,7 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
         .log_freq_div = 120,
 
         .target_position = @splat(0),
+        .queue = .initBuffer(goals),
 
         .pid_prev_timestamp_ns = null,
 
@@ -143,12 +156,13 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
 /// Invalidates `seen_objects`
 pub fn reset(ctx: *MissionContext) void {
     ctx.seen_objects_len = 0;
+    ctx.clearQueue();
     ctx.resetOdometryPid();
-    ctx.held_q = null;
-    ctx.explicit_q = null;
     ctx.target_orientation = bc.identity;
-    ctx.motion = .{};
-    ctx.command = .{};
+    ctx.use_position = false;
+    ctx.use_orientation = false;
+    ctx.visual = null;
+    ctx.translation = null;
     ctx.pid_prev_timestamp_ns = null;
 }
 
@@ -228,7 +242,6 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
         ctx.auv.init();
     }
 
-    ctx.commandTrack();
     var thruster_buffer: [math.max_thrusters]f32 = @splat(0);
     const thruster_values = ctx.controlStep(&thruster_buffer);
     ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
@@ -291,11 +304,6 @@ pub fn resetOdometryPid(ctx: *MissionContext) void {
     ctx.tilt_correction = .{ 0, 0, 0 };
 }
 
-fn clearOdometryAttitude(ctx: *MissionContext) void {
-    ctx.pid_sum_err = .{ ctx.pid_sum_err[0], ctx.pid_sum_err[1], ctx.pid_sum_err[2], 0, 0, 0 };
-    ctx.pid_prev_err = .{ ctx.pid_prev_err[0], ctx.pid_prev_err[1], ctx.pid_prev_err[2], 0, 0, 0 };
-}
-
 /// How body-forward error is chosen while a box is visible.
 pub const ImageSurge = enum {
     /// Body Y comes from `target_height` minus the box height.
@@ -307,7 +315,7 @@ pub const ImageSurge = enum {
 /// Body-Y error used while `ImageSurge.forward` is active.
 const forward_body_error: f32 = 2;
 
-/// Image target carried by a `track` goal.
+/// Image target stored on the context. Null means this frame has no visual source.
 pub const LookForwardHeading = struct {
     id: u32,
     /// Desired image point. The center is `{0, 0}`.
@@ -319,21 +327,6 @@ pub const LookForwardHeading = struct {
     /// Body X per unit of `desired_height - height`. Zero leaves sway to the matrix.
     range_sway: f32 = 0,
     surge: ImageSurge = .scale,
-};
-
-/// One goal. Position fills an axis when that measurement exists; otherwise vision. An axis with neither is zero.
-pub const Track = struct {
-    position: ?math.Vector3f = null,
-    position_axes: Auv.AxisOk = .{ .x = true, .y = true, .z = true },
-    visual: ?LookForwardHeading = null,
-    orientation: ?math.Quaternionf = null,
-    translation: ?math.Vector3f = null,
-};
-
-const Command = struct {
-    translation: math.Vector3f = .{ 0, 0, 0 },
-    target_orientation: ?math.Quaternionf = null,
-    body_error: ?[6]f32 = null,
 };
 
 /// World direction of body +Y at a level heading. Yaw 0 looks along +Y.
@@ -376,35 +369,35 @@ fn bodyTranslationError(ctx: *const MissionContext, target: math.Vector3f, use_a
     return math.quaternionRotate(math.quaternionConjugate(body_q), world);
 }
 
-fn attitudeToward(ctx: *const MissionContext, orientation: ?math.Quaternionf) ?math.Vector3f {
-    const target = orientation orelse return null;
+fn attitudeToward(ctx: *const MissionContext, orientation: math.Quaternionf) ?math.Vector3f {
     const current = bc.normalizedQuat(ctx.frame.camera_pose.quat) catch return null;
-    const desired = bc.normalizedQuat(target) catch return null;
+    const desired = bc.normalizedQuat(orientation) catch return null;
     return bc.attitudeError(current, desired) catch null;
 }
 
-/// Position and orientation errors for the axes the goal is allowed to fill. Unavailable axes are zero here.
-fn positionGoalError(ctx: *const MissionContext, goal: Track) [6]f32 {
-    const translation = if (goal.position) |target|
-        bodyTranslationError(ctx, target, goal.position_axes)
+/// Pose error for the axes the context is tracking. Untracked and unavailable axes are zero here.
+fn poseError(ctx: *const MissionContext) [6]f32 {
+    const translation = if (ctx.use_position)
+        bodyTranslationError(ctx, ctx.target_position, ctx.position_axes)
     else
         math.Vector3f{ 0, 0, 0 };
-    const angular = attitudeToward(ctx, goal.orientation) orelse math.Vector3f{ 0, 0, 0 };
+    const angular = if (ctx.use_orientation)
+        attitudeToward(ctx, ctx.target_orientation) orelse math.Vector3f{ 0, 0, 0 }
+    else
+        math.Vector3f{ 0, 0, 0 };
     return .{ translation[0], translation[1], translation[2], angular[0], angular[1], angular[2] };
 }
 
-fn positionAvailable(ctx: *const MissionContext, goal: Track) [6]bool {
+fn poseAvailable(ctx: *const MissionContext) [6]bool {
     const position = ctx.frame.position_ok;
     const attitude = ctx.frame.attitude_ok;
-    const use_position = goal.position != null;
-    const use_attitude = goal.orientation != null;
     return .{
-        use_position and goal.position_axes.x and position.x,
-        use_position and goal.position_axes.y and position.y,
-        use_position and goal.position_axes.z and position.z,
-        use_attitude and attitude.x,
-        use_attitude and attitude.y,
-        use_attitude and attitude.z,
+        ctx.use_position and ctx.position_axes.x and position.x,
+        ctx.use_position and ctx.position_axes.y and position.y,
+        ctx.use_position and ctx.position_axes.z and position.z,
+        ctx.use_orientation and attitude.x,
+        ctx.use_orientation and attitude.y,
+        ctx.use_orientation and attitude.z,
     };
 }
 
@@ -455,13 +448,12 @@ fn anyAxis(available: [6]bool) bool {
     return false;
 }
 
-/// Fill one body error from position, then vision. An axis with neither source is zero.
-fn commandTrack(ctx: *MissionContext) void {
-    const goal = ctx.motion;
-    const visual = if (goal.visual) |heading| visualBodyError(ctx, heading) else null;
-    var available = positionAvailable(ctx, goal);
-    var position_error = positionGoalError(ctx, goal);
-    if (goal.translation) |body| {
+/// Fill one body error from the pose, then vision. An axis with neither source is zero.
+fn bodyError(ctx: *MissionContext) [6]f32 {
+    const visual = if (ctx.visual) |heading| visualBodyError(ctx, heading) else null;
+    var available = poseAvailable(ctx);
+    var position_error = poseError(ctx);
+    if (ctx.translation) |body| {
         position_error[0] = body[0];
         position_error[1] = body[1];
         position_error[2] = body[2];
@@ -473,13 +465,7 @@ fn commandTrack(ctx: *MissionContext) void {
         ctx.resetOdometryPid();
         ctx.pid_prev_timestamp_ns = null;
     }
-    const chosen = math.greedy6(position_error, visual, available);
-    ctx.explicit_q = null;
-    ctx.command = .{
-        .translation = .{ chosen[0], chosen[1], chosen[2] },
-        .target_orientation = null,
-        .body_error = chosen,
-    };
+    return math.greedy6(position_error, visual, available);
 }
 
 fn quaternionFromRotationVector(rot: math.Vector3f) math.Quaternionf {
@@ -488,23 +474,9 @@ fn quaternionFromRotationVector(rot: math.Vector3f) math.Quaternionf {
     return bc.forwardRotation(rot, angle) catch bc.identity;
 }
 
-fn resolveLook(ctx: *MissionContext, current: math.Quaternionf, look: ?math.Quaternionf) math.Quaternionf {
-    if (look) |q| {
-        const target = bc.normalizedQuat(q) catch unreachable;
-        ctx.explicit_q = target;
-        return target;
-    }
-    if (ctx.explicit_q != null) {
-        ctx.explicit_q = null;
-        ctx.held_q = null;
-        ctx.clearOdometryAttitude();
-    }
-    if (ctx.held_q == null) ctx.held_q = current;
-    return ctx.held_q.?;
-}
-
-/// Track `ctx.command` and return the thruster values. Invalid pose axes contribute no error.
+/// Track the context pose and return the thruster values. Invalid pose axes contribute no error.
 fn controlStep(ctx: *MissionContext, thruster_buffer: *[math.max_thrusters]f32) []f32 {
+    const body_error = ctx.bodyError();
     const timestamp_ns = ctx.frame.timestamp;
     const dt: ?f32 = if (ctx.pid_prev_timestamp_ns) |previous| blk: {
         const elapsed_ns = timestamp_ns - previous;
@@ -517,23 +489,17 @@ fn controlStep(ctx: *MissionContext, thruster_buffer: *[math.max_thrusters]f32) 
 
     const thrust_direction = bc.ThrustDirections.fromTamLinearForces(ctx.config.tam) catch unreachable;
     const current = ctx.frame.camera_pose.quat;
-    const command = ctx.command;
-    var target_q = if (command.body_error) |err| blk: {
-        const rot: math.Vector3f = .{ err[3], err[4], err[5] };
-        const delta = quaternionFromRotationVector(rot);
-        const current_q = bc.normalizedQuat(current) catch bc.identity;
-        break :blk bc.normalizedQuat(math.quaternionMul(current_q, delta)) catch current_q;
-    } else ctx.resolveLook(current, command.target_orientation);
+    const error_body: math.Vector3f = .{ body_error[0], body_error[1], body_error[2] };
+    const rot: math.Vector3f = .{ body_error[3], body_error[4], body_error[5] };
+    const delta = quaternionFromRotationVector(rot);
+    const current_q = bc.normalizedQuat(current) catch bc.identity;
+    var target_q = bc.normalizedQuat(math.quaternionMul(current_q, delta)) catch current_q;
     const odom = ctx.config.odometry;
     var desired_tilt: math.Vector3f = .{ 0, 0, 0 };
     var force_error: math.Vector3f = .{ 0, 0, 0 };
     const moments = bc.ThrustDirections.fromTamMoments(ctx.config.tam) catch unreachable;
     // Coverage swings a thruster onto a force component the map cannot produce.
     const translation_command: math.Vector3f = blk: {
-        const error_body: math.Vector3f = if (command.body_error) |err|
-            .{ err[0], err[1], err[2] }
-        else
-            command.translation;
         force_error = error_body;
         const available = thrust_direction.alongThrust(error_body);
         var force_body: math.Vector3f = .{ 0, 0, 0 };
@@ -590,7 +556,6 @@ fn controlStep(ctx: *MissionContext, thruster_buffer: *[math.max_thrusters]f32) 
             ctx.pid_prev_err[lane] = 0;
         }
     }
-    ctx.held_q = target_q;
     const input: math.Vector6f = .{
         translation_body[0], translation_body[1], translation_body[2],
         rotation[0],         rotation[1],         rotation[2],
@@ -610,10 +575,8 @@ fn controlStep(ctx: *MissionContext, thruster_buffer: *[math.max_thrusters]f32) 
         std.log.debug("timestamp_ns = {d}", .{timestamp_ns});
         math.debug6f("pose", math.poseTo6f(ctx.frame.camera_pose));
         std.log.debug("position ok: {any} attitude ok: {any}", .{ ctx.frame.position_ok, ctx.frame.attitude_ok });
-        math.debug3f("translation error", command.translation);
-        if (command.target_orientation) |orient_q| {
-            std.log.debug("target orientation: {any}", .{orient_q});
-        }
+        math.debug3f("translation error", error_body);
+        std.log.debug("target orientation: {any}", .{ctx.target_orientation});
         std.log.debug("attitude error body: {any}", .{attitude_error});
         math.debug3f("rotation limit", ctx.config.rotation_limit);
         std.log.debug("target quaternion: {any}", .{target_q});
@@ -634,7 +597,9 @@ fn controlStep(ctx: *MissionContext, thruster_buffer: *[math.max_thrusters]f32) 
 
 /// Search while holding still. Returns the first object of `cls`.
 pub fn yieldFind(ctx: *MissionContext, cls: u8) !*const Auv.Object {
-    ctx.motion = .{ .position = ctx.target_position, .orientation = ctx.target_orientation };
+    ctx.use_position = true;
+    ctx.use_orientation = true;
+    ctx.translation = null;
     var seen: usize = 0;
 
     while (true) {
@@ -685,38 +650,70 @@ fn standoffAlong(object: *const Auv.Object, direction: math.Vector2f, sign: f32)
     return .{ center[0] + offset[0], center[1] + offset[1], center[2] };
 }
 
-fn yieldStandoff(ctx: *MissionContext, object: *const Auv.Object, sign: f32) !void {
+fn clearQueue(ctx: *MissionContext) void {
+    ctx.queue.head = 0;
+    ctx.queue.len = 0;
+}
+
+/// One goal on `side_sign` of `object`, looking at the far side. Direction is frozen at this call.
+pub fn enqueueStandoff(ctx: *MissionContext, object: *const Auv.Object, side_sign: f32) !void {
     const direction = approachDirection(ctx, object);
-    while (true) {
-        const place = standoffAlong(object, direction, sign);
-        try ctx.setLookAtTarget(standoffAlong(object, direction, 1));
-        ctx.motion = .{ .position = place, .orientation = ctx.target_orientation };
-        try ctx.yieldUntilNextFrameAndUpdate();
-        if (reached(ctx, standoffAlong(object, direction, sign))) return;
-    }
+    const far = standoffAlong(object, direction, 1);
+    try ctx.queue.pushBackBounded(.{
+        .position = standoffAlong(object, direction, side_sign),
+        .look_at = far,
+    });
 }
 
 /// Face `object` and hold position. Returns when the attitude error is small.
 pub fn yieldLookAt(ctx: *MissionContext, object: *const Auv.Object) !void {
-    const hold = ctx.frame.camera_pose.pos;
+    ctx.target_position = ctx.frame.camera_pose.pos;
+    ctx.use_position = true;
+    ctx.use_orientation = true;
+    ctx.translation = null;
     while (true) {
         try ctx.setLookAtTarget(object.bbox.pose.pos);
-        ctx.motion = .{ .position = hold, .orientation = ctx.target_orientation };
         try ctx.yieldUntilNextFrameAndUpdate();
         const err = attitudeToward(ctx, ctx.target_orientation) orelse continue;
         if (math.length3f(err) <= look_done) return;
     }
 }
 
-/// Drive to the near side of `object`, looking at it.
+/// Drive to the near side of `object`, looking at the far side.
 pub fn yieldMoveTo(ctx: *MissionContext, object: *const Auv.Object) !void {
-    try yieldStandoff(ctx, object, -1);
+    ctx.clearQueue();
+    try ctx.enqueueStandoff(object, -1);
+    try ctx.yieldQueue();
 }
 
 /// Stop short of `object`, then continue the same distance past it.
 pub fn yieldPass(ctx: *MissionContext, object: *const Auv.Object) !void {
-    try yieldMoveTo(ctx, object);
-    try yieldStandoff(ctx, object, 1);
+    ctx.clearQueue();
+    const direction = approachDirection(ctx, object);
+    const far = standoffAlong(object, direction, 1);
+    try ctx.queue.pushBackBounded(.{
+        .position = standoffAlong(object, direction, -1),
+        .look_at = far,
+    });
+    try ctx.queue.pushBackBounded(.{
+        .position = far,
+        .look_at = far,
+    });
+    try ctx.yieldQueue();
+}
+
+/// Drive the queued goals in order. Returns when the queue is empty.
+pub fn yieldQueue(ctx: *MissionContext) !void {
+    ctx.use_position = true;
+    ctx.use_orientation = true;
+    ctx.translation = null;
+    while (ctx.queue.len != 0) {
+        const goal = ctx.queue.front().?;
+        ctx.target_position = goal.position;
+        try ctx.setLookAtTarget(goal.look_at);
+        try ctx.yieldUntilNextFrameAndUpdate();
+        if (reached(ctx, goal.position)) _ = ctx.queue.popFront();
+    }
 }
 
 const circle_corners: [4]math.Vector2f = .{
@@ -749,27 +746,24 @@ fn nearestCorner(ctx: *const MissionContext, object: *const Auv.Object, depth: f
 }
 
 fn yieldPlaceLookingAt(ctx: *MissionContext, place: math.Vector3f, object: *const Auv.Object) !void {
-    while (true) {
-        try ctx.setLookAtTarget(object.bbox.pose.pos);
-        ctx.motion = .{ .position = place, .orientation = ctx.target_orientation };
-        try ctx.yieldUntilNextFrameAndUpdate();
-        if (reached(ctx, place)) return;
-    }
+    ctx.clearQueue();
+    try ctx.queue.pushBackBounded(.{ .position = place, .look_at = object.bbox.pose.pos });
+    try ctx.yieldQueue();
 }
 
 /// Visit the four outside corners of `object`, then return to the start.
 pub fn yieldCircle(ctx: *MissionContext, object: *const Auv.Object) !void {
+    ctx.clearQueue();
     const start = ctx.frame.camera_pose.pos;
     const first = nearestCorner(ctx, object, start[2]);
+    const look_at = object.bbox.pose.pos;
     for (0..circle_corners.len) |step| {
         const index = (first + step) % circle_corners.len;
-        while (true) {
-            const place = circleCorner(object, index, start[2]);
-            try ctx.setLookAtTarget(object.bbox.pose.pos);
-            ctx.motion = .{ .position = place, .orientation = ctx.target_orientation };
-            try ctx.yieldUntilNextFrameAndUpdate();
-            if (reached(ctx, circleCorner(object, index, start[2]))) break;
-        }
+        try ctx.queue.pushBackBounded(.{
+            .position = circleCorner(object, index, start[2]),
+            .look_at = look_at,
+        });
     }
-    try yieldPlaceLookingAt(ctx, start, object);
+    try ctx.queue.pushBackBounded(.{ .position = start, .look_at = look_at });
+    try ctx.yieldQueue();
 }

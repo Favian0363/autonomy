@@ -54,13 +54,13 @@ pub fn teleopMission(ctx: *MissionContext) !void {
             else => return err,
         }
 
+        ctx.use_position = false;
+        ctx.use_orientation = true;
+        ctx.target_orientation = orientation;
         if (math.length3f(translation) <= 1e-4) {
-            ctx.motion = .{ .orientation = orientation };
+            ctx.translation = null;
         } else {
-            ctx.motion = .{
-                .translation = translation,
-                .orientation = orientation,
-            };
+            ctx.translation = translation;
         }
         try ctx.yieldUntilNextFrameAndUpdate();
     }
