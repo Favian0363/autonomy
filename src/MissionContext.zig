@@ -655,16 +655,6 @@ fn clearQueue(ctx: *MissionContext) void {
     ctx.queue.len = 0;
 }
 
-/// One goal on `side_sign` of `object`, looking at the far side. Direction is frozen at this call.
-pub fn enqueueStandoff(ctx: *MissionContext, object: *const Auv.Object, side_sign: f32) !void {
-    const direction = approachDirection(ctx, object);
-    const far = standoffAlong(object, direction, 1);
-    try ctx.queue.pushBackBounded(.{
-        .position = standoffAlong(object, direction, side_sign),
-        .look_at = far,
-    });
-}
-
 /// Face `object` and hold position. Returns when the attitude error is small.
 pub fn yieldLookAt(ctx: *MissionContext, object: *const Auv.Object) !void {
     ctx.target_position = ctx.frame.camera_pose.pos;
@@ -682,7 +672,12 @@ pub fn yieldLookAt(ctx: *MissionContext, object: *const Auv.Object) !void {
 /// Drive to the near side of `object`, looking at the far side.
 pub fn yieldMoveTo(ctx: *MissionContext, object: *const Auv.Object) !void {
     ctx.clearQueue();
-    try ctx.enqueueStandoff(object, -1);
+    const direction = approachDirection(ctx, object);
+    const far = standoffAlong(object, direction, 1);
+    try ctx.queue.pushBackBounded(.{
+        .position = standoffAlong(object, direction, -1),
+        .look_at = far,
+    });
     try ctx.yieldQueue();
 }
 
@@ -731,20 +726,6 @@ fn circleCorner(object: *const Auv.Object, index: usize, depth: f32) math.Vector
     return .{ pos[0], pos[1], depth };
 }
 
-fn nearestCorner(ctx: *const MissionContext, object: *const Auv.Object, depth: f32) usize {
-    var best_i: usize = 0;
-    var best = std.math.inf(f32);
-    const sub = math.xy(ctx.frame.camera_pose.pos);
-    for (0..circle_corners.len) |i| {
-        const dist = math.length2f(math.xy(circleCorner(object, i, depth)) - sub);
-        if (dist < best) {
-            best = dist;
-            best_i = i;
-        }
-    }
-    return best_i;
-}
-
 fn yieldPlaceLookingAt(ctx: *MissionContext, place: math.Vector3f, object: *const Auv.Object) !void {
     ctx.clearQueue();
     try ctx.queue.pushBackBounded(.{ .position = place, .look_at = object.bbox.pose.pos });
@@ -755,12 +736,25 @@ fn yieldPlaceLookingAt(ctx: *MissionContext, place: math.Vector3f, object: *cons
 pub fn yieldCircle(ctx: *MissionContext, object: *const Auv.Object) !void {
     ctx.clearQueue();
     const start = ctx.frame.camera_pose.pos;
-    const first = nearestCorner(ctx, object, start[2]);
     const look_at = object.bbox.pose.pos;
-    for (0..circle_corners.len) |step| {
-        const index = (first + step) % circle_corners.len;
+    var corners: [circle_corners.len]math.Vector3f = undefined;
+    for (0..circle_corners.len) |i| corners[i] = circleCorner(object, i, start[2]);
+
+    var first: usize = 0;
+    var best = std.math.inf(f32);
+    const sub = math.xy(start);
+    for (corners, 0..) |corner, i| {
+        const dist = math.length2f(math.xy(corner) - sub);
+        if (dist < best) {
+            best = dist;
+            first = i;
+        }
+    }
+
+    for (0..corners.len) |step| {
+        const index = (first + step) % corners.len;
         try ctx.queue.pushBackBounded(.{
-            .position = circleCorner(object, index, start[2]),
+            .position = corners[index],
             .look_at = look_at,
         });
     }
