@@ -55,6 +55,8 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
       .quat = {0, 0, 0, 1},
   };
   frame->timestamp = timestamp;
+  frame->position_ok = (AuvAxisOk){true, true, true};
+  frame->attitude_ok = (AuvAxisOk){true, true, true};
 }
 
 void auv_set_thrustor_values(

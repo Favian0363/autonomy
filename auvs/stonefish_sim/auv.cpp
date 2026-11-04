@@ -40,7 +40,7 @@ static std::string scenario_file = "scenarios/hydrus_env.scn";
 static constexpr sf::Scalar kStepsPerSecond = 360.0;
 static constexpr sf::Scalar kPhysicsDt = sf::Scalar(1) / kStepsPerSecond;
 static constexpr sf::Scalar kRealtimeFactorCap = 1.0;
-static constexpr sf::Scalar kTrackingOkSeconds = 1000.0;
+static constexpr sf::Scalar kTrackingOkSeconds = 1000000000.0;
 static constexpr auto kMinRenderInterval = std::chrono::milliseconds(16);
 static constexpr bool kConsoleApp = false;
 static sf::Scalar realtimeFactorCap = kRealtimeFactorCap;
@@ -74,6 +74,7 @@ struct RobosubTag
 const RobosubTag kRobosubTags[] = {
     {"gate", AUV_ROBOSUB_GATE},
     {"marker", AUV_ROBOSUB_MARKER},
+    {"gate_opening", AUV_ROBOSUB_GATE_OPENING},
 };
 static_assert(std::size(kRobosubTags) == static_cast<size_t>(AUV_ROBOSUB_COUNT),
               "stonefish robosub tags must match AuvRobosubCls");
@@ -333,6 +334,18 @@ public:
                 continue;
             tracked_objects.push_back({entity, i, it->second});
         }
+        for(const TrackedObject& tracked : tracked_objects)
+        {
+            if(tracked.cls != AUV_ROBOSUB_GATE_OPENING)
+                continue;
+            if(tracked.entity->getType() != sf::EntityType::STATIC)
+                continue;
+            auto* gate_opening = static_cast<sf::StaticEntity*>(tracked.entity);
+            if(gate_opening->getRigidBody() == nullptr)
+                continue;
+            btRigidBody* body = gate_opening->getRigidBody();
+            body->setCollisionFlags(body->getCollisionFlags() | btCollisionObject::CF_NO_CONTACT_RESPONSE);
+        }
 
         thrusters.clear();
         sf::Robot* robot = getRobot(0u);
@@ -393,11 +406,17 @@ public:
 
         frame.image_width = image_width;
         frame.image_height = image_height;
-        frame.tracking_ok = getSimulationTime() < kTrackingOkSeconds;
-        if(!frame.tracking_ok && !logged_tracking_loss)
+        frame.position_ok = {true, true, true};
+        frame.attitude_ok = {true, true, true};
+        if(getSimulationTime() >= kTrackingOkSeconds)
         {
-            logged_tracking_loss = true;
-            std::cout << "[stonefish_sim] tracking_ok false after " << kTrackingOkSeconds << " s\n";
+            frame.position_ok.x = false;
+            frame.position_ok.y = false;
+            if(!logged_tracking_loss)
+            {
+                logged_tracking_loss = true;
+                std::cout << "[stonefish_sim] horizontal position invalid after " << kTrackingOkSeconds << " s\n";
+            }
         }
         if(have_odometry)
         {

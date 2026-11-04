@@ -1,6 +1,8 @@
 const std = @import("std");
 const Io = std.Io;
 const MissionArgs = @import("MissionArgs.zig");
+const math = @import("math.zig");
+const bc = @import("BodyControl.zig");
 
 const Auv = @import("Auv.zig");
 const AuvLoader = @import("AuvLoader.zig");
@@ -13,6 +15,12 @@ const print_stuff = true;
 const clear_print_stuff = true;
 const telemetry_log_path: ?[]const u8 = null;
 const telemetry_addr: []const u8 = "127.0.0.1:5600";
+const queue_capacity = 32;
+
+const Goal = struct {
+    position: math.Vector3f,
+    look_at: math.Vector3f,
+};
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -33,14 +41,19 @@ thrustor_saturate: f32,
 log_counter: u32,
 log_freq_div: u16,
 
-goal: math.Vector6f,
-// Tracks the XY goal so yaw stays at its starting heading during translation,
-// then switches to the requested yaw after arrival.
-last_xy_goal: ?math.Vector2f = null,
-held_yaw: ?f32 = null,
-xy_reached: bool = false,
-pid_sum_err: math.Vector6f,
-pid_prev_pose_err: math.Vector6f,
+target_position: math.Vector3f,
+queue: std.Deque(Goal) = .empty,
+target_orientation: math.Quaternionf = bc.identity,
+use_position: bool = false,
+use_orientation: bool = false,
+position_axes: Auv.AxisOk = .{ .x = true, .y = true, .z = true },
+desired: math.Vector2f = .{ 0, 0 },
+desired_height: ?f32 = null,
+translation: ?math.Vector3f = null,
+pid_sum_err: math.Vector6f = @splat(0),
+pid_prev_err: math.Vector6f = @splat(0),
+tilt_correction: math.Vector3f = .{ 0, 0, 0 },
+force_error: math.Vector3f = .{ 0, 0, 0 },
 pid_prev_timestamp_ns: ?u64,
 
 step: []const u8,
@@ -48,17 +61,8 @@ telemetry_file: ?Io.File = null,
 telemetry_socket: Io.net.Socket = undefined,
 telemetry_dest: Io.net.IpAddress = undefined,
 
-// NonOdometryState
 seen_objects2d: [Auv.Frame.max_objects]Auv.Object2d = undefined,
 seen_objects2d_len: u8 = 0,
-non_odometry_pid_sum_err: math.Vector6f,
-non_odometry_pid_prev_pose_err: math.Vector6f,
-non_odometry_prev_tracked_id: i32 = -1,
-
-tracked_id: i32 = -1,
-search_yaw: f32 = 0,
-hold_depth: f32 = 2,
-//
 
 auv: Auv,
 auv_loader: AuvLoader,
@@ -104,6 +108,8 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
     else
         null;
 
+    const goals = try arena.alloc(Goal, queue_capacity);
+
     return .{
         .frame = undefined,
 
@@ -116,19 +122,15 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
         .log_counter = 0,
         .log_freq_div = 120,
 
-        .goal = @splat(0),
+        .target_position = @splat(0),
+        .queue = .initBuffer(goals),
 
-        .pid_sum_err = @splat(0),
-        .pid_prev_pose_err = @splat(0),
         .pid_prev_timestamp_ns = null,
 
         .step = "",
         .telemetry_file = telemetry_file,
         .telemetry_socket = telemetry_socket,
         .telemetry_dest = telemetry_dest,
-
-        .non_odometry_pid_sum_err = @splat(0),
-        .non_odometry_pid_prev_pose_err = @splat(0),
 
         .auv = auv,
         .auv_loader = auv_loader,
@@ -142,22 +144,23 @@ pub fn init(arena: std.mem.Allocator, io: Io, args: MissionArgs) !MissionContext
     };
 }
 
-/// Invalidates `seen_objects`
 pub fn reset(ctx: *MissionContext) void {
     ctx.seen_objects_len = 0;
-    ctx.last_xy_goal = null;
-    ctx.held_yaw = null;
-    ctx.xy_reached = false;
-    ctx.pid_sum_err = @splat(0);
-    ctx.pid_prev_pose_err = @splat(0);
+    ctx.clearQueue();
+    ctx.resetOdometryPid();
+    ctx.target_orientation = bc.identity;
+    ctx.use_position = false;
+    ctx.use_orientation = false;
+    ctx.desired = .{ 0, 0 };
+    ctx.desired_height = null;
+    ctx.translation = null;
     ctx.pid_prev_timestamp_ns = null;
 }
 
 pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
+    const start = Io.Clock.Timestamp.now(ctx.io, .awake);
     ctx.auv.yieldUntilNextFrame(&ctx.frame);
     if (stop_requested.load(.monotonic)) return error.Stopped;
-
-    const start = Io.Clock.Timestamp.now(ctx.io, .awake);
 
     // std.log.debug("updating seen_objects...", .{});
     for (ctx.frame.objects[0..ctx.frame.objects_len]) |frame_object| {
@@ -189,9 +192,6 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
             ctx.seen_objects2d_len += 1;
         }
     }
-
-    // std.log.debug("setting thruster_values with pid controller...", .{});
-    ControllerStep(ctx);
 
     if (ctx.config_watcher.changed() catch |err| blk: {
         std.log.err("{s}", .{@errorName(err)});
@@ -233,6 +233,11 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
         ctx.auv.init();
     }
 
+    var thruster_buffer: [math.max_thrusters]f32 = @splat(0);
+    const thruster_values = ctx.controlStep(&thruster_buffer);
+    ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
+    ctx.publishToUdp(thruster_values);
+
     const elapsed = start.untilNow(ctx.io);
     if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
         std.log.debug("done in {} us\n", .{elapsed.raw.toMicroseconds()});
@@ -240,39 +245,50 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     ctx.log_counter +%= 1;
 }
 
-const math = @import("math.zig");
-
 // Field order is the little-endian packet.
 const TelemetryPacket = struct {
     magic: [4]u8 = "AUV1".*,
-    version: u8 = 1,
     timestamp: u64,
     camera_pose: math.Pose,
-    tracking_ok: bool,
+    position_ok: Auv.AxisOk,
+    attitude_ok: Auv.AxisOk,
     depth_ok: bool,
     depth: f32,
     objects: []const Auv.Object,
     boxes: []const Auv.Object2d,
     thrusters: []const f32,
     step: []const u8,
+    force_error: math.Vector3f,
+    goals: []const Goal,
 };
 
 fn publishToUdp(ctx: *MissionContext, thrusters: []const f32) void {
     const nobj = @min(@as(usize, ctx.seen_objects_len), ctx.seen_objects.len);
     const nbox = @min(@as(usize, ctx.seen_objects2d_len), ctx.seen_objects2d.len);
+    var goals: [queue_capacity]Goal = undefined;
+    var goals_len: usize = 0;
+    var goal_it = ctx.queue.iterator();
+    while (goal_it.next()) |goal| {
+        if (goals_len >= goals.len) break;
+        goals[goals_len] = goal;
+        goals_len += 1;
+    }
 
     var buf: [64 * 1024]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     SerialBinaryWriter.write(&w, TelemetryPacket{
         .timestamp = ctx.frame.timestamp,
         .camera_pose = ctx.frame.camera_pose,
-        .tracking_ok = ctx.frame.tracking_ok,
+        .position_ok = ctx.frame.position_ok,
+        .attitude_ok = ctx.frame.attitude_ok,
         .depth_ok = ctx.frame.pressure_depth_ok,
         .depth = ctx.frame.pressure_depth,
         .objects = ctx.seen_objects[0..nobj],
         .boxes = ctx.seen_objects2d[0..nbox],
         .thrusters = thrusters[0..@min(thrusters.len, 255)],
         .step = ctx.step[0..@min(ctx.step.len, 255)],
+        .force_error = ctx.force_error,
+        .goals = goals[0..goals_len],
     }) catch return;
     const packet = w.buffered();
 
@@ -283,21 +299,154 @@ fn publishToUdp(ctx: *MissionContext, thrusters: []const f32) void {
     ctx.telemetry_socket.send(ctx.io, &ctx.telemetry_dest, packet) catch {};
 }
 
-fn ControllerStep(ctx: *MissionContext) void {
+pub fn resetOdometryPid(ctx: *MissionContext) void {
+    ctx.pid_sum_err = @splat(0);
+    ctx.pid_prev_err = @splat(0);
+    ctx.tilt_correction = .{ 0, 0, 0 };
+}
+
+/// World direction of body +Y at a level heading. Yaw 0 looks along +Y.
+fn lookAtHeading(heading: f32) math.Vector3f {
+    return .{ -@sin(heading), @cos(heading), 0 };
+}
+
+/// Point the camera at `target` from the current pose, clamped by `rotation_limit`.
+/// A coincident target keeps the previous look.
+fn setLookAtTarget(ctx: *MissionContext, target: math.Vector3f) !void {
+    const offset = target - ctx.frame.camera_pose.pos;
+    if (math.length3f(offset) <= 1e-6) return;
+    const toward = math.normalize3f(offset);
+    ctx.target_orientation = try bc.lookWithinLimits(ctx.config.camera_forward, toward, bc.identity, ctx.config.rotation_limit);
+}
+
+fn slew3(current: math.Vector3f, desired: math.Vector3f, max_step: f32) math.Vector3f {
+    if (max_step <= 0) return current;
+    const delta = desired - current;
+    const len = math.length3f(delta);
+    if (len <= max_step or len <= 1e-6) return desired;
+    return current + delta / @as(math.Vector3f, @splat(len / max_step));
+}
+
+/// World-frame translation toward `target`, with disallowed or invalid axes removed before the body rotation.
+fn bodyTranslationError(ctx: *const MissionContext, target: math.Vector3f, use_axis: Auv.AxisOk) math.Vector3f {
+    var world = bc.positionError(ctx.frame.camera_pose.pos, target) catch return .{ 0, 0, 0 };
+    const ok = ctx.frame.position_ok;
+    if (!ok.x or !use_axis.x) world[0] = 0;
+    if (!ok.y or !use_axis.y) world[1] = 0;
+    if (!ok.z or !use_axis.z) world[2] = 0;
+    const body_q = bc.normalizedQuat(ctx.frame.camera_pose.quat) catch return .{ 0, 0, 0 };
+    return math.quaternionRotate(math.quaternionConjugate(body_q), world);
+}
+
+fn attitudeToward(ctx: *const MissionContext, orientation: math.Quaternionf) ?math.Vector3f {
+    const current = bc.normalizedQuat(ctx.frame.camera_pose.quat) catch return null;
+    const desired = bc.normalizedQuat(orientation) catch return null;
+    return bc.attitudeError(current, desired) catch null;
+}
+
+/// Pose error for the axes the context is tracking. Untracked and unavailable axes are zero here.
+fn poseError(ctx: *const MissionContext) [6]f32 {
+    const translation = if (ctx.use_position)
+        bodyTranslationError(ctx, ctx.target_position, ctx.position_axes)
+    else
+        math.Vector3f{ 0, 0, 0 };
+    const angular = if (ctx.use_orientation)
+        attitudeToward(ctx, ctx.target_orientation) orelse math.Vector3f{ 0, 0, 0 }
+    else
+        math.Vector3f{ 0, 0, 0 };
+    return .{ translation[0], translation[1], translation[2], angular[0], angular[1], angular[2] };
+}
+
+fn poseAvailable(ctx: *const MissionContext) [6]bool {
+    const position = ctx.frame.position_ok;
+    const attitude = ctx.frame.attitude_ok;
+    return .{
+        ctx.use_position and ctx.position_axes.x and position.x,
+        ctx.use_position and ctx.position_axes.y and position.y,
+        ctx.use_position and ctx.position_axes.z and position.z,
+        ctx.use_orientation and attitude.x,
+        ctx.use_orientation and attitude.y,
+        ctx.use_orientation and attitude.z,
+    };
+}
+
+/// Visual body error from the first box on this frame. Null when the frame has no box or `interaction` does not match the image error.
+/// Translation rows come from the interaction matrix. Roll and pitch are the level-look error plus those matrix rows.
+fn visualBodyError(ctx: *MissionContext) ?[6]f32 {
+    if (ctx.frame.objects2d_len == 0) return null;
+    const object = ctx.frame.objects2d[0];
+    const metrics = math.boxMetrics(
+        ctx.frame.image_width,
+        ctx.frame.image_height,
+        .{ object.top_left.x, object.top_left.y },
+        .{ object.bottom_right.x, object.bottom_right.y },
+    );
+    const ibvs = ctx.config.ibvs;
+    const image_error = [_]f32{
+        math.withinDeadband(ctx.desired[0] - metrics.cx, ibvs.center_deadband),
+        math.withinDeadband(ctx.desired[1] - metrics.cy, ibvs.center_deadband),
+        (ctx.desired_height orelse ibvs.target_height) - metrics.height,
+    };
+    const mapped = math.mapInteraction(ibvs.interaction, &image_error) catch |err| {
+        std.log.err(
+            "interaction map failed ({s}): expected {d} rows, each with {d} columns; config has {d} rows",
+            .{ @errorName(err), math.interaction_output_len, image_error.len, ibvs.interaction.len },
+        );
+        if (ibvs.interaction.len > 0) {
+            std.log.err("interaction row 0 has {d} columns", .{ibvs.interaction[0].len});
+        }
+        return null;
+    };
+    const current = bc.normalizedQuat(ctx.frame.camera_pose.quat) catch unreachable;
+    const yaw = math.quaternionToEuler(current)[2] + mapped[5];
+    const look_q = bc.lookWithinLimits(
+        ctx.config.camera_forward,
+        lookAtHeading(yaw),
+        bc.identity,
+        ctx.config.rotation_limit,
+    ) catch unreachable;
+    var angular = bc.attitudeError(current, look_q) catch unreachable;
+    angular[0] += mapped[3];
+    angular[1] += mapped[4];
+    return .{ mapped[0], mapped[1], mapped[2], angular[0], angular[1], angular[2] };
+}
+
+fn anyAxis(available: [6]bool) bool {
+    for (available) |ok| if (ok) return true;
+    return false;
+}
+
+/// Fill one body error from the pose, then ibvs. An axis with neither source is zero.
+fn bodyError(ctx: *MissionContext) [6]f32 {
+    const visual = visualBodyError(ctx);
+    var available = poseAvailable(ctx);
+    var position_error = poseError(ctx);
+    if (ctx.translation) |body| {
+        position_error[0] = body[0];
+        position_error[1] = body[1];
+        position_error[2] = body[2];
+        available[0] = true;
+        available[1] = true;
+        available[2] = true;
+    }
+    if (visual == null and !anyAxis(available)) {
+        ctx.resetOdometryPid();
+        ctx.pid_prev_timestamp_ns = null;
+    }
+    return math.greedy6(position_error, visual, available);
+}
+
+fn quaternionFromRotationVector(rot: math.Vector3f) math.Quaternionf {
+    const angle = math.length3f(rot);
+    if (angle <= 1e-6) return bc.identity;
+    return bc.forwardRotation(rot, angle) catch bc.identity;
+}
+
+/// Track the context pose and return the thruster values. Invalid pose axes contribute no error.
+fn controlStep(ctx: *MissionContext, thruster_buffer: *[math.max_thrusters]f32) []f32 {
+    const body_error = ctx.bodyError();
     const timestamp_ns = ctx.frame.timestamp;
     const dt: ?f32 = if (ctx.pid_prev_timestamp_ns) |previous| blk: {
-        if (timestamp_ns <= previous) {
-            ctx.pid_sum_err = @splat(0);
-            ctx.pid_prev_pose_err = @splat(0);
-            ctx.non_odometry_pid_sum_err = @splat(0);
-            ctx.non_odometry_pid_prev_pose_err = @splat(0);
-            ctx.pid_prev_timestamp_ns = null;
-            std.log.warn(
-                "frame timestamp not increasing (prev={} ns, now={} ns); skipping I/D",
-                .{ previous, timestamp_ns },
-            );
-            break :blk null;
-        }
         const elapsed_ns = timestamp_ns - previous;
         ctx.pid_prev_timestamp_ns = timestamp_ns;
         break :blk @as(f32, @floatFromInt(elapsed_ns)) * 1e-9;
@@ -306,279 +455,277 @@ fn ControllerStep(ctx: *MissionContext) void {
         break :blk null;
     };
 
-    const tam_input: math.Vector6f = if (ctx.frame.tracking_ok) command: {
-        const pose = ctx.frame.camera_pose;
-
-        const goal = ctx.goal;
-        const current_pose = math.poseTo6f(pose);
-
-        var pose_err = goal - current_pose;
-
-        // Current orientation.
-        const rot = math.normalize4f(pose.quat);
-
-        // Vehicle forward is +Y in body frame.
-        const forward = math.quaternionRotate(rot, .{ 0.0, 1.0, 0.0 });
-        const current_yaw = std.math.atan2(forward[1], forward[0]);
-
-        const dir = math.Vector3f{
-            pose_err[0],
-            pose_err[1],
-            0.0,
-        };
-
-        const xy_distance = math.length3f(dir);
-
-        const yaw_state = math.targetYaw(
-            ctx.last_xy_goal,
-            ctx.held_yaw,
-            ctx.xy_reached,
-            goal,
-            xy_distance,
-            current_yaw,
-            ctx.config.odometry.xy_arrival_radius,
-        );
-        ctx.last_xy_goal = yaw_state.last_xy_goal;
-        ctx.held_yaw = yaw_state.held_yaw;
-        ctx.xy_reached = yaw_state.xy_reached;
-        const target_yaw = yaw_state.yaw;
-
-        const yaw_error = math.wrapAngle(target_yaw - current_yaw);
-
-        pose_err[5] = yaw_error;
-
-        const vel_err: math.Vector6f = if (dt) |delta_t| blk: {
-            ctx.pid_sum_err += pose_err * @as(math.Vector6f, @splat(delta_t));
-
-            break :blk (pose_err - ctx.pid_prev_pose_err) / @as(math.Vector6f, @splat(delta_t));
-        } else @splat(0.0);
-
-        const kp = ctx.config.odometry.kp;
-        const ki = ctx.config.odometry.ki;
-        const kd = ctx.config.odometry.kd;
-
-        const wrench =
-            kp * pose_err +
-            ki * ctx.pid_sum_err +
-            kd * vel_err;
-
-        const input = math.wrenchToThrusterInput(wrench, pose.quat, yaw_error, std.math.pi / 8.0);
-        if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
-            if (clear_print_stuff) {
-                std.debug.print("\x1b[2J\x1b[H", .{});
+    const thrust_direction = bc.ThrustDirections.fromTamLinearForces(ctx.config.tam) catch unreachable;
+    const current = ctx.frame.camera_pose.quat;
+    const error_body: math.Vector3f = .{ body_error[0], body_error[1], body_error[2] };
+    const rot: math.Vector3f = .{ body_error[3], body_error[4], body_error[5] };
+    const delta = quaternionFromRotationVector(rot);
+    const current_q = bc.normalizedQuat(current) catch bc.identity;
+    var target_q = bc.normalizedQuat(math.quaternionMul(current_q, delta)) catch current_q;
+    const odom = ctx.config.odometry;
+    var desired_tilt: math.Vector3f = .{ 0, 0, 0 };
+    var force_error: math.Vector3f = .{ 0, 0, 0 };
+    const moments = bc.ThrustDirections.fromTamMoments(ctx.config.tam) catch unreachable;
+    // Coverage swings a thruster onto a force component the map cannot produce.
+    const translation_command: math.Vector3f = blk: {
+        force_error = error_body;
+        const available = thrust_direction.alongThrust(error_body);
+        var force_body: math.Vector3f = .{ 0, 0, 0 };
+        inline for (0..3) |i| {
+            var rate: f32 = 0;
+            if (dt) |t| {
+                ctx.pid_sum_err[i] += available[i] * t;
+                rate = (error_body[i] - ctx.pid_prev_err[i]) / t;
             }
-            std.log.debug("config:", .{});
-            std.log.debug("\txy_arrival_radius = {}", .{ctx.config.odometry.xy_arrival_radius});
-            math.debug6f("\tkp", kp);
-            math.debug6f("\tki", ki);
-            math.debug6f("\tkd", kd);
-            for (ctx.config.tam) |row| {
-                math.debug6f("\ttam", row);
-            }
-            std.log.debug("dt = {d:6.2} ms", .{(dt orelse 0) * 1000});
-            std.log.debug("timestamp_ns = {d}, xy_translation_complete = {}", .{ timestamp_ns, ctx.xy_reached });
-            math.debug6f("pose", current_pose);
-            math.debug6f("goal", goal);
-            std.log.debug("xy_distance = {}", .{xy_distance});
-            std.log.debug("thruster mapping:", .{});
-            math.debug6f("\twrench  ", wrench);
-            math.debug3f("\tforward ", forward);
-            math.debug3f("\tdir2d   ", dir);
-            std.log.debug(
-                "\tcurrent_yaw={d:3.2} target_yaw={d:3.2} yaw_error={d:3.2}",
-                .{ current_yaw, target_yaw, yaw_error },
-            );
-            // math.debug3f("\trotated ", rotated);
-            // math.debug3f("\tbody_force ", body_force);
-            math.debug6f("\tinput   ", input);
+            force_body[i] = odom.kp[i] * error_body[i] + odom.ki[i] * ctx.pid_sum_err[i] + odom.kd[i] * rate;
+            ctx.pid_prev_err[i] = error_body[i];
         }
-
-        ctx.pid_prev_pose_err = pose_err;
-        break :command input;
-    } else command: {
-        ctx.last_xy_goal = null;
-        ctx.held_yaw = null;
-        ctx.xy_reached = false;
-        ctx.trackFirstSeenObject2d();
-
-        const non_odometry = ctx.config.non_odometry;
-        const dive_sign: f32 = 1;
-        const current_pose = math.poseTo6f(ctx.frame.camera_pose);
-        const roll_err = ctx.goal[3] - current_pose[3];
-        const pitch_err = ctx.goal[4] - current_pose[4];
-
-        const tracked_box: ?Auv.Object2d = if (ctx.tracked_id < 0)
-            null
-        else
-            for (ctx.seen_objects2d[0..ctx.seen_objects2d_len]) |object| {
-            if (object.id == @as(u32, @intCast(ctx.tracked_id))) break object;
-        } else null;
-
-        const tam_input = if (ctx.tracked_id >= 0 and tracked_box == null) blk: {
-            ctx.non_odometry_pid_sum_err = @splat(0);
-            ctx.non_odometry_pid_prev_pose_err = @splat(0);
-            ctx.pid_prev_timestamp_ns = null;
-            break :blk @as(math.Vector6f, @splat(0));
-        } else if (ctx.tracked_id < 0) blk: {
-            var err: math.Vector6f = @splat(0);
-            if (ctx.frame.pressure_depth_ok) {
-                err[2] = ctx.hold_depth - ctx.frame.pressure_depth;
-            }
-            err[3] = roll_err;
-            err[4] = pitch_err;
-            const wrench = math.pidWrench(
-                &ctx.non_odometry_pid_sum_err,
-                &ctx.non_odometry_pid_prev_pose_err,
-                non_odometry.kp,
-                non_odometry.ki,
-                non_odometry.kd,
-                err,
-                dt,
-            );
-            break :blk @as(math.Vector6f, .{ 0, 0, dive_sign * wrench[2], -wrench[3], wrench[4], ctx.search_yaw });
-        } else blk: {
-            const tracked = tracked_box orelse break :blk @as(math.Vector6f, @splat(0));
-            const metrics = math.boxMetrics(
-                ctx.frame.image_width,
-                ctx.frame.image_height,
-                .{ tracked.top_left.x, tracked.top_left.y },
-                .{ tracked.bottom_right.x, tracked.bottom_right.y },
-            );
-            const cx = math.withinDeadband(metrics.cx, non_odometry.center_deadband);
-            const cy = math.withinDeadband(metrics.cy, non_odometry.center_deadband);
-
-            var err: math.Vector6f = @splat(0);
-            err[1] = non_odometry.target_height - metrics.height;
-            err[2] = cy;
-            err[3] = roll_err;
-            err[4] = pitch_err;
-            err[5] = cx;
-
-            const wrench = math.pidWrench(
-                &ctx.non_odometry_pid_sum_err,
-                &ctx.non_odometry_pid_prev_pose_err,
-                non_odometry.kp,
-                non_odometry.ki,
-                non_odometry.kd,
-                err,
-                dt,
-            );
-            break :blk @as(math.Vector6f, .{ 0, wrench[1], dive_sign * wrench[2], -wrench[3], wrench[4], wrench[5] });
-        };
-
-        if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
-            if (clear_print_stuff) {
-                std.debug.print("\x1b[2J\x1b[H", .{});
-            }
-            std.log.debug("non-odometry controller:", .{});
-            math.debug6f("\tkp", non_odometry.kp);
-            math.debug6f("\tki", non_odometry.ki);
-            math.debug6f("\tkd", non_odometry.kd);
-            for (ctx.config.tam) |row| {
-                math.debug6f("\ttam", row);
-            }
-            std.log.debug("dt = {d:6.2} ms", .{(dt orelse 0) * 1000});
-            math.debug6f("pose", current_pose);
-            std.log.debug("tracked_id = {}", .{ctx.tracked_id});
-            std.log.debug(
-                "mode = {s}",
-                .{if (ctx.tracked_id < 0) "search" else if (tracked_box == null) "tracked object missing" else "track"},
-            );
-            std.log.debug(
-                "pressure_depth_ok = {}, pressure_depth = {}, hold_depth = {}",
-                .{ ctx.frame.pressure_depth_ok, ctx.frame.pressure_depth, ctx.hold_depth },
-            );
-            if (tracked_box) |tracked| {
-                std.log.debug(
-                    "\tbox = ({}, {}) -> ({}, {})",
-                    .{ tracked.top_left.x, tracked.top_left.y, tracked.bottom_right.x, tracked.bottom_right.y },
-                );
-            }
-            math.debug6f("\tinput  ", tam_input);
-        }
-
-        break :command tam_input;
+        const coverage = bc.coverForce(thrust_direction, moments, force_body, ctx.config.rotation_limit, ctx.config.camera_forward);
+        if (coverage.tilt) |tilt| desired_tilt = tilt.axis * @as(math.Vector3f, @splat(tilt.angle));
+        break :blk coverage.force;
     };
+    // The tilt follows the reshaped force. Slew it so the attitude loop does not see a step.
+    const tilt_step = if (dt) |t| 0.8 * t else 0;
+    ctx.tilt_correction = slew3(ctx.tilt_correction, desired_tilt, tilt_step);
+    const tilt_len = math.length3f(ctx.tilt_correction);
+    if (tilt_len > 1e-4) {
+        const tilt_q = bc.forwardRotation(ctx.tilt_correction, tilt_len) catch unreachable;
+        target_q = bc.normalizedQuat(math.quaternionMul(target_q, tilt_q)) catch unreachable;
+    }
+    var attitude_error = bc.attitudeError(current, target_q) catch unreachable;
+    const attitude_axis = [3]bool{ ctx.frame.attitude_ok.x, ctx.frame.attitude_ok.y, ctx.frame.attitude_ok.z };
+    inline for (0..3) |i| {
+        if (!attitude_axis[i]) attitude_error[i] = 0;
+    }
+    const translation_body: math.Vector3f = blk: {
+        var force = thrust_direction.alongThrust(translation_command);
+        if (math.length3f(attitude_error) > odom.rotation_gate) {
+            force[0] = 0;
+            force[1] = 0;
+            //we doing zero out force[2] beause we always want to maintain the z axis.
+        }
+        break :blk force;
+    };
+    ctx.force_error = force_error;
 
-    var thruster_buffer: [math.max_thrusters]f32 = undefined;
+    var rotation: math.Vector3f = .{ 0, 0, 0 };
+    inline for (0..3) |i| {
+        const lane = i + 3;
+        if (attitude_axis[i]) {
+            var rate: f32 = 0;
+            if (dt) |t| {
+                rate = (attitude_error[i] - ctx.pid_prev_err[lane]) / t;
+                ctx.pid_sum_err[lane] += attitude_error[i] * t;
+            }
+            ctx.pid_prev_err[lane] = attitude_error[i];
+            rotation[i] = odom.kp[lane] * attitude_error[i] + odom.ki[lane] * ctx.pid_sum_err[lane] + odom.kd[lane] * rate;
+        } else {
+            ctx.pid_sum_err[lane] = 0;
+            ctx.pid_prev_err[lane] = 0;
+        }
+    }
+    const input: math.Vector6f = .{
+        translation_body[0], translation_body[1], translation_body[2],
+        rotation[0],         rotation[1],         rotation[2],
+    };
+    if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
+        if (clear_print_stuff) {
+            std.debug.print("\x1b[2J\x1b[H", .{});
+        }
+        std.log.debug("control:", .{});
+        math.debug6f("\tkp", odom.kp);
+        math.debug6f("\tki", odom.ki);
+        math.debug6f("\tkd", odom.kd);
+        for (ctx.config.tam) |row| {
+            math.debug6f("\ttam", row);
+        }
+        std.log.debug("dt = {d:6.2} ms", .{(dt orelse 0) * 1000});
+        std.log.debug("timestamp_ns = {d}", .{timestamp_ns});
+        math.debug6f("pose", math.poseTo6f(ctx.frame.camera_pose));
+        std.log.debug("position ok: {any} attitude ok: {any}", .{ ctx.frame.position_ok, ctx.frame.attitude_ok });
+        math.debug3f("translation error", error_body);
+        std.log.debug("target orientation: {any}", .{ctx.target_orientation});
+        std.log.debug("attitude error body: {any}", .{attitude_error});
+        math.debug3f("rotation limit", ctx.config.rotation_limit);
+        std.log.debug("target quaternion: {any}", .{target_q});
+        math.debug6f("\tinput", input);
+    }
     const thruster_values = math.tamToThrusters(
         ctx.config.tam,
-        tam_input,
+        input,
         ctx.thrustor_saturate,
         5.0,
-        &thruster_buffer,
+        thruster_buffer,
     );
     if (print_stuff and ctx.log_counter % ctx.log_freq_div == 0) {
         std.log.debug("\tthruster_values = {any}", .{thruster_values});
     }
-    ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
-    ctx.publishToUdp(thruster_values);
+    return thruster_values;
 }
 
-/// Stop search and follow the 2D object `id`. The next non-odometry step uses the tracking branch.
-pub fn trackObject2d(ctx: *MissionContext, id: u32) void {
-    const tracked_id: i32 = @intCast(id);
-    if (ctx.tracked_id == tracked_id) return;
-    ctx.tracked_id = tracked_id;
-    ctx.non_odometry_pid_sum_err = @splat(0);
-    ctx.non_odometry_pid_prev_pose_err = @splat(0);
-}
-
-fn trackFirstSeenObject2d(ctx: *MissionContext) void {
-    if (ctx.tracked_id >= 0 or ctx.seen_objects2d_len == 0) return;
-    ctx.trackObject2d(ctx.seen_objects2d[0].id);
-}
-
-fn yieldUntilObjectWithCls(ctx: *MissionContext, clss: []const u8, start: usize) !*const Auv.Object {
-    var seen = start;
+/// Search while holding still. Returns the first object of `cls`.
+pub fn yieldFind(ctx: *MissionContext, cls: u8) !*const Auv.Object {
+    ctx.use_position = true;
+    ctx.use_orientation = true;
+    ctx.translation = null;
+    var seen: usize = 0;
 
     while (true) {
-        for (ctx.seen_objects[seen..ctx.seen_objects_len]) |*reacted_object| {
-            for (clss) |cls| {
-                if (reacted_object.cls == cls) {
-                    return reacted_object;
-                }
-            }
+        for (ctx.seen_objects[seen..ctx.seen_objects_len]) |*object| {
+            if (object.cls == cls) return object;
             seen += 1;
         }
-
         try ctx.yieldUntilNextFrameAndUpdate();
     }
 }
 
-/// yield until getting first object with any of the `cls` in `clss`
-pub fn yieldUntilFirstObjectWithAnyCls(ctx: *MissionContext, clss: []const u8) !*const Auv.Object {
-    return try yieldUntilObjectWithCls(ctx, clss, 0);
+const object_clearance: f32 = 2;
+const look_done: f32 = 0.1;
+
+fn reached(ctx: *const MissionContext, target: math.Vector3f) bool {
+    const ok = ctx.frame.position_ok;
+    if (!ok.x or !ok.y or !ok.z) return false;
+    return math.length3f(target - ctx.frame.camera_pose.pos) <= ctx.goal_dist_threshold;
 }
 
-/// yield until getting first object wit `cls`
-pub fn yieldUntilFirstObjectWithCls(ctx: *MissionContext, cls: u8) !*const Auv.Object {
-    return try yieldUntilFirstObjectWithAnyCls(ctx, &.{cls});
+/// Horizontal unit direction from the vehicle toward the object. World +Y when they overlap.
+fn approachDirection(ctx: *const MissionContext, object: *const Auv.Object) math.Vector2f {
+    const delta = math.xy(object.bbox.pose.pos) - math.xy(ctx.frame.camera_pose.pos);
+    if (math.length2f(delta) <= 1e-4) return .{ 0, 1 };
+    return math.normalize2f(delta);
 }
 
-/// yield until getting next object with any of the `cls` in `clss` (ignoring any seen before)
-pub fn yieldUntilNewObjectWithAnyCls(ctx: *MissionContext, clss: []const u8) !*const Auv.Object {
-    return try yieldUntilObjectWithCls(ctx, clss, ctx.seen_objects_len);
+/// Half the oriented box, measured along a horizontal unit direction.
+fn horizontalHalfExtent(object: *const Auv.Object, direction: math.Vector2f) f32 {
+    const rot = math.normalize4f(object.bbox.pose.quat);
+    const world_dir: math.Vector3f = .{ direction[0], direction[1], 0 };
+    const size = object.bbox.size;
+    const axes = [3]math.Vector3f{
+        math.quaternionRotate(rot, .{ 1, 0, 0 }),
+        math.quaternionRotate(rot, .{ 0, 1, 0 }),
+        math.quaternionRotate(rot, .{ 0, 0, 1 }),
+    };
+    var extent: f32 = 0;
+    inline for (axes, 0..) |axis, i| extent += @abs(math.dot3f(world_dir, axis)) * size[i];
+    return 0.5 * extent;
 }
 
-/// yield until getting next object wit `cls` (ignoring any seen before)
-pub fn yieldUntilNewObjectWithCls(ctx: *MissionContext, cls: u8) !*const Auv.Object {
-    return try yieldUntilNewObjectWithAnyCls(ctx, &.{cls});
+/// `sign` is -1 on the approach side and +1 on the far side. `direction` stays fixed for the maneuver.
+fn standoffAlong(object: *const Auv.Object, direction: math.Vector2f, sign: f32) math.Vector3f {
+    const reach = horizontalHalfExtent(object, direction) + object_clearance;
+    const offset = direction * @as(math.Vector2f, @splat(sign * reach));
+    const center = object.bbox.pose.pos;
+    return .{ center[0] + offset[0], center[1] + offset[1], center[2] };
 }
 
-/// yield until at `ctx.frame.camera_pose.pos` is at `goal_threshold` distance from `goal_pos`
-pub fn yieldUntilReachGoal(ctx: *MissionContext, goal_pos: math.Vector3f) !void {
-    ctx.goal[0] = goal_pos[0];
-    ctx.goal[1] = goal_pos[1];
-    ctx.goal[2] = goal_pos[2];
+fn clearQueue(ctx: *MissionContext) void {
+    ctx.queue.head = 0;
+    ctx.queue.len = 0;
+}
+
+/// Face `object` and hold position. Returns when the attitude error is small.
+pub fn yieldLookAt(ctx: *MissionContext, object: *const Auv.Object) !void {
+    ctx.target_position = ctx.frame.camera_pose.pos;
+    ctx.use_position = true;
+    ctx.use_orientation = true;
+    ctx.translation = null;
     while (true) {
-        const camera_pos = ctx.frame.camera_pose.pos;
-        const goal_delta = goal_pos - camera_pos;
-        const goal_dist = @sqrt(@reduce(.Add, goal_delta * goal_delta));
-        if (goal_dist <= ctx.goal_dist_threshold) {
-            break;
-        }
-
+        try ctx.setLookAtTarget(object.bbox.pose.pos);
         try ctx.yieldUntilNextFrameAndUpdate();
+        const err = attitudeToward(ctx, ctx.target_orientation) orelse continue;
+        if (math.length3f(err) <= look_done) return;
     }
+}
+
+/// Drive to the near side of `object`, looking at the far side.
+pub fn yieldMoveTo(ctx: *MissionContext, object: *const Auv.Object) !void {
+    ctx.clearQueue();
+    const direction = approachDirection(ctx, object);
+    const far = standoffAlong(object, direction, 1);
+    try ctx.queue.pushBackBounded(.{
+        .position = standoffAlong(object, direction, -1),
+        .look_at = far,
+    });
+    try ctx.yieldQueue();
+}
+
+/// Stop short of `object`, then continue the same distance past it.
+pub fn yieldPass(ctx: *MissionContext, object: *const Auv.Object) !void {
+    ctx.clearQueue();
+    const direction = approachDirection(ctx, object);
+    const far = standoffAlong(object, direction, 1);
+    try ctx.queue.pushBackBounded(.{
+        .position = standoffAlong(object, direction, -1),
+        .look_at = far,
+    });
+    try ctx.queue.pushBackBounded(.{
+        .position = far,
+        .look_at = far,
+    });
+    try ctx.yieldQueue();
+}
+
+/// Drive the queued goals in order. Returns when the queue is empty.
+pub fn yieldQueue(ctx: *MissionContext) !void {
+    ctx.use_position = true;
+    ctx.use_orientation = true;
+    ctx.translation = null;
+    while (ctx.queue.len != 0) {
+        const goal = ctx.queue.front().?;
+        ctx.target_position = goal.position;
+        try ctx.setLookAtTarget(goal.look_at);
+        try ctx.yieldUntilNextFrameAndUpdate();
+        if (reached(ctx, goal.position)) _ = ctx.queue.popFront();
+    }
+}
+
+const circle_corners: [4]math.Vector2f = .{
+    .{ 0.5, 0.5 },
+    .{ 0.5, -0.5 },
+    .{ -0.5, -0.5 },
+    .{ -0.5, 0.5 },
+};
+
+fn circleCorner(object: *const Auv.Object, index: usize, depth: f32) math.Vector3f {
+    const local_2d = circle_corners[index] * math.xy(object.bbox.size);
+    const rotated = math.xy(math.quaternionRotate(math.normalize4f(object.bbox.pose.quat), .{ local_2d[0], local_2d[1], 0 }));
+    const outward = if (math.length2f(rotated) <= 1e-4) math.Vector2f{ 1, 0 } else math.normalize2f(rotated);
+    const pos = math.xy(object.bbox.pose.pos) + rotated + outward * @as(math.Vector2f, @splat(object_clearance));
+    return .{ pos[0], pos[1], depth };
+}
+
+fn yieldPlaceLookingAt(ctx: *MissionContext, place: math.Vector3f, object: *const Auv.Object) !void {
+    ctx.clearQueue();
+    try ctx.queue.pushBackBounded(.{ .position = place, .look_at = object.bbox.pose.pos });
+    try ctx.yieldQueue();
+}
+
+/// Visit the four outside corners of `object`, then return to the start.
+pub fn yieldCircle(ctx: *MissionContext, object: *const Auv.Object) !void {
+    ctx.clearQueue();
+    const start = ctx.frame.camera_pose.pos;
+    const look_at = object.bbox.pose.pos;
+    var corners: [circle_corners.len]math.Vector3f = undefined;
+    for (0..circle_corners.len) |i| corners[i] = circleCorner(object, i, start[2]);
+
+    var first: usize = 0;
+    var best = std.math.inf(f32);
+    const sub = math.xy(start);
+    for (corners, 0..) |corner, i| {
+        const dist = math.length2f(math.xy(corner) - sub);
+        if (dist < best) {
+            best = dist;
+            first = i;
+        }
+    }
+
+    for (0..corners.len) |step| {
+        const index = (first + step) % corners.len;
+        try ctx.queue.pushBackBounded(.{
+            .position = corners[index],
+            .look_at = look_at,
+        });
+    }
+    try ctx.queue.pushBackBounded(.{ .position = start, .look_at = look_at });
+    try ctx.yieldQueue();
 }

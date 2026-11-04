@@ -23,6 +23,13 @@ pub const Object2d = extern struct {
     cls: u8,
 };
 
+/// One flag per axis. False means that component of the pose must not be used.
+pub const AxisOk = extern struct {
+    x: bool,
+    y: bool,
+    z: bool,
+};
+
 pub const Frame = extern struct {
     pub const max_objects = c.AUV_FRAME_MAX_OBJECTS;
 
@@ -30,7 +37,10 @@ pub const Frame = extern struct {
     objects_len: u8,
     camera_pose: math.Pose,
     timestamp: u64,
-    tracking_ok: bool,
+    /// World X, Y, Z. A false axis means `camera_pose.pos` on that axis is not usable.
+    position_ok: AxisOk,
+    /// Roll, pitch, yaw. A false axis means that attitude component is not usable.
+    attitude_ok: AxisOk,
     accel: math.Vector3f,
     gyro: math.Vector3f,
     imu_quat: math.Quaternionf,
@@ -145,6 +155,7 @@ comptime {
     assertSameLayout(Object, c.AuvObject);
     assertSameLayout(Point2u, c.AuvPoint2u);
     assertSameLayout(Object2d, c.AuvObject2d);
+    assertSameLayout(AxisOk, c.AuvAxisOk);
     assertSameLayout(Frame, c.AuvFrame);
 
     assertSameFunctionLayout(InitFunc, c.AuvInitFunc);

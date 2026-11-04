@@ -5,51 +5,6 @@ pub const Vector3f = @Vector(3, f32);
 pub const Vector6f = @Vector(6, f32);
 pub const Quaternionf = @Vector(4, f32);
 
-/// Preserve the current heading while the XY goal is changing or still far
-/// away. Once reached, use the latest goal yaw until another XY goal arrives.
-pub fn targetYaw(
-    last_xy_goal: ?Vector2f,
-    held_yaw: ?f32,
-    xy_reached: bool,
-    goal: Vector6f,
-    xy_distance: f32,
-    current_yaw: f32,
-    arrival_radius: f32,
-) struct {
-    yaw: f32,
-    last_xy_goal: ?Vector2f,
-    held_yaw: ?f32,
-    xy_reached: bool,
-} {
-    const xy_goal: Vector2f = .{ goal[0], goal[1] };
-    const changed = if (last_xy_goal) |last|
-        xy_goal[0] != last[0] or xy_goal[1] != last[1]
-    else
-        false;
-    var next_held_yaw = held_yaw;
-    var next_xy_reached = xy_reached;
-
-    if (changed) {
-        if (next_xy_reached) next_held_yaw = current_yaw;
-        next_xy_reached = false;
-    }
-    if (!next_xy_reached and xy_distance <= arrival_radius) {
-        next_xy_reached = true;
-        next_held_yaw = null;
-    }
-    const target_yaw = if (next_xy_reached) goal[5] else blk: {
-        if (next_held_yaw == null) next_held_yaw = current_yaw;
-        break :blk next_held_yaw.?;
-    };
-
-    return .{
-        .yaw = target_yaw,
-        .last_xy_goal = xy_goal,
-        .held_yaw = next_held_yaw,
-        .xy_reached = next_xy_reached,
-    };
-}
-
 pub const Pose = extern struct {
     pos: Vector3f,
     quat: Quaternionf,
@@ -81,6 +36,55 @@ pub inline fn dot3f(a: Vector3f, b: Vector3f) f32 {
     return @reduce(.Add, a * b);
 }
 
+/// Body X, Y, Z, roll, pitch, yaw.
+pub const interaction_output_len = 6;
+
+pub const InteractionMapError = error{
+    InteractionRowCountMismatch,
+    InteractionColumnCountMismatch,
+};
+
+/// Each interaction row is dotted with `error_vector`. Row count must be [`interaction_output_len`]; every row length must match `error_vector.len`.
+pub fn mapInteraction(interaction: []const []const f32, error_vector: []const f32) InteractionMapError![interaction_output_len]f32 {
+    if (interaction.len != interaction_output_len)
+        return error.InteractionRowCountMismatch;
+    var mapped: [interaction_output_len]f32 = undefined;
+    for (interaction, &mapped) |row, *out| {
+        if (row.len != error_vector.len)
+            return error.InteractionColumnCountMismatch;
+        var sum: f32 = 0;
+        for (row, error_vector) |gain, err| sum += gain * err;
+        out.* = sum;
+    }
+    return mapped;
+}
+
+pub fn add4(a: [4]f32, b: [4]f32) [4]f32 {
+    var out: [4]f32 = undefined;
+    for (&out, a, b) |*slot, left, right| slot.* = left + right;
+    return out;
+}
+
+/// Per axis: position when `position_available`, otherwise visual, otherwise zero.
+/// A null visual vector means vision is unavailable on every axis.
+pub fn greedy6(
+    position: [interaction_output_len]f32,
+    visual: ?[interaction_output_len]f32,
+    position_available: [interaction_output_len]bool,
+) [interaction_output_len]f32 {
+    var out: [interaction_output_len]f32 = undefined;
+    for (&out, position, position_available, 0..) |*slot, pos, available, i| {
+        if (available) {
+            slot.* = pos;
+        } else if (visual) |vis| {
+            slot.* = vis[i];
+        } else {
+            slot.* = 0;
+        }
+    }
+    return out;
+}
+
 pub inline fn length3f(v: Vector3f) f32 {
     return @sqrt(dot3f(v, v));
 }
@@ -109,12 +113,12 @@ pub inline fn quaternionConjugate(q: Quaternionf) Quaternionf {
 }
 
 pub inline fn quaternionMul(a: Quaternionf, b: Quaternionf) Quaternionf {
-    const av: Vector3f = a[0..3].*;
-    const bv: Vector3f = b[0..3].*;
+    const av: Vector3f = .{ a[0], a[1], a[2] };
+    const bv: Vector3f = .{ b[0], b[1], b[2] };
 
     const xyz =
-        a[3] * bv +
-        b[3] * av +
+        @as(Vector3f, @splat(a[3])) * bv +
+        @as(Vector3f, @splat(b[3])) * av +
         cross3f(av, bv);
 
     const w = a[3] * b[3] - dot3f(av, bv);
@@ -147,6 +151,26 @@ pub inline fn quaternionToEuler(q: Quaternionf) Vector3f {
     const yaw: f32 = std.math.atan2(siny_cosp, cosy_cosp);
 
     return .{ roll, pitch, yaw };
+}
+
+/// Inverse of `quaternionToEuler`: roll about X, pitch about Y, yaw about Z.
+pub fn eulerToQuaternion(euler: Vector3f) Quaternionf {
+    const roll, const pitch, const yaw = euler;
+    const half_roll = roll * 0.5;
+    const half_pitch = pitch * 0.5;
+    const half_yaw = yaw * 0.5;
+    const cr = @cos(half_roll);
+    const sr = @sin(half_roll);
+    const cp = @cos(half_pitch);
+    const sp = @sin(half_pitch);
+    const cy = @cos(half_yaw);
+    const sy = @sin(half_yaw);
+    return .{
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    };
 }
 
 pub inline fn wrapAngle(angle: f32) f32 {
@@ -206,13 +230,6 @@ pub fn rotationBetween(forward: Vector3f, dir: Vector3f) Quaternionf {
     return normalize4f(q);
 }
 
-// pub inline fn poseTo6f(pose: Pose) Auv.Vector6f {
-//     const x, const y, const z = pose.pos;
-//     const roll, const pitch, const yaw = quaternionToEuler(pose.quat);
-//
-//     return .{ x, y, z, roll, pitch, yaw };
-// }
-
 pub inline fn poseTo6f(pose: Pose) Vector6f {
     const x, const y, const z = pose.pos;
     const rot = normalize4f(pose.quat);
@@ -252,35 +269,6 @@ pub fn tamToThrusters(
     return thruster_values;
 }
 
-/// Per-axis PID on a 6-DOF error vector, producing a wrench command.
-///
-/// For each axis: `wrench = kp·err + ki·∫err + kd·d(err)/dt`.
-/// Gains and error are element-wise (`Vector6f`), e.g. x/y/z position and roll/pitch/yaw.
-///
-/// When `dt` is non-null, the I term uses `sumError + err·dt` and D uses `(err - prevError)/dt`.
-/// When `dt` is null (missing or invalid timestep), D is zero and I uses `sumError` unchanged—
-/// same I/D skip as `MissionContext.ControllerStep`.
-///
-/// `sumError` and `prevError` are updated in place when `dt` is non-null.
-/// Returns the wrench; feed through `wrenchToThrusterInput` / `tamToThrusters` for thrusters.
-pub fn pidWrench(
-    sumError: *Vector6f,
-    prevError: *Vector6f,
-    kp: Vector6f,
-    ki: Vector6f,
-    kd: Vector6f,
-    err: Vector6f,
-    dt: ?f32,
-) Vector6f {
-    const vel_err: Vector6f = if (dt) |dt_val| blk: {
-        sumError.* += err * @as(Vector6f, @splat(dt_val));
-        break :blk (err - prevError.*) / @as(Vector6f, @splat(dt_val));
-    } else @as(Vector6f, @splat(0));
-    const wrench = kp * err + ki * sumError.* + kd * vel_err;
-    prevError.* = err;
-    return wrench;
-}
-
 /// Maps a 6-DOF PID wrench into the 6-DOF command vector expected by `math.tamMul`.
 ///
 /// Pose `orientation` (unit quaternion `rot`) rotates body vectors into world:
@@ -312,7 +300,7 @@ pub fn wrenchToThrusterInput(
     return .{
         body_force[0],
         body_force[1],
-        wrench[2],
+        body_force[2],
         -wrench[3],
         wrench[4],
         wrench[5],

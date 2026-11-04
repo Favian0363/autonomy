@@ -30,13 +30,23 @@ typedef struct {
   AuvObjectCls cls;
 } AuvObject;
 
+/// One flag per axis. False means that component of the pose must not be used.
+typedef struct {
+  bool x;
+  bool y;
+  bool z;
+} AuvAxisOk;
+
 #define AUV_FRAME_MAX_OBJECTS 128
 typedef struct {
   AuvObject objects[AUV_FRAME_MAX_OBJECTS];
   uint8_t objects_len;
   MathPose camera_pose;
   uint64_t timestamp;
-  bool tracking_ok;
+  /// World X, Y, Z. A false axis means `camera_pose.pos` on that axis is not usable.
+  AuvAxisOk position_ok;
+  /// Roll, pitch, yaw. A false axis means that attitude component is not usable.
+  AuvAxisOk attitude_ok;
   MathVector3f accel;
   MathVector3f gyro;
   MathQuaternionf imu_quat;

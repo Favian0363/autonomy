@@ -1,7 +1,12 @@
 const std = @import("std");
-const math = @import("math.zig");
 const MissionContext = @import("MissionContext.zig");
 const MissionArgs = @import("MissionArgs.zig");
+
+test {
+    std.testing.refAllDecls(@import("BodyControl.zig"));
+    std.testing.refAllDecls(@import("MissionContext.zig"));
+    std.testing.refAllDecls(@import("ConfigLoader.zig"));
+}
 
 pub fn main(init: std.process.Init) !void {
     const args_slice = try init.minimal.args.toSlice(init.arena.allocator());
@@ -13,8 +18,8 @@ pub fn main(init: std.process.Init) !void {
 
     while (true) {
         try ctx.yieldUntilNextFrameAndUpdate();
-        //Make sure the goal starts  with the inital measurement of the odometry
-        ctx.goal = math.poseTo6f(ctx.frame.camera_pose);
+        // Make sure the target position starts with the initial odometry measurement.
+        ctx.target_position = ctx.frame.camera_pose.pos;
 
         const mission_result = switch (args.mission_id) {
             .prequalify_coco => @import("missions/prequalify.zig").cocoMission(&ctx),

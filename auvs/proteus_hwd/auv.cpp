@@ -174,6 +174,8 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
   sl::SensorsData sensors_data{};
   double quat_length = 1.0;
   double imu_quat_length = 1.0;
+  bool imu_ok = false;
+  bool depth_this_frame = false;
   const float pose_flip[] = {1, -1, -1, 1};
 
   switch (error) {
@@ -185,7 +187,6 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
     const uint64_t frame_start = config.metrics ? now_ns() : 0;
     tracking = zed.getPosition(pose, sl::REFERENCE_FRAME::WORLD);
     frame->timestamp = zed.getTimestamp(sl::TIME_REFERENCE::IMAGE).getNanoseconds();
-    frame->tracking_ok = (tracking == sl::POSITIONAL_TRACKING_STATE::OK);
     translation = pose.getTranslation();
     orientation = pose.getOrientation();
     frame->camera_pose.pos.buf[0] = pose_flip[0] * translation.tx;
@@ -223,6 +224,7 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
       frame->imu_quat.buf[1] = static_cast<float>(imu_orientation.oy / imu_quat_length);
       frame->imu_quat.buf[2] = static_cast<float>(imu_orientation.oz / imu_quat_length);
       frame->imu_quat.buf[3] = static_cast<float>(imu_orientation.ow / imu_quat_length);
+      imu_ok = std::isfinite(imu_quat_length) && imu_quat_length > 1e-6;
 
       frame->pressure_depth_ok = false;
       if (sensors_data.barometer.is_available) {
@@ -235,7 +237,32 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
         if (delta_pa > 0.0f) {
           frame->pressure_depth = delta_pa / (kWaterDensity * kGravity);
           frame->pressure_depth_ok = true;
+          depth_this_frame = true;
         }
+      }
+    }
+
+    if (tracking == sl::POSITIONAL_TRACKING_STATE::OK) {
+      frame->position_ok = {true, true, true};
+      frame->attitude_ok = {true, true, true};
+    } else {
+      frame->position_ok = {false, false, false};
+      frame->attitude_ok = {false, false, false};
+      if (depth_this_frame) {
+        // pose_flip already makes world Z positive down. Pressure depth is positive down.
+        frame->camera_pose.pos.buf[2] = frame->pressure_depth;
+        frame->position_ok.z = true;
+      }
+      if (imu_ok) {
+        frame->camera_pose.quat.buf[0] =
+            static_cast<float>(pose_flip[0] * imu_orientation.ox / imu_quat_length);
+        frame->camera_pose.quat.buf[1] =
+            static_cast<float>(pose_flip[1] * imu_orientation.oy / imu_quat_length);
+        frame->camera_pose.quat.buf[2] =
+            static_cast<float>(pose_flip[2] * imu_orientation.oz / imu_quat_length);
+        frame->camera_pose.quat.buf[3] =
+            static_cast<float>(pose_flip[3] * imu_orientation.ow / imu_quat_length);
+        frame->attitude_ok = {true, true, true};
       }
     }
 
