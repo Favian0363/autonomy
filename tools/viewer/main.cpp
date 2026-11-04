@@ -25,6 +25,11 @@ struct Object3d {
   unsigned char cls;
 };
 
+struct Goal3d {
+  float pos[3];
+  float look[3];
+};
+
 struct Telemetry {
   float pos[3];
   float quat[4];
@@ -40,6 +45,8 @@ struct Telemetry {
   int thr_len;
   char step[64];
   float force_error[3];
+  int goals_len;
+  Goal3d goals[32];
 };
 
 struct Cursor {
@@ -155,7 +162,21 @@ static bool parse_telemetry(const unsigned char *bytes, int size, Telemetry *out
   const int step_len = nstep < 63 ? nstep : 63;
   std::memcpy(out->step, step, static_cast<std::size_t>(step_len));
   out->step[step_len] = '\0';
-  return read_vec3(&c, out->force_error);
+  if (!read_vec3(&c, out->force_error)) return false;
+
+  out->goals_len = 0;
+  unsigned char ngoals;
+  if (!read_u8(&c, &ngoals)) return true;
+  out->goals_len = ngoals < 32 ? ngoals : 32;
+  for (int i = 0; i < ngoals; i++) {
+    float pos[3], look[3];
+    if (!read_vec3(&c, pos) || !read_vec3(&c, look)) return false;
+    if (i < out->goals_len) {
+      std::memcpy(out->goals[i].pos, pos, sizeof(pos));
+      std::memcpy(out->goals[i].look, look, sizeof(look));
+    }
+  }
+  return true;
 }
 
 // ZED streaming binds an even port and the next one; keep separate from telemetry udp (5600).
@@ -428,10 +449,22 @@ int main(int argc, char **argv) {
         if (axis < 0.05f) axis = 0.3f;
       draw_box(obj.pos, obj.quat, size, object_color(obj.cls));
     }
+    for (int i = 0; i < tel.goals_len; i++) {
+      const Goal3d &goal = tel.goals[i];
+      const Vector3 at = to_ray(goal.pos[0], goal.pos[1], goal.pos[2]);
+      const Vector3 look = to_ray(goal.look[0], goal.look[1], goal.look[2]);
+      const Color color = i == 0 ? WHITE : LIME;
+      if (i + 1 < tel.goals_len) {
+        const Goal3d &next = tel.goals[i + 1];
+        DrawLine3D(at, to_ray(next.pos[0], next.pos[1], next.pos[2]), LIME);
+      }
+      DrawLine3D(at, look, Fade(color, 0.65f));
+      DrawSphere(at, i == 0 ? 0.18f : 0.1f, color);
+    }
     EndMode3D();
     DrawText("sub blue   objects colored by coco class   right-drag orbit   wheel zoom", 8, 8, 16, LIGHTGRAY);
     DrawText("y forward   x right   z down", 8, 28, 16, GRAY);
-    DrawText("orange nose   green cmd   pink move   yellow err", 8, 48, 16, GRAY);
+    DrawText("orange nose   green cmd   pink move   yellow err   lime goals", 8, 48, 16, GRAY);
     EndTextureMode();
 
     BeginDrawing();

@@ -259,11 +259,20 @@ const TelemetryPacket = struct {
     thrusters: []const f32,
     step: []const u8,
     force_error: math.Vector3f,
+    goals: []const Goal,
 };
 
 fn publishToUdp(ctx: *MissionContext, thrusters: []const f32) void {
     const nobj = @min(@as(usize, ctx.seen_objects_len), ctx.seen_objects.len);
     const nbox = @min(@as(usize, ctx.seen_objects2d_len), ctx.seen_objects2d.len);
+    var goals: [queue_capacity]Goal = undefined;
+    var goals_len: usize = 0;
+    var goal_it = ctx.queue.iterator();
+    while (goal_it.next()) |goal| {
+        if (goals_len >= goals.len) break;
+        goals[goals_len] = goal;
+        goals_len += 1;
+    }
 
     var buf: [64 * 1024]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
@@ -279,6 +288,7 @@ fn publishToUdp(ctx: *MissionContext, thrusters: []const f32) void {
         .thrusters = thrusters[0..@min(thrusters.len, 255)],
         .step = ctx.step[0..@min(ctx.step.len, 255)],
         .force_error = ctx.force_error,
+        .goals = goals[0..goals_len],
     }) catch return;
     const packet = w.buffered();
 
