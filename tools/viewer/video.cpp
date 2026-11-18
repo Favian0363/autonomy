@@ -68,7 +68,8 @@ extern "C" bool video_open(const char *source, int *width, int *height) {
 
   const auto err = zed.open(init);
   if (err != sl::ERROR_CODE::SUCCESS) {
-    std::fprintf(stderr, "can't open video %s: %s\n", source, sl::toString(err).c_str());
+    std::fprintf(stderr, "can't open video %s: %s — %s\n",
+                 source, sl::toString(err).c_str(), sl::toVerbose(err).c_str());
     return false;
   }
 

@@ -1,7 +1,7 @@
 const std = @import("std");
 const math = @import("math.zig");
-const MissionContext = @import("MissionContext.zig");
 const Auv = @import("Auv.zig");
+const MissionContext = @import("MissionContext.zig");
 const c = Auv.c;
 
 pub fn teleopMission(ctx: *MissionContext) !void {
@@ -32,6 +32,11 @@ pub fn teleopMission(ctx: *MissionContext) !void {
         }
         try ctx.yieldUntilNextFrameAndUpdate();
     }
+}
+
+pub fn thrusterControl(ctx: *MissionContext) !void {
+    ctx.step = "direct_thruster_control";
+    while (true) try ctx.yieldUntilNextFrameAndUpdate();
 }
 
 pub fn missionControl(ctx: *MissionContext) !void {

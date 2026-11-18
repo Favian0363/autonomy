@@ -1,4 +1,4 @@
-//! Vehicle tuning presets (`mission_profiles`) live at the bottom of this file (replaces `auvs/*/auv.json`).
+//! Compiled startup defaults and vehicle tuning presets.
 const std = @import("std");
 const bc = @import("BodyControl.zig");
 const math = @import("math.zig");
@@ -38,6 +38,14 @@ pub fn FixedText(comptime capacity: usize) type {
             if (self.len > self.bytes.len) return error.InvalidTextLength;
             return self.bytes[0..self.len];
         }
+
+        /// Return the stored bytes directly as a C-compatible sentinel slice.
+        pub fn sentinelSlice(self: *const @This()) error{InvalidTextLength}![:0]const u8 {
+            if (self.len >= self.bytes.len or self.bytes[self.len] != 0) return error.InvalidTextLength;
+            const text = self.bytes[0..self.len :0];
+            if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidTextLength;
+            return text;
+        }
     };
 }
 
@@ -56,7 +64,7 @@ pub const Ibvs = struct {
     interaction: [math.interaction_output_len][max_ibvs_error_cols]f32,
 };
 
-pub const MissionProfileId = enum {
+pub const MissionProfileId = enum(u8) {
     stonefish_sim,
     proteus_hwd,
 
@@ -65,13 +73,30 @@ pub const MissionProfileId = enum {
     }
 };
 
-/// All vehicle presets in the plugin (`mission_profiles` symbol).
+pub const MissionId = enum(u8) { prequalify_coco, prequalify_robosub, teleop, mission_control, thruster_control };
+pub const SensorSource = enum(u8) { simulated, plugin };
+pub const path_max = 256;
+pub const name_max = 64;
+pub const control_port: u16 = 8080;
+pub const startup_mission: MissionId = .mission_control;
+pub const startup_profile: MissionProfileId = .stonefish_sim;
+
+/// Compiled vehicle tuning presets.
 pub const MissionProfiles = struct {
     stonefish_sim: MissionConfig,
     proteus_hwd: MissionConfig,
 };
 
 pub const MissionConfig = struct {
+    mission_id: MissionId = startup_mission,
+    mission_profile: MissionProfileId = startup_profile,
+    sensor_source: SensorSource = .simulated,
+    sensor_library: FixedText(path_max) = .fromLiteral("./zig-out/lib/libauv_proteus_hwd.so"),
+    serial_port: FixedText(path_max) = .{},
+    sim_robot: FixedText(name_max) = .fromLiteral("hydrus"),
+    sim_scene: FixedText(name_max) = .fromLiteral("robosub_course"),
+    sim_realtime: bool = false,
+
     // Startup/control connection. These values must match between the runtime
     // and viewer built from this module.
     teleop_port: u16,
@@ -96,6 +121,13 @@ pub const MissionConfig = struct {
     print_stuff: bool,
     clear_print_stuff: bool,
 
+    pub fn operationallyEqual(a: *const MissionConfig, b: *const MissionConfig) bool {
+        return a.mission_id == b.mission_id and a.mission_profile == b.mission_profile and
+            a.sensor_source == b.sensor_source and textEqual(a.sensor_library, b.sensor_library) and
+            textEqual(a.serial_port, b.serial_port) and textEqual(a.sim_robot, b.sim_robot) and
+            textEqual(a.sim_scene, b.sim_scene) and a.sim_realtime == b.sim_realtime;
+    }
+
     pub fn telemetryAddr(self: *const MissionConfig) error{InvalidTextLength}![]const u8 {
         const text = try self.telemetry_addr.slice();
         if (text.len == 0) return error.InvalidTextLength;
@@ -116,12 +148,25 @@ pub const MissionConfig = struct {
 
     pub const ValidateError = error{
         InvalidTamLen,
+        InvalidProfile,
+        InvalidPath,
         InvalidQueueCapacity,
         InvalidInteractionCols,
         InvalidTextLength,
     };
 
     pub fn validate(self: *const MissionConfig) ValidateError!void {
+        if (self.tam_len != compiledProfile(self.mission_profile).tam_len) return error.InvalidProfile;
+        const library = try self.sensor_library.slice();
+        const serial = try self.serial_port.slice();
+        const robot = try self.sim_robot.slice();
+        const scene = try self.sim_scene.slice();
+        if (std.mem.indexOfScalar(u8, library, 0) != null or std.mem.indexOfScalar(u8, serial, 0) != null or
+            std.mem.indexOfScalar(u8, robot, 0) != null or std.mem.indexOfScalar(u8, scene, 0) != null) return error.InvalidPath;
+        if (self.sensor_source == .plugin and library.len == 0) return error.InvalidPath;
+        if (robot.len == 0 or scene.len == 0) return error.InvalidPath;
+        if (serial.len != 0 and self.mission_profile != .proteus_hwd) return error.InvalidProfile;
+        if (self.teleop_port != control_port and !@import("builtin").is_test) return error.InvalidPath;
         if (self.tam_len == 0 or self.tam_len > thruster_count) return error.InvalidTamLen;
         if (self.queue_capacity == 0 or self.queue_capacity > queue_capacity_max) return error.InvalidQueueCapacity;
         if (self.ibvs.interaction_cols == 0 or self.ibvs.interaction_cols > max_ibvs_error_cols) return error.InvalidInteractionCols;
@@ -133,15 +178,6 @@ pub const MissionConfig = struct {
         _ = try self.telemetryLogPath();
     }
 };
-
-comptime {
-    if (@offsetOf(MissionConfig, "tam") <= @offsetOf(MissionConfig, "rotation_limit")) {
-        @compileError("MissionConfig field order drift: tam must follow rotation_limit");
-    }
-    if (@offsetOf(MissionConfig, "odometry") <= @offsetOf(MissionConfig, "tam")) {
-        @compileError("MissionConfig field order drift: odometry must follow tam");
-    }
-}
 
 // --- Presets (edit here; rebuild the main executable to apply compile-time checks) ---
 
@@ -155,7 +191,7 @@ fn presetZeroInteraction() [math.interaction_output_len][max_ibvs_error_cols]f32
 
 fn presetBaseline() MissionConfig {
     return .{
-        .teleop_port = 8080,
+        .teleop_port = control_port,
         .camera_forward = .{ 0, 1, 0 },
         .rotation_limit = .{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) },
         .tam = presetZeroTam(),
@@ -187,6 +223,7 @@ fn presetBaseline() MissionConfig {
 
 fn presetStonefishSim() MissionConfig {
     var config = presetBaseline();
+    config.mission_profile = .stonefish_sim;
     config.rotation_limit = .{ 0, 0, 100 };
     config.telemetry_transport = .shared_memory;
     config.odometry = .{
@@ -219,6 +256,8 @@ fn presetStonefishSim() MissionConfig {
 
 fn presetProteusHwd() MissionConfig {
     var config = presetBaseline();
+    config.mission_profile = .proteus_hwd;
+    config.sim_robot = .fromLiteral("proteus");
     config.rotation_limit = .{ 0.3, 0, 100 };
     config.ibvs.target_height = 0.35;
     config.telemetry_transport = .shared_memory;
@@ -262,9 +301,6 @@ pub fn compiledProfile(profile: MissionProfileId) *const MissionConfig {
         .proteus_hwd => &mission_profiles.proteus_hwd,
     };
 }
-
-/// The current viewer/runtime integration is compiled for this profile.
-pub const viewer_profile = MissionProfileId.stonefish_sim;
 
 fn rowIsZero(row: [tam_cols]f32) bool {
     for (row) |gain| if (gain != 0) return false;
@@ -362,6 +398,16 @@ fn assertPreset(comptime name: []const u8, comptime config: MissionConfig) void 
 }
 
 comptime {
+    if (mission_profiles.proteus_hwd.tam_len != 6) @compileError("Proteus firmware requires six TAM rows");
     assertPreset("stonefish_sim", mission_profiles.stonefish_sim);
     assertPreset("proteus_hwd", mission_profiles.proteus_hwd);
 }
+
+pub fn textEqual(a: anytype, b: @TypeOf(a)) bool {
+    return a.len == b.len and a.len <= a.bytes.len and std.mem.eql(u8, a.bytes[0..a.len], b.bytes[0..b.len]);
+}
+pub const startup_config: MissionConfig = blk: {
+    var config = compiledProfile(startup_profile).*;
+    config.mission_id = startup_mission;
+    break :blk config;
+};

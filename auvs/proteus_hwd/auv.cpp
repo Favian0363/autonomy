@@ -7,7 +7,12 @@
 // viewer video stream defaults to 127.0.0.1:5610 (even port, uses the next port too).
 
 #include "../../include/auv.h"
-#include "arduino.hpp"
+#include <exception>
+#include <stdexcept>
+static AuvFrameError initialization_error{};
+static void sensor_init();
+static void sensor_read(AuvFrame *frame);
+static void sensor_close();
 #include "object_map.hpp"
 #include "coordinates.hpp"
 #include <cstdint>
@@ -21,9 +26,10 @@
 #include <limits>
 #include <stdexcept>
 #include <sys/stat.h>
-#include <thread>
 #include <time.h>
 #include <cinttypes>
+#include <chrono>
+#include <thread>
 
 #ifdef AUV_STANDARD_RTP
 #include "rtp_relay.hpp"
@@ -55,8 +61,6 @@ static uint64_t last_timestamp = 0;
 static float surface_pressure_hpa = 0.f;
 static bool surface_pressure_set = false;
 static uint64_t frames = 0;
-static std::thread arduino_reader_thread;
-static std::thread arduino_writer_thread;
 static constexpr float kWaterDensity = 997.0f;
 static constexpr float kGravity = 9.80665f;
 static constexpr uintmax_t kMinFreeDisk = 1ULL << 30;
@@ -69,14 +73,16 @@ static constexpr int kZedStreamPort = 5610; // 0 = off
 static constexpr bool kLogCls = false;
 static constexpr bool kZedMetrics = false;
 static constexpr sl::RESOLUTION kZedResolution = sl::RESOLUTION::HD720;
+static constexpr auto kFrameTimeout = std::chrono::seconds(1);
+static constexpr auto kFrameRetryInterval = std::chrono::milliseconds(1);
+static constexpr uint32_t kZedFrameGrabError = 0x1000;
 
 static Config load_config();
 static bool coco_class(int label, AuvObjectCls *cls);
 
 [[noreturn]] static void fail(const char *message) {
   std::fprintf(stderr, "[zed] %s\n", message);
-  auv_deinit();
-  std::exit(EXIT_FAILURE);
+  throw std::runtime_error(message);
 }
 
 static uint64_t now_ns() {
@@ -93,12 +99,9 @@ static void check(sl::ERROR_CODE error, const char *operation) {
   }
 }
 
-void auv_init(void) {
+static void sensor_init(void) {
   try {
-    auv_deinit();
-    arduino_init();
-    arduino_reader_thread = std::thread(arduino_serial_reader);
-    arduino_writer_thread = std::thread(arduino_serial_writer);
+    sensor_close();
 
     config = load_config();
     sl::InitParameters params;
@@ -189,9 +192,12 @@ void auv_init(void) {
   }
 }
 
-void auv_yield_until_next_frame(AuvFrame *frame) {
+static void sensor_read(AuvFrame *frame) {
   if (!frame || !zed_open) {
-    std::fprintf(stderr, "Error Zed has not been initialized yet and we dont have our first grabbed frame\n");
+    if (frame) {
+      frame->frame_error.code = AUV_FRAME_ERROR_NOT_INITIALIZED;
+      std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "ZED camera is not initialized");
+    }
     return;
   }
 
@@ -220,8 +226,9 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
   bool depth_this_frame = false;
   switch (error) {
   case sl::ERROR_CODE::END_OF_SVOFILE_REACHED:
-    std::fprintf(stderr, "Recording has ended\n");
-    break;
+    frame->frame_error.code = AUV_FRAME_ERROR_END_OF_STREAM;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "Recording has ended");
+    return;
 
   case sl::ERROR_CODE::SUCCESS: {
 #ifdef AUV_STANDARD_RTP
@@ -369,25 +376,19 @@ void auv_yield_until_next_frame(AuvFrame *frame) {
     break;
   }
   default:
-    break;
+    frame->frame_error.code = kZedFrameGrabError;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "ZED grab: %s", sl::toString(error).c_str());
+    return;
   }
 }
 
-void auv_set_thrustor_values(const float *thrustor_values, uint8_t thrustor_values_len) {
-  enqueue_serial_command_packet(thrustor_values, thrustor_values_len);
-}
 
-void auv_deinit(void) {
+
+static void sensor_close(void) {
 #ifdef AUV_STANDARD_RTP
   rtp_relay_enabled = false;
   rtp_relay_stop();
 #endif
-  request_stop();
-  if (arduino_reader_thread.joinable())
-    arduino_reader_thread.join();
-  if (arduino_writer_thread.joinable())
-    arduino_writer_thread.join();
-  arduino_deinit();
 
   if (zed_open) {
     zed_open = false;
@@ -397,7 +398,7 @@ void auv_deinit(void) {
       zed.close();
     } catch (...) {
       std::fputs("[zed] camera close failed\n", stderr);
-      std::exit(EXIT_FAILURE);
+      // Cleanup errors are reported without terminating the application.
     }
   }
   detection_enabled = false;
@@ -437,4 +438,53 @@ static Config load_config() {
   if (*config.svo) check_file(config.svo);
 
   return config;
+}
+
+// SDK calls run directly on the mission thread. Control is polled between calls
+// by the host. Frame deadlines are measured here; SDK calls can still block.
+void auv_init(void) {
+  initialization_error = {};
+  try {
+    sensor_init();
+  } catch (const std::exception &e) {
+    initialization_error.code = AUV_FRAME_ERROR_INITIALIZATION;
+    std::snprintf(initialization_error.message, sizeof(initialization_error.message), "%s", e.what());
+  } catch (...) {
+    initialization_error.code = AUV_FRAME_ERROR_INITIALIZATION;
+    std::snprintf(initialization_error.message, sizeof(initialization_error.message), "unexpected sensor initialization exception");
+  }
+}
+void auv_yield_until_next_frame(AuvFrame *frame) {
+  *frame = {};
+  if (initialization_error.code != AUV_FRAME_ERROR_NONE) {
+    frame->frame_error = initialization_error;
+    return;
+  }
+  try {
+    const auto started = std::chrono::steady_clock::now();
+    while (true) {
+      if (std::chrono::steady_clock::now() - started >= kFrameTimeout) break;
+      sensor_read(frame);
+      if (frame->frame_error.code != AUV_FRAME_ERROR_NONE) return;
+      if (std::chrono::steady_clock::now() - started >= kFrameTimeout) break;
+      if (frame->timestamp) return;
+      std::this_thread::sleep_for(kFrameRetryInterval);
+    }
+    frame->frame_error.code = AUV_FRAME_ERROR_TIMEOUT;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message),
+                  "ZED frame timed out after %lld ms",
+                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(kFrameTimeout).count()));
+  } catch (const std::exception &e) {
+    frame->frame_error.code = AUV_FRAME_ERROR_SENSOR;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "%s", e.what());
+  } catch (...) {
+    frame->frame_error.code = AUV_FRAME_ERROR_SENSOR;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "unexpected sensor frame exception");
+  }
+}
+void auv_deinit(void) {
+  try { sensor_close(); }
+  catch (const std::exception &e) { std::fprintf(stderr, "sensor cleanup: %s\n", e.what()); }
+  catch (...) { std::fputs("unexpected sensor cleanup exception\n", stderr); }
+  initialization_error = {};
 }

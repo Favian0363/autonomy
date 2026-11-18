@@ -48,7 +48,8 @@ GstElement *make_pipeline(bool hardware) {
       : "avdec_h264 ! videoconvert ! video/x-raw,format=RGBA";
   const std::string desc = "udpsrc address=" + bind_address + " port=" + std::to_string(bind_port) +
       " caps=\"application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96\" ! "
-      "rtpjitterbuffer latency=80 drop-on-latency=true ! rtph264depay ! h264parse ! " + decode +
+      "rtpjitterbuffer latency=80 drop-on-latency=true ! rtph264depay ! "
+      "h264parse config-interval=1 ! " + decode +
       " ! appsink name=frames max-buffers=1 drop=true sync=false";
   GError *error = nullptr;
   GstElement *pipeline = gst_parse_launch(desc.c_str(), &error);

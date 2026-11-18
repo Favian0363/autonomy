@@ -8,29 +8,55 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 
-#define PULSE_WIDTH_NEUTRAL 1500
-#define PULSE_WIDTH_DELTA 100
-#define PULSE_WIDTH_MIN PULSE_WIDTH_NEUTRAL - PULSE_WIDTH_DELTA
-#define PULSE_WIDTH_MAX PULSE_WIDTH_NEUTRAL + PULSE_WIDTH_DELTA
-#define PINS_COUNT 6
+// Proteus firmware protocol and actuator configuration.
+const uint8_t PROTEUS_THRUSTER_COUNT = 6;
+const uint8_t PROTOCOL_V2_SYNC_BYTE_0 = 0xA5;
+const uint8_t PROTOCOL_V2_SYNC_BYTE_1 = 0x5A;
+const uint8_t PROTOCOL_V2_READY_REPLY_TYPE = 0x80;
+const uint8_t PROTOCOL_V2_ERROR_REPLY_TYPE = 0xE0;
+const unsigned long PROTOCOL_V2_SERIAL_BAUD_RATE = 115200;
+const unsigned long PROTOCOL_V2_COMMAND_TIMEOUT_MS = 500;
+const size_t PROTOCOL_V2_FLOAT32_SIZE_BYTES = 4;
+const size_t PROTOCOL_V2_COMMAND_HEADER_SIZE_BYTES = 3;
+const size_t PROTOCOL_V2_COMMAND_CRC_SIZE_BYTES = 2;
+const size_t PROTOCOL_V2_MAX_COMMAND_PACKET_SIZE_BYTES =
+    PROTOCOL_V2_COMMAND_HEADER_SIZE_BYTES +
+    PROTOCOL_V2_FLOAT32_SIZE_BYTES * PROTEUS_THRUSTER_COUNT +
+    PROTOCOL_V2_COMMAND_CRC_SIZE_BYTES;
+const size_t PROTOCOL_V2_READY_REPLY_SIZE_BYTES = 5;
+const size_t PROTOCOL_V2_ERROR_REPLY_SIZE_BYTES = 7;
 
-const int PINS[PINS_COUNT] = {7, 6, 3, 2, 4, 5};
+enum class ProtocolV2ErrorCode : uint8_t {
+  InvalidCrc = 1,
+  InvalidValue = 2,
+  InvalidCount = 4,
+  CommandTimeout = 9,
+};
 
-const uint16_t SERVO_REFRESH_US = 20000;
-const uint8_t SERVO_TIMER_PRESCALER = 8;
-const uint8_t SERVO_WRITE_TRIM_US = 2;
+const int PROTEUS_THRUSTER_PINS[PROTEUS_THRUSTER_COUNT] = {7, 6, 3, 2, 4, 5};
+const float PROTEUS_COMMAND_MIN = -1.0f;
+const float PROTEUS_COMMAND_MAX = 1.0f;
+const int PROTEUS_PULSE_WIDTH_NEUTRAL_US = 1500;
+const int PROTEUS_PULSE_WIDTH_DELTA_US = 100;
+const int PROTEUS_PULSE_WIDTH_MIN_US =
+    PROTEUS_PULSE_WIDTH_NEUTRAL_US - PROTEUS_PULSE_WIDTH_DELTA_US;
+const int PROTEUS_PULSE_WIDTH_MAX_US =
+    PROTEUS_PULSE_WIDTH_NEUTRAL_US + PROTEUS_PULSE_WIDTH_DELTA_US;
+const uint16_t PROTEUS_SERVO_REFRESH_US = 20000;
+const uint8_t PROTEUS_SERVO_TIMER_PRESCALER = 8;
+const uint8_t PROTEUS_SERVO_WRITE_TRIM_US = 2;
 
-volatile uint16_t thrusterPulseTicks[PINS_COUNT];
+volatile uint16_t thrusterPulseTicks[PROTEUS_THRUSTER_COUNT];
 volatile int8_t activeThrusterPulse = -1;
 
 uint16_t microsecondsToTimerTicks(uint16_t microseconds) {
   return (clockCyclesPerMicrosecond() * microseconds) /
-         SERVO_TIMER_PRESCALER;
+         PROTEUS_SERVO_TIMER_PRESCALER;
 }
 
 void writeThrusterMicroseconds(uint8_t thruster, uint16_t microseconds) {
   const uint16_t ticks =
-      microsecondsToTimerTicks(microseconds - SERVO_WRITE_TRIM_US);
+      microsecondsToTimerTicks(microseconds - PROTEUS_SERVO_WRITE_TRIM_US);
 
   // A 16-bit store is not atomic on the 8-bit ATmega328P. Prevent Timer1's
   // interrupt from seeing one byte from the old value and one from the new.
@@ -44,43 +70,26 @@ ISR(TIMER1_COMPA_vect) {
   if (activeThrusterPulse < 0)
     TCNT1 = 0;
   else
-    digitalWrite(PINS[activeThrusterPulse], LOW);
+    digitalWrite(PROTEUS_THRUSTER_PINS[activeThrusterPulse], LOW);
 
   ++activeThrusterPulse;
-  if (activeThrusterPulse < PINS_COUNT) {
+  if (activeThrusterPulse < PROTEUS_THRUSTER_COUNT) {
     OCR1A = TCNT1 + thrusterPulseTicks[activeThrusterPulse];
-    digitalWrite(PINS[activeThrusterPulse], HIGH);
+    digitalWrite(PROTEUS_THRUSTER_PINS[activeThrusterPulse], HIGH);
     return;
   }
 
   const uint16_t refreshTicks =
-      microsecondsToTimerTicks(SERVO_REFRESH_US);
+      microsecondsToTimerTicks(PROTEUS_SERVO_REFRESH_US);
   OCR1A = TCNT1 + 4 < refreshTicks ? refreshTicks : TCNT1 + 4;
   activeThrusterPulse = -1;
 }
 
-const uint8_t PACKET_MAGIC_0 = 0xA5;
-const uint8_t PACKET_MAGIC_1 = 0x5A;
-const uint8_t PACKET_VERSION = 2;
-const uint8_t READY_PACKET_TYPE = 0x80;
-const uint8_t ERROR_PACKET_TYPE = 0xE0;
-const unsigned long COMMAND_TIMEOUT_MS = 500;
-const size_t FLOAT32_SIZE = 4;
-const size_t PACKET_MAX_SIZE = 6 + FLOAT32_SIZE * PINS_COUNT;
-
-enum class ErrorCode : uint8_t {
-  InvalidCrc = 1,
-  InvalidValue = 2,
-  UnsupportedVersion = 3,
-  InvalidCount = 4,
-  CommandTimeout = 9,
-};
-
 // Keep Arduino's automatic prototype generator from declaring this function
-// before ErrorCode is defined.
-void sendErrorPacket(ErrorCode errorCode, uint8_t detail);
+// before ProtocolV2ErrorCode is defined.
+void sendErrorPacket(ProtocolV2ErrorCode errorCode, uint8_t detail);
 
-uint8_t packetBuffer[PACKET_MAX_SIZE];
+uint8_t packetBuffer[PROTOCOL_V2_MAX_COMMAND_PACKET_SIZE_BYTES];
 size_t packetLength = 0;
 size_t expectedPacketLength = 0;
 unsigned long lastValidCommandMs = 0;
@@ -114,51 +123,63 @@ uint16_t crc16Ccitt(const uint8_t *data, size_t size) {
 }
 
 void sendReadyPacket() {
-  uint8_t packet[6] = {
-      PACKET_MAGIC_0, PACKET_MAGIC_1, PACKET_VERSION, READY_PACKET_TYPE, 0, 0};
-  const uint16_t crc = crc16Ccitt(packet + 2, 2);
-  packet[4] = static_cast<uint8_t>(crc & 0xFF);
-  packet[5] = static_cast<uint8_t>(crc >> 8);
+  uint8_t packet[PROTOCOL_V2_READY_REPLY_SIZE_BYTES] = {
+      PROTOCOL_V2_SYNC_BYTE_0, PROTOCOL_V2_SYNC_BYTE_1,
+      PROTOCOL_V2_READY_REPLY_TYPE, 0, 0};
+  const uint16_t crc = crc16Ccitt(packet + 2, 1);
+  packet[PROTOCOL_V2_READY_REPLY_SIZE_BYTES -
+         PROTOCOL_V2_COMMAND_CRC_SIZE_BYTES] = static_cast<uint8_t>(crc & 0xFF);
+  packet[PROTOCOL_V2_READY_REPLY_SIZE_BYTES - 1] =
+      static_cast<uint8_t>(crc >> 8);
   Serial.write(packet, sizeof(packet));
 }
 
-void sendErrorPacket(ErrorCode errorCode, uint8_t detail) {
-  uint8_t packet[8] = {PACKET_MAGIC_0, PACKET_MAGIC_1, PACKET_VERSION,
-                       ERROR_PACKET_TYPE, static_cast<uint8_t>(errorCode),
-                       detail, 0, 0};
-  const uint16_t crc = crc16Ccitt(packet + 2, 4);
-  packet[6] = static_cast<uint8_t>(crc & 0xFF);
-  packet[7] = static_cast<uint8_t>(crc >> 8);
+void sendErrorPacket(ProtocolV2ErrorCode errorCode, uint8_t detail) {
+  uint8_t packet[PROTOCOL_V2_ERROR_REPLY_SIZE_BYTES] = {
+      PROTOCOL_V2_SYNC_BYTE_0, PROTOCOL_V2_SYNC_BYTE_1,
+      PROTOCOL_V2_ERROR_REPLY_TYPE, static_cast<uint8_t>(errorCode), detail,
+      0, 0};
+  const uint16_t crc = crc16Ccitt(packet + 2, 3);
+  packet[PROTOCOL_V2_ERROR_REPLY_SIZE_BYTES -
+         PROTOCOL_V2_COMMAND_CRC_SIZE_BYTES] = static_cast<uint8_t>(crc & 0xFF);
+  packet[PROTOCOL_V2_ERROR_REPLY_SIZE_BYTES - 1] =
+      static_cast<uint8_t>(crc >> 8);
   Serial.write(packet, sizeof(packet));
 }
 
 void neutralizeThrusters() {
-  for (uint8_t i = 0; i < PINS_COUNT; ++i)
-    writeThrusterMicroseconds(i, PULSE_WIDTH_NEUTRAL);
+  for (uint8_t i = 0; i < PROTEUS_THRUSTER_COUNT; ++i)
+    writeThrusterMicroseconds(i, PROTEUS_PULSE_WIDTH_NEUTRAL_US);
 }
 
 void applyThrusterPacket() {
-  const uint8_t count = packetBuffer[3];
+  const uint8_t count = packetBuffer[2];
   const uint16_t receivedCrc = readU16LE(packetBuffer + expectedPacketLength - 2);
   const uint16_t calculatedCrc = crc16Ccitt(packetBuffer + 2, expectedPacketLength - 4);
   if (receivedCrc != calculatedCrc) {
-    sendErrorPacket(ErrorCode::InvalidCrc, 0);
+    neutralizeThrusters();
+    sendErrorPacket(ProtocolV2ErrorCode::InvalidCrc, 0);
     return;
   }
 
-  float thrustValues[PINS_COUNT] = {};
+  float thrustValues[PROTEUS_THRUSTER_COUNT] = {};
   for (uint8_t i = 0; i < count; ++i) {
-    const float thrust = readF32LE(packetBuffer + 4 + FLOAT32_SIZE * i);
-    if (!isfinite(thrust)) {
-      sendErrorPacket(ErrorCode::InvalidValue, i);
+    const float thrust = readF32LE(
+        packetBuffer + PROTOCOL_V2_COMMAND_HEADER_SIZE_BYTES +
+        PROTOCOL_V2_FLOAT32_SIZE_BYTES * i);
+    if (!isfinite(thrust) || thrust < PROTEUS_COMMAND_MIN ||
+        thrust > PROTEUS_COMMAND_MAX) {
+      neutralizeThrusters();
+      sendErrorPacket(ProtocolV2ErrorCode::InvalidValue, i);
       return;
     }
     thrustValues[i] = thrust;
   }
 
   for (uint8_t i = 0; i < count; ++i) {
-    const long pulseWidth = PULSE_WIDTH_NEUTRAL +
-                            lroundf(PULSE_WIDTH_DELTA * thrustValues[i]);
+    const long pulseWidth = PROTEUS_PULSE_WIDTH_NEUTRAL_US +
+                            lroundf(PROTEUS_PULSE_WIDTH_DELTA_US *
+                                    thrustValues[i]);
     writeThrusterMicroseconds(i, pulseWidth);
   }
   lastValidCommandMs = millis();
@@ -168,35 +189,32 @@ void applyThrusterPacket() {
 
 void consumeSerialByte(uint8_t value) {
   if (packetLength == 0) {
-    if (value == PACKET_MAGIC_0)
+    if (value == PROTOCOL_V2_SYNC_BYTE_0)
       packetBuffer[packetLength++] = value;
     return;
   }
 
   if (packetLength == 1) {
-    if (value == PACKET_MAGIC_1)
+    if (value == PROTOCOL_V2_SYNC_BYTE_1)
       packetBuffer[packetLength++] = value;
-    else if (value != PACKET_MAGIC_0)
+    else if (value != PROTOCOL_V2_SYNC_BYTE_0)
       packetLength = 0;
     return;
   }
 
   packetBuffer[packetLength++] = value;
-  if (packetLength == 4) {
-    const uint8_t count = packetBuffer[3];
-    if (packetBuffer[2] != PACKET_VERSION) {
-      sendErrorPacket(ErrorCode::UnsupportedVersion, packetBuffer[2]);
+  if (packetLength == PROTOCOL_V2_COMMAND_HEADER_SIZE_BYTES) {
+    const uint8_t count = packetBuffer[2];
+    if (count != PROTEUS_THRUSTER_COUNT) {
+      neutralizeThrusters();
+      sendErrorPacket(ProtocolV2ErrorCode::InvalidCount, count);
       packetLength = 0;
       expectedPacketLength = 0;
       return;
     }
-    if (count > PINS_COUNT) {
-      sendErrorPacket(ErrorCode::InvalidCount, count);
-      packetLength = 0;
-      expectedPacketLength = 0;
-      return;
-    }
-    expectedPacketLength = 6 + FLOAT32_SIZE * count;
+    expectedPacketLength = PROTOCOL_V2_COMMAND_HEADER_SIZE_BYTES +
+                           PROTOCOL_V2_FLOAT32_SIZE_BYTES * count +
+                           PROTOCOL_V2_COMMAND_CRC_SIZE_BYTES;
   }
 
   if (expectedPacketLength != 0 && packetLength == expectedPacketLength) {
@@ -207,11 +225,11 @@ void consumeSerialByte(uint8_t value) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(PROTOCOL_V2_SERIAL_BAUD_RATE);
 
-  for (uint8_t i = 0; i < PINS_COUNT; ++i) {
-    pinMode(PINS[i], OUTPUT);
-    writeThrusterMicroseconds(i, PULSE_WIDTH_NEUTRAL);
+  for (uint8_t i = 0; i < PROTEUS_THRUSTER_COUNT; ++i) {
+    pinMode(PROTEUS_THRUSTER_PINS[i], OUTPUT);
+    writeThrusterMicroseconds(i, PROTEUS_PULSE_WIDTH_NEUTRAL_US);
   }
 
   // Timer1 runs at 2 MHz (16 MHz / 8). Its compare interrupt raises each
@@ -235,9 +253,12 @@ void serialEvent() {
 
 void loop() {
   if (receivedCommand && !watchdogTripped &&
-      millis() - lastValidCommandMs >= COMMAND_TIMEOUT_MS) {
+      millis() - lastValidCommandMs >= PROTOCOL_V2_COMMAND_TIMEOUT_MS) {
     neutralizeThrusters();
+    // Discard an incomplete stale frame so the next valid command can resume.
+    packetLength = 0;
+    expectedPacketLength = 0;
     watchdogTripped = true;
-    sendErrorPacket(ErrorCode::CommandTimeout, 0);
+    sendErrorPacket(ProtocolV2ErrorCode::CommandTimeout, 0);
   }
 }

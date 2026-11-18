@@ -1,6 +1,7 @@
 const std = @import("std");
 const rl = @import("raylib");
 const ui = @import("ui.zig");
+const RuntimePanel = @import("runtime_panel.zig");
 const MissionIO = @import("MissionIO");
 const MissionConfig = MissionIO.CompiledConfig;
 const math = MissionIO.Math;
@@ -29,7 +30,8 @@ const pid_slider_max = [_]f32{ 10, 2, 10 };
 
 const Config = struct {
     video_source: [:0]const u8,
-    mission_control: bool = false,
+    mission_control: bool = MissionConfig.startup_mission == .mission_control,
+    teleop_host: []const u8 = "127.0.0.1",
 };
 
 fn parseArgs(args: []const [:0]const u8) !Config {
@@ -41,11 +43,15 @@ fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingVideoSource;
             config.video_source = args[i];
+        } else if (std.mem.eql(u8, arg, "--teleop-host")) {
+            i += 1;
+            if (i >= args.len) return error.MissingTeleopHost;
+            config.teleop_host = args[i];
         } else if (std.mem.eql(u8, arg, "--mission-control")) {
             config.mission_control = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
-                "usage: viewer [--video source|none] [--mission-control]\n",
+                "usage: viewer [--video source|none] [--teleop-host IP] [--mission-control]\n",
                 .{},
             );
             return error.HelpRequested;
@@ -229,9 +235,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("viewer argument error: {s}\n", .{@errorName(err)});
         return err;
     };
-    const compiled_config = MissionConfig.compiledProfile(MissionConfig.viewer_profile);
-    const telemetry_shm_name = compiled_config.telemetryShmName() catch "";
-    const telemetry_addr = compiled_config.telemetryAddr() catch "";
+    var observed_config = MissionConfig.startup_config;
+    const compiled_config = &observed_config;
+    var telemetry_shm_name = compiled_config.telemetryShmName() catch "";
+    var telemetry_addr = compiled_config.telemetryAddr() catch "";
 
     var subscriber: ?MissionIO.TelemetrySubscriber = null;
     defer if (subscriber) |*value| value.deinit();
@@ -251,9 +258,10 @@ pub fn main(init: std.process.Init) !void {
 
     const teleop_dest = blk: {
         var address_buf: [48]u8 = undefined;
-        const text = try std.fmt.bufPrint(&address_buf, "127.0.0.1:{d}", .{compiled_config.teleop_port});
+        const text = try std.fmt.bufPrint(&address_buf, "{s}:{d}", .{ config.teleop_host, compiled_config.teleop_port });
         break :blk try Io.net.IpAddress.parseLiteral(text);
     };
+    var runtime_panel: RuntimePanel = .{};
     var config_packet = MissionIO.LiveConfigPacket.fromRuntimeConfig(compiled_config);
     const teleop_bind: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
     var teleop_socket: ?Io.net.Socket = teleop_bind.bind(init.io, .{ .mode = .dgram, .protocol = .udp }) catch null;
@@ -319,6 +327,8 @@ pub fn main(init: std.process.Init) !void {
     var mission_look_pitch: f32 = 0;
     var mission_object_class: u8 = 0;
     var mission_control = config.mission_control;
+    var chosen_mission = MissionConfig.startup_mission;
+    var dropdown_open = false;
     var workspace: ui.Workspace = if (config.mission_control) .mission else .operation;
     var font_percent: u8 = 100;
     var mission_sent = false;
@@ -341,22 +351,69 @@ pub fn main(init: std.process.Init) !void {
     while (!rl.windowShouldClose()) {
         telemetry = &udp_telemetry;
         const now = rl.getTime();
+        if (teleop_socket) |*socket| {
+            if (runtime_panel.update(init.io, socket, &teleop_dest, &config_packet)) {
+                const old = observed_config;
+                config_packet.applyToRuntimeConfig(&observed_config);
+                if (!dropdown_open) chosen_mission = observed_config.mission_id;
+                if (old.mission_id != observed_config.mission_id) mission_control = observed_config.mission_id == .mission_control;
+                const endpoint_changed = old.telemetry_transport != observed_config.telemetry_transport or
+                    !MissionConfig.textEqual(old.telemetry_addr, observed_config.telemetry_addr) or
+                    !MissionConfig.textEqual(old.telemetry_shm_name, observed_config.telemetry_shm_name);
+                if (endpoint_changed) {
+                    if (subscriber) |*value| value.deinit();
+                    subscriber = null;
+                    if (udp_socket) |*value| value.close(init.io);
+                    udp_socket = null;
+                    telemetry_shm_name = compiled_config.telemetryShmName() catch "";
+                    telemetry_addr = compiled_config.telemetryAddr() catch "";
+                    if (observed_config.telemetry_transport == .udp) {
+                        if (Io.net.IpAddress.parseLiteral(telemetry_addr)) |address| {
+                            udp_socket = address.bind(init.io, .{ .mode = .dgram, .protocol = .udp }) catch null;
+                        } else |_| {}
+                    }
+                    last_packet = -1;
+                    last_source_try = -10;
+                    last_timestamp = null;
+                }
+            }
+        }
+
         const layout = ui.Layout.init(@floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()), read_video);
         if (rl.isKeyPressed(.equal) or rl.isKeyPressed(.kp_add)) font_percent = ui.adjustFontPercent(font_percent, 5);
         if (rl.isKeyPressed(.minus) or rl.isKeyPressed(.kp_subtract)) font_percent = ui.adjustFontPercent(font_percent, -5);
         if (rl.isKeyPressed(.zero)) font_percent = 100;
-        if (rl.isKeyPressed(.one)) workspace = .operation;
-        if (rl.isKeyPressed(.two)) workspace = .mission;
-        if (rl.isKeyPressed(.three)) workspace = .tuning;
+        if (runtime_panel.editing == null and rl.isKeyPressed(.one)) workspace = .operation;
+        if (runtime_panel.editing == null and rl.isKeyPressed(.two)) workspace = .mission;
+        if (runtime_panel.editing == null and rl.isKeyPressed(.three)) workspace = .tuning;
+        if (runtime_panel.editing == null and rl.isKeyPressed(.four)) workspace = .runtime;
+        const menu_was_open = dropdown_open;
         if (rl.isMouseButtonPressed(.left)) {
             const mouse = rl.getMousePosition();
             if (rl.checkCollisionPointRec(mouse, layout.fontButton(false))) font_percent = ui.adjustFontPercent(font_percent, -5);
             if (rl.checkCollisionPointRec(mouse, layout.fontButton(true))) font_percent = ui.adjustFontPercent(font_percent, 5);
-            for (0..3) |i| if (rl.checkCollisionPointRec(rl.getMousePosition(), layout.navRect(i))) {
+            for (0..4) |i| if (rl.checkCollisionPointRec(rl.getMousePosition(), layout.navRect(i))) {
                 workspace = @fromBackingInt(@intCast(i));
                 pid_drag = null;
                 break;
             };
+            if (workspace != .runtime) {
+                if (dropdown_open) {
+                    for (0..@typeInfo(MissionConfig.MissionId).@"enum".field_names.len) |i| {
+                        if (rl.checkCollisionPointRec(mouse, layout.dropdownOption(i))) {
+                            chosen_mission = @fromBackingInt(@as(u8, @intCast(i)));
+                            break;
+                        }
+                    }
+                    dropdown_open = false;
+                } else if (rl.checkCollisionPointRec(mouse, layout.dropdownRect())) {
+                    dropdown_open = true;
+                } else if (rl.checkCollisionPointRec(mouse, layout.activateRect()) and runtime_panel.synchronized()) {
+                    var request = config_packet;
+                    request.mission_id = chosen_mission;
+                    runtime_panel.queueConfig(request);
+                }
+            }
         }
         const view3d = layout.sceneContent(if (workspace == .mission) .mission else .operation);
         const next_w: i32 = @max(1, @as(i32, @intFromFloat(view3d.width)));
@@ -475,7 +532,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        if (rl.isKeyPressed(.t)) {
+        if (workspace != .runtime and rl.isKeyPressed(.t)) {
             // Release any held teleoperation translation before leaving teleop mode.
             if (!mission_control) if (teleop_socket) |*socket| {
                 const neutral = encodeGoal(.{ 0, 0, 0, orientation[0], orientation[1], orientation[2], orientation[3] });
@@ -485,14 +542,18 @@ pub fn main(init: std.process.Init) !void {
                 translation = .{ 0, 0, 0 };
             };
             mission_control = !mission_control;
+            if (runtime_panel.synchronized()) {
+                config_packet.mission_id = if (mission_control) .mission_control else .teleop;
+                runtime_panel.queueConfig(config_packet);
+            }
             if (mission_control) mission_target_initialized = false;
             std.debug.print(
                 "control mode: {s}\n",
                 .{if (mission_control) "mission-control" else "teleop"},
             );
         }
-        const focused = rl.isWindowFocused();
-        const mouse_click = focused and workspace == .mission and rl.isMouseButtonPressed(.left);
+        const focused = rl.isWindowFocused() and workspace != .runtime and !dropdown_open and !menu_was_open;
+        const mouse_click = focused and rl.isMouseButtonPressed(.left);
         if (mouse_click and mission_control) {
             if (rl.checkCollisionPointRec(rl.getMousePosition(), layout.missionButton(0))) mission_kind = .point;
             if (rl.checkCollisionPointRec(rl.getMousePosition(), layout.missionButton(1))) mission_kind = .object;
@@ -503,7 +564,7 @@ pub fn main(init: std.process.Init) !void {
             mission_target_initialized = true;
         }
 
-        if (mission_control and focused and workspace == .mission) {
+        if (mission_control and focused) {
             if (rl.isKeyPressed(.p)) mission_kind = .point;
             if (rl.isKeyPressed(.o)) mission_kind = .object;
             if (rl.isKeyPressed(.m)) mission_maneuver = .move;
@@ -533,7 +594,7 @@ pub fn main(init: std.process.Init) !void {
             };
 
             const clicked_send = mouse_click and rl.checkCollisionPointRec(rl.getMousePosition(), layout.sendButton());
-            if (workspace == .mission and (rl.isKeyPressed(.enter) or clicked_send) and teleop_socket != null and (mission_kind != .point or (mission_target_initialized and last_packet >= 0 and now - last_packet <= 1))) {
+            if ((rl.isKeyPressed(.enter) or clicked_send) and teleop_socket != null and (mission_kind != .point or (mission_target_initialized and last_packet >= 0 and now - last_packet <= 1))) {
                 const command: MissionIO.MissionCommand = switch (mission_kind) {
                     .point => .{
                         .kind = .point,
@@ -588,7 +649,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        if (!mission_control and focused and workspace == .tuning) {
+        if (!mission_control and focused) {
             if (rl.isKeyPressed(.q)) {
                 tune_selection = (tune_selection + tune_names.len - 1) % tune_names.len;
             }
@@ -598,7 +659,11 @@ pub fn main(init: std.process.Init) !void {
         }
 
         var tune_changed = false;
-        if (focused and workspace == .tuning and rl.isMouseButtonPressed(.left)) {
+        if (focused and runtime_panel.synchronized() and rl.isMouseButtonPressed(.left) and rl.checkCollisionPointRec(rl.getMousePosition(), layout.resetPidRect())) {
+            for (0..tune_names.len) |i| tuningValue(&config_packet, i).* = 0;
+            tune_changed = true;
+        }
+        if (focused and rl.isMouseButtonPressed(.left)) {
             const mouse = rl.getMousePosition();
             for (0..tune_names.len) |index| {
                 if (rl.checkCollisionPointRec(mouse, layout.pidRect(index))) {
@@ -608,7 +673,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
-        if (!focused or workspace != .tuning or !rl.isMouseButtonDown(.left)) pid_drag = null;
+        if (!focused or !rl.isMouseButtonDown(.left)) pid_drag = null;
         if (pid_drag) |index| {
             if (now - last_tune_adjust >= tune_period) {
                 const value = pidSliderValue(index, rl.getMousePosition().x, layout);
@@ -620,7 +685,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
-        if (focused and workspace == .tuning and now - last_tune_adjust >= tune_period) {
+        if (focused and now - last_tune_adjust >= tune_period) {
             var delta: f32 = 0;
             if (rl.isKeyDown(.z)) delta -= tune_step;
             if (rl.isKeyDown(.x)) delta += tune_step;
@@ -630,14 +695,10 @@ pub fn main(init: std.process.Init) !void {
                 tune_changed = true;
             }
         }
-        if (tune_changed and teleop_socket != null) {
-            if (sendTuning(init.io, &teleop_socket.?, &teleop_dest, config_packet)) |_| {
-                tune_error_logged = false;
-                tune_sent = true;
-            } else |_| {
-                if (!tune_error_logged) std.debug.print("live tuning send failed\n", .{});
-                tune_error_logged = true;
-            }
+        if (tune_changed and teleop_socket != null and runtime_panel.synchronized()) {
+            runtime_panel.queueConfig(config_packet);
+            tune_error_logged = false;
+            tune_sent = true;
         }
 
         if (focused and workspace != .tuning and rl.checkCollisionPointRec(rl.getMousePosition(), view3d)) {
@@ -736,7 +797,11 @@ pub fn main(init: std.process.Init) !void {
             .video_h = video_h,
             .scene = scene,
             .mission_control = mission_control,
-            .socket_ok = teleop_socket != null,
+            .chosen_mission = chosen_mission,
+            .active_mission = if (runtime_panel.status) |status| if (status.active) status.active_config.mission_id else null else null,
+            .dropdown_open = dropdown_open,
+            .runtime_switch_pending = runtime_panel.pending_config != null,
+            .socket_ok = teleop_socket != null and runtime_panel.synchronized(),
             .send_error = teleop_error_logged or mission_error_logged or tune_error_logged,
             .translation = translation,
             .orientation = orientation,
@@ -753,6 +818,7 @@ pub fn main(init: std.process.Init) !void {
             .object_scroll = object_scroll,
             .goal_scroll = goal_scroll,
         });
+        if (workspace == .runtime) runtime_panel.draw(font, layout.content, &config_packet, telemetry, telemetry_status == .live);
         rl.endDrawing();
     }
 }

@@ -1,81 +1,51 @@
 # Autonomy
 
-Zig-based AUV runtime, missions, telemetry, viewer, and simulator plugins.
-
-## Dependencies
-
-All commands need Zig `0.17+`, a C/C++ toolchain, libc, `pkg-config`, and
-network access on the first build so Zig can fetch `raylib-zig`.
-
-Ubuntu packages used by the base build and tests:
+Requires Zig 0.17+, C/C++ toolchain, CMake, libc, pkg-config, and Python 3.
 
 ```sh
-sudo apt install build-essential pkg-config \
+sudo apt install build-essential pkg-config python3 \
+  cmake \
   libsdl2-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
   libxinerama-dev libxrandr-dev libxi-dev
 ```
 
-## Build and test
+## Build, test, run
 
 ```sh
 zig build
 zig build test
+zig build run
 ```
 
-Useful build options: `-Dzed`, `-Dstonefish`, `-Dviewer-zed`, and
-`-Dviewer-gstreamer`.
-
-## Run missions
-
-### Proteus/ZED
-
-Requires the ZED SDK and CUDA Toolkit. The default locations are
-`/usr/local/zed` and `/usr/local/cuda`; override them with
-`-Dzed-prefix=...` and `-Dcuda-prefix=...`.
+## Native simulator
 
 ```sh
-zig build -Dzed
-zig build -Dzed run -- \
-  ./zig-out/lib/libauv_proteus_hwd.so prequalify_coco proteus_hwd
+git submodule update --init vendor/mujoco
+zig build -Dsimulator
+zig build test -Dsimulator
+zig build run -Dsimulator
 ```
 
-### Stonefish
-
-Requires CMake `3.20+`, OpenMP, and development libraries for SDL2, FreeType,
-OpenGL, GLU, and Gomp. Stonefish itself is included under `vendor/stonefish`.
+## ZED sensor plugin
 
 ```sh
-sudo apt install cmake libfreetype6-dev libglu1-mesa-dev
-zig build -Dstonefish
-zig build -Dstonefish run -- \
-  ./zig-out/lib/libauv_stonefish_sim.so prequalify_robosub stonefish_sim
+zig build -Dzed \
+  -Dzed-prefix=/usr/local/zed \
+  -Dcuda-prefix=/usr/local/cuda
+zig build run -Dzed
 ```
 
 ## Viewer
-
-The default viewer requires a desktop OpenGL/X11 or Wayland environment and
-the raylib dependencies used by `raylib-zig`.
 
 ```sh
 zig build viewer
 ./zig-out/bin/viewer --video none
 ```
 
-### ZED video
-
-Requires the ZED SDK, CUDA Toolkit, and a C++ compiler. The defaults are the
-same `/usr/local/zed` and `/usr/local/cuda` locations used above.
-
 ```sh
 zig build viewer -Dviewer-zed
 ./zig-out/bin/viewer --video 127.0.0.1:5610
 ```
-
-### GStreamer RTP video
-
-Requires GStreamer development packages plus the RTP, H.264, video, and
-appsink plugins. Software decoding uses `avdec_h264`; `nvv4l2decoder` is
-optional hardware decoding on Jetson.
 
 ```sh
 sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -85,11 +55,15 @@ zig build viewer -Dviewer-gstreamer
 ./zig-out/bin/viewer --video rtp://0.0.0.0:5612
 ```
 
-## Teleop
-
-Requires SDL2 development files and a graphical desktop session.
+## Teleop sender
 
 ```sh
 zig build teleop-sender
 ./zig-out/bin/teleop_sender 8080
+```
+
+## Legacy Stonefish plugin
+
+```sh
+zig build -Dstonefish
 ```

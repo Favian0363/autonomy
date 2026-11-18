@@ -1,12 +1,15 @@
 #include <cmath>
 #include <cstdio>
 #include <math.h>
-#include <csignal>
 #include <cstdlib>
 #include "../../include/auv.h"
+#include <exception>
+#include <stdexcept>
+static AuvFrameError initialization_error{};
+static void sensor_init();
+static void sensor_read(AuvFrame *frame);
+static void sensor_close();
 
-#include "Stonefish/actuators/Actuator.h"
-#include "Stonefish/actuators/Thruster.h"
 #include "Stonefish/core/ConsoleSimulationApp.h"
 #include "Stonefish/core/GraphicalSimulationApp.h"
 #include "Stonefish/core/Robot.h"
@@ -34,6 +37,8 @@
 #include <unordered_map>
 #include <vector>
 
+static constexpr auto kFrameTimeout = std::chrono::seconds(1);
+static constexpr auto kFrameRetryInterval = std::chrono::milliseconds(1);
 
 static std::filesystem::path dataPath = "auvs/stonefish_sim/data/";
 static std::string scenario_file = "scenarios/hydrus_env.scn";
@@ -45,22 +50,6 @@ static constexpr auto kMinRenderInterval = std::chrono::milliseconds(16);
 static constexpr bool kConsoleApp = false;
 static sf::Scalar realtimeFactorCap = kRealtimeFactorCap;
 
-
-volatile std::sig_atomic_t g_stop_requested = 0;
-
-void requestStop(int)
-{
-    g_stop_requested = 1;
-}
-
-void stopIfRequested()
-{
-    if(g_stop_requested == 0)
-        return;
-    std::cerr << "[stonefish_sim] interrupted; shutting down" << std::endl;
-    auv_deinit();
-    std::exit(130);
-}
 
 namespace
 {
@@ -347,25 +336,6 @@ public:
             body->setCollisionFlags(body->getCollisionFlags() | btCollisionObject::CF_NO_CONTACT_RESPONSE);
         }
 
-        thrusters.clear();
-        sf::Robot* robot = getRobot(0u);
-        if(robot == nullptr)
-        {
-            std::cout << "[stonefish_sim] no robot in scenario; thrusters will not run\n";
-            return;
-        }
-        for(size_t i = 0; sf::Actuator* actuator = robot->getActuator(i); ++i)
-        {
-            if(actuator->getType() != sf::ActuatorType::THRUSTER)
-                continue;
-            thrusters.push_back(static_cast<sf::Thruster*>(actuator));
-        }
-    }
-
-    void setThrustorValues(const float* thrustor_values, uint8_t thrustor_values_len)
-    {
-        for(uint8_t i = 0; i < thrustor_values_len; ++i)
-            thrusters[i]->setSetpoint(thrustor_values[i]);
     }
 
     AuvFrame getAuvFrame()
@@ -445,7 +415,6 @@ public:
     float focal_px = 0.f;
     bool logged_tracking_loss = false;
     std::vector<TrackedObject> tracked_objects;
-    std::vector<sf::Thruster*> thrusters;
 };
 
 class SimApp : public sf::GraphicalSimulationApp
@@ -607,11 +576,9 @@ sf::HelperSettings DefaultHelperSettings()
 }
 }
 
-void auv_init(void)
+static void sensor_init(void)
 {
-    g_stop_requested = 0;
-    std::signal(SIGINT, requestStop);
-    auv_deinit();
+    sensor_close();
 
     g_simulation_context = new SimulationContext();
     g_simulation_context->sim = new SimManager(kStepsPerSecond, dataPath / scenario_file);
@@ -630,10 +597,9 @@ void auv_init(void)
     }
 }
 
-void auv_yield_until_next_frame(AuvFrame* frame)
+static void sensor_read(AuvFrame* frame)
 {
 
-    stopIfRequested();
     if(g_simulation_context == nullptr)
         return;
 
@@ -650,22 +616,17 @@ void auv_yield_until_next_frame(AuvFrame* frame)
     if(finished)
     {
         std::cerr << "[stonefish_sim] simulation finished; restart for another run\n";
-        auv_deinit();
-        std::exit(0);
+        sensor_close();
+        throw std::runtime_error("simulation finished");
     }
     *frame = g_simulation_context->sim->getAuvFrame();
 }
 
 
 
-void auv_set_thrustor_values(const float* thrustor_values, uint8_t thrustor_values_len)
-{
-    if(g_simulation_context == nullptr)
-        return;
-    g_simulation_context->sim->setThrustorValues(thrustor_values, thrustor_values_len); 
-}
 
-void auv_deinit(void)
+
+static void sensor_close(void)
 {
     if(g_simulation_context == nullptr)
         return;
@@ -684,4 +645,53 @@ void auv_deinit(void)
 
     delete g_simulation_context;
     g_simulation_context = nullptr;
+}
+
+// SDK calls run directly on the mission thread. Control is polled between calls
+// by the host. Frame deadlines are measured here; SDK calls can still block.
+void auv_init(void) {
+  initialization_error = {};
+  try {
+    sensor_init();
+  } catch (const std::exception &e) {
+    initialization_error.code = AUV_FRAME_ERROR_INITIALIZATION;
+    std::snprintf(initialization_error.message, sizeof(initialization_error.message), "%s", e.what());
+  } catch (...) {
+    initialization_error.code = AUV_FRAME_ERROR_INITIALIZATION;
+    std::snprintf(initialization_error.message, sizeof(initialization_error.message), "unexpected sensor initialization exception");
+  }
+}
+void auv_yield_until_next_frame(AuvFrame *frame) {
+  *frame = {};
+  if (initialization_error.code != AUV_FRAME_ERROR_NONE) {
+    frame->frame_error = initialization_error;
+    return;
+  }
+  try {
+    const auto started = std::chrono::steady_clock::now();
+    while (true) {
+      if (std::chrono::steady_clock::now() - started >= kFrameTimeout) break;
+      sensor_read(frame);
+      if (frame->frame_error.code != AUV_FRAME_ERROR_NONE) return;
+      if (std::chrono::steady_clock::now() - started >= kFrameTimeout) break;
+      if (frame->timestamp) return;
+      std::this_thread::sleep_for(kFrameRetryInterval);
+    }
+    frame->frame_error.code = AUV_FRAME_ERROR_TIMEOUT;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message),
+                  "Stonefish frame timed out after %lld ms",
+                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(kFrameTimeout).count()));
+  } catch (const std::exception &e) {
+    frame->frame_error.code = AUV_FRAME_ERROR_SENSOR;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "%s", e.what());
+  } catch (...) {
+    frame->frame_error.code = AUV_FRAME_ERROR_SENSOR;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "unexpected sensor frame exception");
+  }
+}
+void auv_deinit(void) {
+  try { sensor_close(); }
+  catch (const std::exception &e) { std::fprintf(stderr, "sensor cleanup: %s\n", e.what()); }
+  catch (...) { std::fputs("unexpected sensor cleanup exception\n", stderr); }
+  initialization_error = {};
 }

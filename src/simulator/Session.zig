@@ -1,0 +1,107 @@
+//! In-process simulation session. Sensor frames and command data share this owner.
+const std = @import("std");
+const Auv = @import("../Auv.zig");
+const Scene = @import("Scene.zig");
+const Runtime = @import("Runtime.zig");
+const robots = @import("robots.zig");
+const presets = @import("presets.zig");
+const self_capacity = @import("types.zig").max_thrusters;
+
+pub const Session = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scene: Scene,
+    runtime: Runtime,
+    commands: [self_capacity]f64 = @splat(0),
+    realtime: bool,
+    tam_len: usize,
+    failed: bool = false,
+    started: std.Io.Clock.Timestamp,
+    const frame_ticks = 6;
+
+    pub fn create(allocator: std.mem.Allocator, io: std.Io, robot_name: []const u8, scene: []const u8, tam_len: usize, realtime: bool) !*Self {
+        if (tam_len == 0 or tam_len > self_capacity) return error.InvalidThrusterCount;
+        const robot = robots.find(robot_name) orelse return error.UnknownSimRobot;
+        if (robot.thrusters.len != tam_len) return error.InvalidThrusterCount;
+
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .scene = try presets.create(allocator, scene, robot),
+            .runtime = undefined,
+            .realtime = realtime,
+            .tam_len = tam_len,
+            .started = undefined,
+        };
+        errdefer self.scene.deinit();
+        self.runtime = try Runtime.init(&self.scene);
+        self.rebaseClock();
+        return self;
+    }
+
+    pub fn destroy(self: *Self) void {
+        self.runtime.deinit();
+        self.scene.deinit();
+        self.allocator.destroy(self);
+    }
+
+    pub fn setThrusters(self: *Self, values: *const [self_capacity]f32) !void {
+        try self.checkHealth();
+        for (values[0..self.tam_len]) |v| if (!std.math.isFinite(v) or v < -1 or v > 1) return error.InvalidThrust;
+        for (values[0..self.tam_len], 0..) |v, i| self.commands[i] = v;
+    }
+
+    pub fn checkHealth(self: *Self) !void {
+        if (self.failed) return error.SimulationFailed;
+    }
+    pub fn rebaseClock(self: *Self) void {
+        self.started = .now(self.io, .awake);
+    }
+
+    pub fn timestamp(self: *const Self) u64 {
+        return @intCast(@as(u128, self.runtime.tick) * self.scene.settings.dt_numerator * 1_000_000_000 / self.scene.settings.dt_denominator);
+    }
+
+    fn step(self: *Self) !void {
+        try self.checkHealth();
+        self.runtime.step(self.commands[0..self.tam_len]) catch |err| {
+            std.log.warn("simulator step failed: {s}", .{@errorName(err)});
+            self.failed = true;
+            return error.SimulationFailed;
+        };
+    }
+
+    pub fn nextFrame(self: *Self, out: *Auv.Frame) !void {
+        errdefer self.failed = true;
+        for (0..frame_ticks) |_| try self.step();
+        if (self.realtime) {
+            const elapsed = self.started.untilNow(self.io).raw.toNanoseconds();
+            const delay = @as(i96, @intCast(self.timestamp())) - elapsed;
+            if (delay > 0) try std.Io.sleep(self.io, .fromNanoseconds(delay), .awake);
+        }
+        const observation = self.runtime.observation();
+        out.* = std.mem.zeroes(Auv.Frame);
+        out.timestamp = self.timestamp();
+        out.camera_pose = .{ .pos = observation.body.pos, .quat = observation.body.quat };
+        out.position_ok = .{ .x = observation.position_axes & 1 != 0, .y = observation.position_axes & 2 != 0, .z = observation.position_axes & 4 != 0 };
+        out.attitude_ok = .{ .x = observation.attitude_axes & 1 != 0, .y = observation.attitude_axes & 2 != 0, .z = observation.attitude_axes & 4 != 0 };
+        out.imu_quat = observation.imu;
+        out.accel = observation.accel;
+        out.gyro = observation.gyro;
+        out.pressure_depth = @floatCast(observation.depth);
+        out.pressure_depth_ok = observation.depth_ok;
+        out.image_width = observation.image_width;
+        out.image_height = observation.image_height;
+        for (observation.objects[0..@min(observation.objects.len, Auv.Frame.max_objects)], 0..) |object, i| {
+            if (object.cls > 255) return error.InvalidObjectClass;
+            out.objects[i] = .{ .bbox = .{ .pose = .{ .pos = object.pose.pos, .quat = object.pose.quat }, .size = object.size }, .id = object.id, .cls = @intCast(object.cls) };
+            out.objects2d[i] = .{ .top_left = .{ .x = object.x0, .y = object.y0 }, .bottom_right = .{ .x = object.x1, .y = object.y1 }, .id = object.id, .cls = @intCast(object.cls) };
+            out.objects_len += 1;
+            out.objects2d_len += 1;
+        }
+    }
+};

@@ -5,58 +5,6 @@ const math = @import("math.zig");
 const Auv = @import("Auv.zig");
 const MissionConfig = @import("MissionConfig.zig");
 
-var stop_requested = std.atomic.Value(bool).init(false);
-
-fn requestStop() void {
-    stop_requested.store(true, .monotonic);
-}
-
-pub fn stopRequested() bool {
-    return stop_requested.load(.monotonic);
-}
-
-const windows_ctrl_c_event: u32 = 0;
-const windows_ctrl_break_event: u32 = 1;
-const windows_ctrl_close_event: u32 = 2;
-const windows_ctrl_logoff_event: u32 = 5;
-const windows_ctrl_shutdown_event: u32 = 6;
-
-fn windowsConsoleHandler(ctrl_type: u32) callconv(.winapi) std.os.windows.BOOL {
-    switch (ctrl_type) {
-        windows_ctrl_c_event,
-        windows_ctrl_break_event,
-        windows_ctrl_close_event,
-        windows_ctrl_logoff_event,
-        windows_ctrl_shutdown_event,
-        => requestStop(),
-        else => return .FALSE,
-    }
-    return .TRUE;
-}
-
-extern "kernel32" fn SetConsoleCtrlHandler(
-    handler: ?*const fn (u32) callconv(.winapi) std.os.windows.BOOL,
-    add: std.os.windows.BOOL,
-) callconv(.winapi) std.os.windows.BOOL;
-
-pub fn installStopHandlers() void {
-    if (builtin.os.tag == .windows) {
-        _ = SetConsoleCtrlHandler(&windowsConsoleHandler, .TRUE);
-    } else {
-        const stop: std.posix.Sigaction = .{
-            .handler = .{ .handler = struct {
-                fn handle(_: std.posix.SIG) callconv(.c) void {
-                    requestStop();
-                }
-            }.handle },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        std.posix.sigaction(.INT, &stop, null);
-        std.posix.sigaction(.TERM, &stop, null);
-    }
-}
-
 const SharedMemory = struct {
     const is_windows = builtin.os.tag == .windows;
     const page_alignment = std.heap.page_size_min;
@@ -447,11 +395,7 @@ pub const MissionDiynLoader = struct {
             .yield_until_next_frame_impl = loader.dynlib.lookup(
                 *const Auv.YieldUntilNextFrameFunc,
                 "auv_yield_until_next_frame",
-            ) orelse return error.MissingAuvYieldNextFrame,
-            .set_thrustor_values_impl = loader.dynlib.lookup(
-                *const Auv.SetThrustorValuesFunc,
-                "auv_set_thrustor_values",
-            ) orelse return error.MissingAuvSetThrustorsInput,
+            ) orelse return error.MissingAuvYieldUntilNextFrame,
             .deinit_impl = loader.dynlib.lookup(
                 *const Auv.DeinitFunc,
                 "auv_deinit",
@@ -481,7 +425,18 @@ pub const LiveConfigPacket = struct {
     telemetry_shm_name: MissionConfig.FixedText(MissionConfig.telemetry_shm_name_max),
     telemetry_log_path: MissionConfig.FixedText(MissionConfig.telemetry_log_path_max),
 
-    const wire_version_value: u16 = 3;
+    mission_id: MissionConfig.MissionId,
+    mission_profile: MissionConfig.MissionProfileId,
+    sensor_source: MissionConfig.SensorSource,
+    sensor_library: MissionConfig.FixedText(MissionConfig.path_max),
+    serial_port: MissionConfig.FixedText(MissionConfig.path_max),
+    sim_robot: MissionConfig.FixedText(MissionConfig.name_max),
+    sim_scene: MissionConfig.FixedText(MissionConfig.name_max),
+    sim_realtime: bool,
+
+    revision: u64 = 0,
+
+    const wire_version_value: u16 = 4;
     const magic_value: [4]u8 = "MCF1".*;
 
     const DecodeError = error{
@@ -500,13 +455,14 @@ pub const LiveConfigPacket = struct {
         NonFinite,
     };
 
-    fn decode(buf: []const u8) DecodeError!LiveConfigPacket {
+    pub fn decode(buf: []const u8) DecodeError!LiveConfigPacket {
         if (buf.len < 4 + 2) return error.BufferTooShort;
         if (!std.mem.eql(u8, buf[0..4], &magic_value)) return error.BadMagic;
         const version = std.mem.readInt(u16, buf[4..6], .little);
         if (version != wire_version_value) return error.UnsupportedWireVersion;
 
         const parsed = SerialBinary.readFromBuffer(LiveConfigPacket, buf) catch return error.BufferTooShort;
+        if (parsed.consumed != buf.len) return error.TooLong;
         if (!std.mem.eql(u8, &parsed.value.magic, &magic_value)) return error.BadMagic;
         if (parsed.value.wire_version != wire_version_value) return error.UnsupportedWireVersion;
         return parsed.value;
@@ -543,11 +499,18 @@ pub const LiveConfigPacket = struct {
         }
     }
 
-    fn validate(packet: *const LiveConfigPacket) ValidateError!void {
+    pub fn validate(packet: *const LiveConfigPacket) !void {
         if (packet.tam_len == 0 or packet.tam_len > MissionConfig.thruster_count)
             return error.InvalidTamLen;
         if (packet.queue_capacity == 0 or packet.queue_capacity > MissionConfig.queue_capacity_max)
             return error.InvalidQueueCapacity;
+        var forward_energy: f32 = 0;
+        for (packet.camera_forward) |value| {
+            try requireFinite(value);
+            forward_energy += value * value;
+        }
+        if (!std.math.isFinite(forward_energy) or forward_energy <= 1e-12) return error.NonFinite;
+        for (packet.rotation_limit) |value| if (std.math.isNan(value) or value < 0) return error.NonFinite;
         try validateTam(&packet.tam, packet.tam_len);
         try validateOdometry(&packet.odometry);
         try validateIbvs(&packet.ibvs);
@@ -565,12 +528,23 @@ pub const LiveConfigPacket = struct {
             .stdout => {},
         }
         _ = try packet.telemetry_log_path.slice();
+        var config = MissionConfig.compiledProfile(packet.mission_profile).*;
+        packet.applyToRuntimeConfig(&config);
+        try config.validate();
     }
 
     pub fn fromRuntimeConfig(config: *const MissionConfig.MissionConfig) LiveConfigPacket {
         return .{
             .magic = magic_value,
             .wire_version = wire_version_value,
+            .mission_id = config.mission_id,
+            .mission_profile = config.mission_profile,
+            .sensor_source = config.sensor_source,
+            .sensor_library = config.sensor_library,
+            .serial_port = config.serial_port,
+            .sim_robot = config.sim_robot,
+            .sim_scene = config.sim_scene,
+            .sim_realtime = config.sim_realtime,
             .camera_forward = config.camera_forward,
             .rotation_limit = config.rotation_limit,
             .tam = config.tam,
@@ -590,9 +564,17 @@ pub const LiveConfigPacket = struct {
         };
     }
 
-    fn applyToRuntimeConfig(dst: *MissionConfig.MissionConfig, packet: LiveConfigPacket) void {
+    pub fn applyToRuntimeConfig(packet: LiveConfigPacket, dst: *MissionConfig.MissionConfig) void {
         const teleop_port = dst.teleop_port;
 
+        dst.mission_id = packet.mission_id;
+        dst.mission_profile = packet.mission_profile;
+        dst.sensor_source = packet.sensor_source;
+        dst.sensor_library = packet.sensor_library;
+        dst.serial_port = packet.serial_port;
+        dst.sim_robot = packet.sim_robot;
+        dst.sim_scene = packet.sim_scene;
+        dst.sim_realtime = packet.sim_realtime;
         dst.camera_forward = packet.camera_forward;
         dst.rotation_limit = packet.rotation_limit;
         dst.tam = packet.tam;
@@ -706,7 +688,6 @@ pub const TelemetryFrame = extern struct {
     attitude_error: [3]f32,
     rotation_limit: [3]f32,
     input: [6]f32,
-
 };
 
 fn layoutMix(h: u64, value: usize) u64 {
@@ -784,7 +765,7 @@ comptime {
     // LiveConfigPacket is serialized field-by-field by SerialBinary. Keep
     // these anchors in order when changing the control wire schema.
     const live_fields = @typeInfo(LiveConfigPacket).@"struct".field_names;
-    if (live_fields.len != 18 or
+    if (live_fields.len != 27 or
         !std.mem.eql(u8, live_fields[2], "camera_forward") or
         !std.mem.eql(u8, live_fields[14], "telemetry_transport") or
         !std.mem.eql(u8, live_fields[17], "telemetry_log_path"))
@@ -1191,6 +1172,16 @@ pub fn decodeTelemetryFrame(buf: []const u8, frame: *TelemetryFrame) !void {
         return error.InvalidTelemetryLengths;
 }
 
+/// Direct command sent over the control socket; values use the active TAM order.
+pub const ThrusterCommand = struct {
+    magic: [4]u8 = "AUT1".*,
+    run_id: u64,
+    client_id: u64,
+    sequence: u64,
+    count: u8,
+    values: [MissionConfig.thruster_count]f32,
+};
+
 pub const TeleopCommand = struct {
     translation: [3]f32,
     orientation: [4]f32,
@@ -1268,6 +1259,22 @@ const mission_command_magic: [4]u8 = "AUM1".*;
 const mission_command_wire_version: u16 = 1;
 
 pub const Telemetry = struct {
+    state: RuntimeState = .idle,
+    result: RuntimeResult = .none,
+    revision: u64 = 1,
+    last_error: MissionConfig.FixedText(256) = .{},
+    telemetry_error: MissionConfig.FixedText(256) = .{},
+    run_id: u64 = 0,
+    direct_command: ?ThrusterCommand = null,
+    direct_last_received: ?Io.Clock.Timestamp = null,
+    teleop_command: ?TeleopCommand = null,
+    mission_command: ?MissionCommand = null,
+    pending_lifecycle: ?error{ MissionRestart, MissionStopped } = null,
+    accepted_client_id: u64 = 0,
+    accepted_request_id: u64 = 0,
+    clients: [16]struct { id: u64 = 0, request: u64 = 0 } = @splat(.{}),
+    client_slot: usize = 0,
+
     publisher: TelemetryPublisher,
     log_file: ?Io.File,
     encoded_buf: [outbound_buf_len]u8 = undefined,
@@ -1275,14 +1282,8 @@ pub const Telemetry = struct {
     stdout_log_counter: u64 = 0,
     stdout_log_freq_div: u16,
     control_socket: Io.net.Socket = undefined,
-    teleop_command: ?TeleopCommand = null,
-    mission_command: ?MissionCommand = null,
-    live_config_packet: LiveConfigPacket = undefined,
-    initial_config_packet: LiveConfigPacket = undefined,
 
-    fn refreshLiveConfigPacket(self: *Telemetry, config: MissionConfig.MissionConfig) void {
-        self.live_config_packet = LiveConfigPacket.fromRuntimeConfig(&config);
-    }
+    initial_config_packet: LiveConfigPacket = undefined,
 
     pub fn init(_: std.mem.Allocator, io: Io, config: MissionConfig.MissionConfig) !Telemetry {
         var publisher = try TelemetryPublisher.init(io, config);
@@ -1306,14 +1307,13 @@ pub const Telemetry = struct {
             null;
         errdefer if (log_file) |file| file.close(io);
 
-        var telemetry: Telemetry = .{
+        const telemetry: Telemetry = .{
             .publisher = publisher,
             .log_file = log_file,
             .stdout_log_freq_div = config.log_freq_div,
             .control_socket = control_socket,
             .initial_config_packet = LiveConfigPacket.fromRuntimeConfig(&config),
         };
-        telemetry.refreshLiveConfigPacket(config);
         return telemetry;
     }
 
@@ -1324,39 +1324,42 @@ pub const Telemetry = struct {
         self.* = undefined;
     }
 
-    pub fn warnImmutableFields(self: *const Telemetry, config: MissionConfig.MissionConfig) void {
-        const initial_transport = self.initial_config_packet.telemetry_transport;
-        if (initial_transport == .udp or config.telemetry_transport == .udp) {
-            const init_telemetry = self.initial_config_packet.telemetry_addr.slice() catch "";
-            const new_telemetry = config.telemetryAddr() catch {
-                std.log.err("live config has invalid telemetry_addr", .{});
-                return;
-            };
-            if (!std.mem.eql(u8, new_telemetry, init_telemetry)) {
-                std.log.warn("config telemetry_addr changed; restart required", .{});
-            }
+    /// Replace outputs transactionally; the listener never changes ownership.
+    pub fn reconfigure(self: *Telemetry, io: Io, config: MissionConfig.MissionConfig) !void {
+        const previous = self.initial_config_packet;
+        const publisher_changed = config.telemetry_transport != previous.telemetry_transport or
+            (config.telemetry_transport == .udp and !MissionConfig.textEqual(config.telemetry_addr, previous.telemetry_addr)) or
+            (config.telemetry_transport == .shared_memory and !MissionConfig.textEqual(config.telemetry_shm_name, previous.telemetry_shm_name));
+        var replacement: ?TelemetryPublisher = if (publisher_changed) try TelemetryPublisher.init(io, config) else null;
+        errdefer if (replacement) |*publisher| publisher.deinit(io);
+        const log_changed = !MissionConfig.textEqual(config.telemetry_log_path, previous.telemetry_log_path);
+        const log_file: ?Io.File = if (log_changed) blk: {
+            if (try config.telemetryLogPath()) |path| break :blk try Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+            break :blk null;
+        } else self.log_file;
+        if (replacement) |publisher| {
+            self.publisher.deinit(io);
+            self.publisher = publisher;
         }
-        if (config.telemetry_transport != self.initial_config_packet.telemetry_transport) {
-            std.log.warn("config telemetry_transport changed; restart required", .{});
+        if (log_changed) {
+            if (self.log_file) |file| file.close(io);
+            self.log_file = log_file;
         }
-        if (initial_transport == .shared_memory or config.telemetry_transport == .shared_memory) {
-            const init_shm_name = self.initial_config_packet.telemetry_shm_name.slice() catch "";
-            const new_shm_name = config.telemetryShmName() catch {
-                std.log.err("live config has invalid telemetry_shm_name", .{});
-                return;
-            };
-            if (!std.mem.eql(u8, new_shm_name, init_shm_name)) {
-                std.log.warn("config telemetry_shm_name changed; restart required", .{});
-            }
-        }
-        const init_log_path = self.initial_config_packet.telemetry_log_path.slice() catch "";
-        const new_log_path = config.telemetryLogPath() catch {
-            std.log.err("live config has invalid telemetry_log_path", .{});
-            return;
-        } orelse "";
-        if (init_log_path.len != new_log_path.len or !std.mem.eql(u8, new_log_path, init_log_path)) {
-            std.log.warn("config telemetry_log_path changed; restart required", .{});
-        }
+        self.stdout_log_freq_div = config.log_freq_div;
+        self.initial_config_packet = LiveConfigPacket.fromRuntimeConfig(&config);
+    }
+
+    pub fn report(self: *Telemetry, err: anyerror) void {
+        const detail = if (err == error.SensorInitFailed or err == error.SensorFrameFailed) Auv.lastError() else "";
+        setText(&self.last_error, if (detail.len != 0) detail else @errorName(err));
+        std.log.err("mission: {s}", .{self.last_error.slice() catch @errorName(err)});
+    }
+
+    pub fn clearCommands(self: *Telemetry) void {
+        self.direct_command = null;
+        self.direct_last_received = null;
+        self.teleop_command = null;
+        self.mission_command = null;
     }
 
     pub fn takeTeleopCommand(self: *Telemetry) ?TeleopCommand {
@@ -1371,67 +1374,180 @@ pub const Telemetry = struct {
         return command;
     }
 
-    pub fn pollLiveConfig(
-        self: *Telemetry,
-        io: Io,
-        base: MissionConfig.MissionConfig,
-        print_stuff: bool,
-        merged_out: *MissionConfig.MissionConfig,
-    ) bool {
-        const timeout: std.Io.Timeout = .{ .duration = .{
-            .clock = .awake,
-            .raw = .fromNanoseconds(0),
-        } };
-        var recv_buf: [live_config_recv_buf_len]u8 = undefined;
-        var applied = false;
-        var working = base;
-        while (true) {
-            const msg = self.control_socket.receiveTimeout(io, &recv_buf, timeout) catch |err| switch (err) {
+    fn apply(self: *Telemetry, io: Io, current: *MissionConfig.MissionConfig, packet: LiveConfigPacket) !void {
+        try packet.validate();
+        if (packet.sensor_source != current.sensor_source) return error.SensorSourceIsCompiled;
+        if (packet.revision != self.revision) {
+            // A repeated accepted packet is an acknowledgment retry, not a new edit.
+            var current_packet = LiveConfigPacket.fromRuntimeConfig(current);
+            current_packet.revision = packet.revision;
+            if (std.meta.eql(packet, current_packet)) return;
+            return error.StaleConfig;
+        }
+        var next = current.*;
+        packet.applyToRuntimeConfig(&next);
+        const restart = !MissionConfig.MissionConfig.operationallyEqual(current, &next);
+        // Open replacement telemetry resources before committing the new config.
+        try self.reconfigure(io, next);
+        self.last_error = .{};
+        self.telemetry_error = .{};
+        current.* = next;
+        self.revision += 1;
+        if (restart) self.pending_lifecycle = error.MissionRestart;
+    }
+
+    fn acceptRequest(self: *Telemetry, request: RuntimeRequest) void {
+        if (request.action == .query) {
+            self.accepted_client_id = request.client_id;
+            self.accepted_request_id = 0;
+            for (self.clients) |client| if (client.id == request.client_id) {
+                self.accepted_request_id = client.request;
+                break;
+            };
+            return;
+        }
+        if (request.client_id == 0 or request.request_id == 0) {
+            self.report(error.InvalidRequestId);
+            return;
+        }
+        var slot: ?usize = null;
+        for (self.clients, 0..) |client, i| if (client.id == request.client_id) {
+            slot = i;
+            break;
+        };
+        const index = slot orelse blk: {
+            const index = self.client_slot;
+            self.client_slot = (self.client_slot + 1) % self.clients.len;
+            self.clients[index] = .{ .id = request.client_id };
+            break :blk index;
+        };
+        if (request.request_id <= self.clients[index].request) {
+            self.accepted_client_id = request.client_id;
+            self.accepted_request_id = self.clients[index].request;
+            return;
+        }
+        self.clients[index].request = request.request_id;
+        self.accepted_client_id = request.client_id;
+        self.accepted_request_id = request.request_id;
+        switch (request.action) {
+            .query => unreachable,
+            .start => if (self.state == .idle or (if (self.pending_lifecycle) |pending| pending == error.MissionStopped else false)) {
+                self.pending_lifecycle = error.MissionRestart;
+            },
+            .stop => self.pending_lifecycle = error.MissionStopped,
+            .restart => self.pending_lifecycle = error.MissionRestart,
+        }
+    }
+
+    fn reply(self: *Telemetry, io: Io, current: *const MissionConfig.MissionConfig, destination: *const std.Io.net.IpAddress, config_reply_revision: u64, config_rejected: bool) void {
+        var desired = LiveConfigPacket.fromRuntimeConfig(current);
+        desired.revision = self.revision;
+        var active = LiveConfigPacket.fromRuntimeConfig(current);
+        // Publication resources belong to the application and can differ from the
+        // desired defaults after a failed startup publisher open.
+        active.telemetry_transport = self.initial_config_packet.telemetry_transport;
+        active.telemetry_addr = self.initial_config_packet.telemetry_addr;
+        active.telemetry_shm_name = self.initial_config_packet.telemetry_shm_name;
+        active.telemetry_log_path = self.initial_config_packet.telemetry_log_path;
+        const status: RuntimeStatus = .{
+            .run_id = self.run_id,
+            .state = if (self.pending_lifecycle != null and self.state != .idle) .stopping else self.state,
+            .result = self.result,
+            .revision = self.revision,
+            .accepted_client_id = self.accepted_client_id,
+            .accepted_request_id = self.accepted_request_id,
+            .config_reply_revision = config_reply_revision,
+            .config_rejected = config_rejected,
+            .active = self.state != .idle,
+            .desired = desired,
+            .active_config = active,
+            .last_error = if (self.last_error.len != 0) self.last_error else self.telemetry_error,
+        };
+        var buffer: [8192]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        SerialBinary.write(&writer, status) catch return;
+        self.control_socket.send(io, destination, writer.buffered()) catch {};
+    }
+
+    /// Drain a bounded batch before unwinding, so only the latest requested
+    /// configuration is opened by the next mission attempt.
+    pub fn pollControl(self: *Telemetry, io: Io, current: *MissionConfig.MissionConfig) !void {
+        if (self.direct_last_received) |last| {
+            if (last.untilNow(io).raw.toMilliseconds() >= 2000) {
+                setText(&self.last_error, "Thruster control connection timed out");
+                self.clearCommands();
+                return error.MissionStopped;
+            }
+        }
+        var buffer: [4096]u8 = undefined;
+        const timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(0) } };
+        for (0..64) |_| {
+            const message = self.control_socket.receiveTimeout(io, &buffer, timeout) catch |err| switch (err) {
                 error.Timeout => break,
                 else => {
-                    if (print_stuff) std.log.err("live config UDP recv: {s}", .{@errorName(err)});
+                    self.report(err);
                     break;
                 },
             };
-            if (msg.data.len >= mission_command_magic.len and
-                std.mem.eql(u8, msg.data[0..mission_command_magic.len], &mission_command_magic))
-            {
-                self.mission_command = MissionCommand.decode(msg.data) catch |err| {
-                    if (print_stuff) std.log.debug("mission command rejected: {s}", .{@errorName(err)});
+            var config_reply_revision: u64 = 0;
+            var config_rejected = false;
+            if (message.data.len >= 4 and std.mem.eql(u8, message.data[0..4], "ACR1")) {
+                const decoded = SerialBinary.readFromBuffer(RuntimeRequest, message.data) catch |err| {
+                    self.report(err);
+                    self.reply(io, current, &message.from, 0, false);
                     continue;
                 };
-                continue;
-            }
-            if (msg.data.len == 7 * @sizeOf(f32)) {
-                var values: [7]f32 = undefined;
-                for (0..values.len) |i| {
-                    const bits = std.mem.readInt(u32, msg.data[i * 4 ..][0..4], .little);
-                    values[i] = @bitCast(bits);
-                }
-                self.teleop_command = .{
-                    .translation = .{ values[0], values[1], values[2] },
-                    .orientation = .{ values[3], values[4], values[5], values[6] },
+                if (decoded.consumed != message.data.len) self.report(error.InvalidLength) else self.acceptRequest(decoded.value);
+            } else if (message.data.len >= 4 and std.mem.eql(u8, message.data[0..4], "MCF1")) {
+                const packet = LiveConfigPacket.decode(message.data) catch |err| {
+                    self.report(err);
+                    self.reply(io, current, &message.from, 0, false);
+                    continue;
                 };
+                config_reply_revision = packet.revision;
+                self.apply(io, current, packet) catch |err| {
+                    self.report(err);
+                    config_rejected = true;
+                };
+            } else if (message.data.len >= 4 and std.mem.eql(u8, message.data[0..4], "AUT1")) {
+                const decoded = SerialBinary.readFromBuffer(ThrusterCommand, message.data) catch continue;
+                const command = decoded.value;
+                if (decoded.consumed != message.data.len or self.state != .running or self.pending_lifecycle != null or
+                    current.mission_id != .thruster_control or command.run_id != self.run_id or
+                    command.client_id == 0 or command.sequence == 0 or command.count != current.tam_len) continue;
+                var valid = true;
+                for (command.values[0..command.count]) |value| {
+                    if (!std.math.isFinite(value) or value < -1 or value > 1) valid = false;
+                }
+                if (!valid) continue;
+                if (self.direct_command) |previous| {
+                    if (command.client_id != previous.client_id or command.sequence < previous.sequence) continue;
+                    if (command.sequence == previous.sequence and !std.mem.eql(f32, &command.values, &previous.values)) continue;
+                }
+                self.direct_command = command;
+                self.direct_last_received = .now(io, .awake);
+                continue;
+            } else if (message.data.len == 28) {
+                const decoded = SerialBinary.readFromBuffer(TeleopCommand, message.data) catch continue;
+                if (self.state == .running and self.pending_lifecycle == null) self.teleop_command = decoded.value;
+                continue;
+            } else {
+                const command = MissionCommand.decode(message.data) catch |err| {
+                    self.report(err);
+                    self.reply(io, current, &message.from, 0, false);
+                    continue;
+                };
+                if (self.state == .running and self.pending_lifecycle == null) self.mission_command = command;
                 continue;
             }
-            const packet = LiveConfigPacket.decode(msg.data) catch |err| {
-                if (print_stuff) std.log.debug("live config UDP decode: {s}", .{@errorName(err)});
-                continue;
-            };
-            LiveConfigPacket.validate(&packet) catch |err| {
-                std.log.warn("live config UDP rejected: {s}", .{@errorName(err)});
-                continue;
-            };
-            LiveConfigPacket.applyToRuntimeConfig(&working, packet);
-            if (print_stuff) std.log.debug("applied live config UDP on control port", .{});
-            applied = true;
+            self.reply(io, current, &message.from, config_reply_revision, config_rejected);
         }
-        if (applied) {
-            self.refreshLiveConfigPacket(working);
-            self.stdout_log_freq_div = working.log_freq_div;
-            merged_out.* = working;
+        const lifecycle = self.pending_lifecycle;
+        self.pending_lifecycle = null;
+        if (lifecycle) |err| {
+            self.clearCommands();
+            return err;
         }
-        return applied;
     }
 
     /// Publish one runtime telemetry frame synchronously.
@@ -1463,3 +1579,51 @@ pub const Telemetry = struct {
         );
     }
 };
+
+// Control replies use the control socket, including when no sensor is available.
+pub const RuntimeState = enum(u8) { idle, starting, running, stopping };
+pub const RuntimeResult = enum(u8) { none, completed, stopped, failed };
+pub const RuntimeAction = enum(u8) { query, start, stop, restart };
+pub const RuntimeRequest = struct {
+    magic: [4]u8 = "ACR1".*,
+    client_id: u64,
+    request_id: u64,
+    action: RuntimeAction,
+};
+pub const RuntimeStatus = struct {
+    magic: [4]u8 = "ACS1".*,
+    state: RuntimeState,
+    result: RuntimeResult,
+    revision: u64,
+    accepted_client_id: u64,
+    accepted_request_id: u64,
+    config_reply_revision: u64,
+    config_rejected: bool,
+    active: bool,
+    desired: LiveConfigPacket,
+    active_config: LiveConfigPacket,
+    last_error: MissionConfig.FixedText(256),
+    run_id: u64,
+};
+
+pub fn setText(destination: anytype, message: []const u8) void {
+    destination.* = .{};
+    const len = @min(destination.bytes.len, message.len);
+    @memcpy(destination.bytes[0..len], message[0..len]);
+    destination.len = @intCast(len);
+}
+
+test "lifecycle requests deduplicate and the latest request wins" {
+    var telemetry: Telemetry = .{ .publisher = undefined, .log_file = null, .stdout_log_freq_div = 1, .state = .running };
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 1, .action = .start });
+    try std.testing.expect(telemetry.pending_lifecycle == null);
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 2, .action = .restart });
+    try std.testing.expectEqual(error.MissionRestart, telemetry.pending_lifecycle.?);
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 3, .action = .stop });
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 2, .action = .restart });
+    try std.testing.expectEqual(error.MissionStopped, telemetry.pending_lifecycle.?);
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 3, .action = .query });
+    try std.testing.expectEqual(@as(u64, 3), telemetry.accepted_request_id);
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 4, .action = .start });
+    try std.testing.expectEqual(error.MissionRestart, telemetry.pending_lifecycle.?);
+}

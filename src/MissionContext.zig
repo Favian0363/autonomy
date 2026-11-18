@@ -1,14 +1,17 @@
 const std = @import("std");
 const Io = std.Io;
-const MissionArgs = @import("MissionArgs.zig");
 const math = @import("math.zig");
 const bc = @import("BodyControl.zig");
 
 const Auv = @import("Auv.zig");
+const Serial = @import("Serial.zig");
+const Protocol = @import("Protocol.zig");
+const Simulator = @import("Simulator.zig");
 const MissionConfig = @import("MissionConfig.zig");
 const MissionIO = @import("MissionIO.zig");
 
 const MissionContext = @This();
+const SimSession = Simulator.Session;
 
 const Goal = MissionIO.Goal;
 
@@ -18,12 +21,6 @@ frame: Auv.Frame,
 
 seen_objects: [Auv.Frame.max_objects]Auv.Object,
 seen_objects_len: u8,
-
-goal_dist_threshold: f32,
-thrustor_saturate: f32,
-
-print_stuff: bool,
-clear_print_stuff: bool,
 
 target_position: math.Vector3f,
 goal_queue_buf: [MissionConfig.queue_capacity_max]Goal = @splat(std.mem.zeroes(Goal)),
@@ -43,44 +40,70 @@ pid_prev_timestamp_ns: ?u64,
 
 step: []const u8,
 telemetry_frame: MissionIO.TelemetryFrame = std.mem.zeroes(MissionIO.TelemetryFrame),
-telemetry: MissionIO.Telemetry = undefined,
+telemetry: *MissionIO.Telemetry,
 
 seen_objects2d: [Auv.Frame.max_objects]Auv.Object2d = undefined,
 seen_objects2d_len: u8 = 0,
 
-auv: Auv,
-mission_diyn_loader: MissionIO.MissionDiynLoader,
+auv: ?Auv,
+mission_diyn_loader: ?MissionIO.MissionDiynLoader,
+serial: ?Serial,
+serial_parser: Protocol.Parser = .{},
+simulator: ?*SimSession,
+hardware_frame_time: ?Io.Clock.Timestamp = null,
 
-/// Mutable runtime copy of one compiled MissionConfig profile.
-/// Live control packets may update tuning fields; startup transport fields
-/// remain bound to the values used by Telemetry.init.
+/// Live configuration, retained across mission attempts and while idle.
 config: MissionConfig.MissionConfig,
 
-pub fn init(self: *MissionContext, allocator: std.mem.Allocator, io: Io, args: MissionArgs) !void {
-    MissionIO.installStopHandlers();
-
-    const config = MissionArgs.configForProfile(args.mission_profile);
+pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, telemetry: *MissionIO.Telemetry) !void {
+    try telemetry.pollControl(io, &ctx.config);
+    const config = ctx.config;
     try config.validate();
+    if (!Simulator.enabled and config.serial_port.len == 0) return error.MissingOutput;
+    const tam_len = config.tam_len;
 
-    var mission_diyn_loader = MissionIO.MissionDiynLoader.init(args.auv_dynlib_path);
-    const auv = mission_diyn_loader.load() catch |err| {
-        return err;
+    // MissionConfig compile-time preset checks bind Proteus to the six-channel
+    // firmware protocol; the profile selects whether serial output is permitted.
+    if (config.serial_port.len != 0) switch (config.mission_profile) {
+        .proteus_hwd => {},
+        .stonefish_sim => return error.InvalidThrusterCount,
     };
-    auv.init();
+    const simulator: ?*SimSession = if (comptime Simulator.enabled)
+        try SimSession.create(allocator, io, try config.sim_robot.slice(), try config.sim_scene.slice(), tam_len, config.sim_realtime or config.serial_port.len != 0)
+    else
+        null;
+    errdefer if (simulator) |session| session.destroy();
+    var mission_diyn_loader: ?MissionIO.MissionDiynLoader = null;
+    var auv: ?Auv = null;
+    errdefer if (mission_diyn_loader) |*loader| loader.dynlib.close();
+    errdefer if (auv) |loaded| loaded.deinit();
+    if (comptime !Simulator.enabled) {
+        var loader = MissionIO.MissionDiynLoader.init(try config.sensor_library.slice());
+        const loaded = try loader.load();
+        mission_diyn_loader = loader;
+        auv = loaded;
+        auv.?.init();
+        try telemetry.pollControl(io, &ctx.config);
+        // The void initialization ABI reports failures through the first frame.
+        // Check it before opening serial output or waiting for firmware READY.
+        var initial_frame: Auv.Frame = undefined;
+        try auv.?.yieldUntilNextFrame(&initial_frame);
+        try telemetry.pollControl(io, &ctx.config);
+    }
+    var serial = try Serial.init(io, try config.serial_port.sentinelSlice());
+    errdefer if (serial) |*port| port.deinit();
+    var parser: Protocol.Parser = .{};
+    if (serial) |*port| {
+        try port.waitForReady(&parser, telemetry, &ctx.config);
+        std.log.info("READY on {s} at 115200 baud", .{try config.serial_port.slice()});
+    }
+    if (simulator) |session| session.rebaseClock();
 
-    const telemetry = try MissionIO.Telemetry.init(allocator, io, config);
-
-    self.* = .{
+    ctx.* = .{
         .frame = undefined,
 
         .seen_objects = undefined,
         .seen_objects_len = 0,
-
-        .goal_dist_threshold = config.goal_dist_threshold,
-        .thrustor_saturate = config.thrustor_saturate,
-
-        .print_stuff = config.print_stuff,
-        .clear_print_stuff = config.clear_print_stuff,
 
         .target_position = @splat(0),
         .queue = undefined,
@@ -91,13 +114,23 @@ pub fn init(self: *MissionContext, allocator: std.mem.Allocator, io: Io, args: M
         .telemetry = telemetry,
 
         .auv = auv,
+        .serial = serial,
+        .serial_parser = parser,
+        .simulator = simulator,
         .mission_diyn_loader = mission_diyn_loader,
 
-        .config = config,
+        .config = ctx.config,
 
         .io = io,
     };
-    self.queue = .initBuffer(&self.goal_queue_buf);
+    ctx.queue = .initBuffer(&ctx.goal_queue_buf);
+}
+
+pub fn deinit(ctx: *MissionContext) void {
+    if (ctx.serial) |*port| port.deinit();
+    if (ctx.auv) |auv| auv.deinit();
+    if (ctx.mission_diyn_loader) |*loader| loader.dynlib.close();
+    if (ctx.simulator) |session| session.destroy();
 }
 
 pub fn reset(ctx: *MissionContext) void {
@@ -113,10 +146,27 @@ pub fn reset(ctx: *MissionContext) void {
     ctx.pid_prev_timestamp_ns = null;
 }
 
+/// Live cameras usually provide pacing; replay or synthetic plugins may not.
+fn paceHardwareFrame(ctx: *MissionContext) !void {
+    if (ctx.serial == null) return;
+    if (ctx.hardware_frame_time) |previous| {
+        const remaining = 16_666_667 - previous.untilNow(ctx.io).raw.toNanoseconds();
+        if (remaining > 0) try Io.sleep(ctx.io, .fromNanoseconds(remaining), .awake);
+    }
+    ctx.hardware_frame_time = .now(ctx.io, .awake);
+}
+
 pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     const start = Io.Clock.Timestamp.now(ctx.io, .awake);
-    ctx.auv.yieldUntilNextFrame(&ctx.frame);
-    if (MissionIO.stopRequested()) return error.Stopped;
+    try ctx.telemetry.pollControl(ctx.io, &ctx.config);
+    if (comptime Simulator.enabled) {
+        try ctx.simulator.?.nextFrame(&ctx.frame);
+    } else {
+        try ctx.auv.?.yieldUntilNextFrame(&ctx.frame);
+        try ctx.paceHardwareFrame();
+    }
+    if (ctx.serial) |*port| _ = try port.readReplies(&ctx.serial_parser);
+    try ctx.telemetry.pollControl(ctx.io, &ctx.config);
 
     for (ctx.frame.objects[0..ctx.frame.objects_len]) |frame_object| {
         const maybe_seen_object = for (ctx.seen_objects[0..ctx.seen_objects_len]) |*seen_object| {
@@ -147,18 +197,6 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
             ctx.seen_objects2d_len += 1;
         }
     }
-
-    var live_config: MissionConfig.MissionConfig = ctx.config;
-    if (ctx.telemetry.pollLiveConfig(ctx.io, ctx.config, ctx.print_stuff, &live_config)) {
-        ctx.config = live_config;
-        ctx.goal_dist_threshold = live_config.goal_dist_threshold;
-        ctx.thrustor_saturate = live_config.thrustor_saturate;
-        ctx.print_stuff = live_config.print_stuff;
-        ctx.clear_print_stuff = live_config.clear_print_stuff;
-        ctx.telemetry.warnImmutableFields(live_config);
-        ctx.resetOdometryPid();
-    }
-
     var telemetry_frame = &ctx.telemetry_frame;
     telemetry_frame.magic = "AUV1".*;
     telemetry_frame.abi_version = MissionIO.telemetry_frame_abi_version;
@@ -186,8 +224,18 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     @memcpy(telemetry_frame.step[0..step_len], ctx.step[0..step_len]);
 
     var thruster_buffer: [MissionConfig.thruster_count]f32 = @splat(0);
-    const thruster_values = ctx.controlStep(&thruster_buffer, telemetry_frame);
-    ctx.auv.setThrustorValues(thruster_values.ptr, @intCast(thruster_values.len));
+    const direct = ctx.config.mission_id == .thruster_control;
+    const thruster_values = if (direct) blk: {
+        if (ctx.telemetry.direct_command) |command| thruster_buffer = command.values;
+        break :blk thruster_buffer[0..ctx.config.tam_len];
+    } else ctx.controlStep(&thruster_buffer, telemetry_frame);
+    if (!direct or ctx.telemetry.direct_command != null) {
+        if (comptime Simulator.enabled) try ctx.simulator.?.setThrusters(&thruster_buffer);
+        if (ctx.serial) |*port| {
+            const packet = Protocol.encode(&thruster_values[0..Protocol.protocol_v2_command_channel_count].*);
+            try port.writeAll(&packet, 100);
+        }
+    }
 
     const nobj = @min(@as(usize, ctx.seen_objects_len), ctx.seen_objects.len);
     const nbox = @min(@as(usize, ctx.seen_objects2d_len), ctx.seen_objects2d.len);
@@ -233,8 +281,8 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
             ._pad = .{ 0, 0, 0 },
         };
     }
-    telemetry_frame.thrusters_len = @intCast(thruster_values.len);
-    @memcpy(telemetry_frame.thrusters[0..thruster_values.len], thruster_values);
+    telemetry_frame.thrusters_len = @intCast(ctx.config.tam_len);
+    @memcpy(telemetry_frame.thrusters[0..ctx.config.tam_len], thruster_values[0..ctx.config.tam_len]);
     telemetry_frame.goals_len = @intCast(goals_len);
     for (goals[0..goals_len], telemetry_frame.goals[0..goals_len]) |source, *dest| {
         dest.* = .{ .position = source.position, .look_at = source.look_at };
@@ -403,7 +451,7 @@ fn controlStep(
     ctx: *MissionContext,
     thruster_buffer: *[MissionConfig.thruster_count]f32,
     telemetry_frame: *MissionIO.TelemetryFrame,
-) []f32 {
+) []const f32 {
     const body_error = ctx.bodyError();
     const timestamp_ns = ctx.frame.timestamp;
     const dt: ?f32 = if (ctx.pid_prev_timestamp_ns) |previous| blk: {
@@ -415,11 +463,9 @@ fn controlStep(
         break :blk null;
     };
 
-    const tam_len = @min(ctx.config.tam_len, MissionConfig.thruster_count);
-    var tam_storage: [MissionConfig.thruster_count]math.Vector6f = @splat(@splat(0));
-    for (ctx.config.tam[0..tam_len], tam_storage[0..tam_len]) |source, *dest| {
-        dest.* = source;
-    }
+    const tam_len = ctx.config.tam_len;
+    var tam_storage: [MissionConfig.thruster_count]math.Vector6f = undefined;
+    for (ctx.config.tam[0..tam_len], tam_storage[0..tam_len]) |source, *dest| dest.* = @bitCast(source);
     const tam_rows = tam_storage[0..tam_len];
     const camera_forward: math.Vector3f = .{
         ctx.config.camera_forward[0],
@@ -504,20 +550,22 @@ fn controlStep(
         translation_body[0], translation_body[1], translation_body[2],
         rotation[0],         rotation[1],         rotation[2],
     };
-    const thruster_values = math.tamToThrusters(
+    _ = math.tamToThrusters(
         tam_rows,
         input,
-        ctx.thrustor_saturate,
+        ctx.config.thrustor_saturate,
         5.0,
-        thruster_buffer,
+        thruster_buffer[0..tam_len],
     );
-    telemetry_frame.clear_screen = ctx.clear_print_stuff;
+    telemetry_frame.clear_screen = ctx.config.clear_print_stuff;
     telemetry_frame.has_dt = dt != null;
     telemetry_frame.dt = dt orelse 0;
     telemetry_frame.kp = @bitCast(odom.kp);
     telemetry_frame.ki = @bitCast(odom.ki);
     telemetry_frame.kd = @bitCast(odom.kd);
-    telemetry_frame.tam = @bitCast(tam_storage);
+    var telemetry_tam: [MissionConfig.thruster_count][MissionConfig.tam_cols]f32 = @splat(@splat(0));
+    for (tam_storage[0..tam_len], 0..) |row, index| telemetry_tam[index] = @bitCast(row);
+    telemetry_frame.tam = telemetry_tam;
     telemetry_frame.tam_len = @intCast(tam_len);
     telemetry_frame.control_pose = @bitCast(math.poseTo6f(ctx.frame.camera_pose));
     telemetry_frame.translation_error = @bitCast(error_body);
@@ -526,7 +574,7 @@ fn controlStep(
     telemetry_frame.attitude_error = @bitCast(attitude_error);
     telemetry_frame.rotation_limit = @bitCast(rotation_limit);
     telemetry_frame.input = @bitCast(input);
-    return thruster_values;
+    return thruster_buffer[0..tam_len];
 }
 
 /// Search while holding still. Returns the first object of `cls`.
@@ -551,7 +599,7 @@ const look_done: f32 = 0.1;
 fn reached(ctx: *const MissionContext, target: math.Vector3f) bool {
     const ok = ctx.frame.position_ok;
     if (!ok.x or !ok.y or !ok.z) return false;
-    return math.length3f(target - ctx.frame.camera_pose.pos) <= ctx.goal_dist_threshold;
+    return math.length3f(target - ctx.frame.camera_pose.pos) <= ctx.config.goal_dist_threshold;
 }
 
 /// Horizontal unit direction from the vehicle toward the object. World +Y when they overlap.

@@ -2,18 +2,18 @@ const std = @import("std");
 const rl = @import("raylib");
 const IO = @import("MissionIO");
 
-pub const Workspace = enum { operation, mission, tuning };
+pub const Workspace = enum { operation, mission, tuning, runtime };
 pub const Status = enum { disabled, connecting, live, ready, stale, unavailable };
 pub const Rect = rl.Rectangle;
-const bg = color(9, 17, 24, 255);
-const sidebar = color(12, 24, 32, 245);
-const glass = color(21, 42, 51, 224);
-const surface = color(18, 36, 45, 255);
+const bg = color(3, 5, 4, 255);
+const sidebar = color(8, 13, 11, 255);
+const glass = color(17, 23, 21, 245);
+const surface = color(11, 17, 15, 255);
 const border = color(63, 101, 107, 180);
 const white = color(235, 245, 242, 255);
 const muted = color(157, 180, 183, 255);
-const teal = color(99, 220, 191, 255);
-const blue = color(133, 198, 242, 255);
+const teal = color(0, 226, 200, 255);
+const blue = color(0, 226, 200, 255);
 const amber = color(244, 187, 113, 255);
 const red = color(242, 123, 120, 255);
 const axis_names = [_][:0]const u8{ "X", "Y", "Z", "ROLL", "PITCH", "YAW" };
@@ -98,69 +98,80 @@ pub const Layout = struct {
     observed: Rect,
     update: Rect,
     pub fn init(w: f32, h: f32, video_enabled: bool) Layout {
-        const side: f32 = 166;
-        const gap: f32 = 14;
-        const x = side + 20;
-        const y: f32 = 135;
-        const cw = @max(1, w - x - 20);
-        const ch = @max(1, h - y - 18);
-        const lw = @floor((cw - gap) * 0.56);
-        const rw = cw - gap - lw;
-        const rx = x + lw + gap;
-        const upper = @floor((ch - gap) * 0.49);
-        const state_h = @floor((ch - gap) * 0.34);
-        const mission_scene = @floor((ch - gap) * 0.62);
-        const gainw = @floor((cw - gap) * 0.70);
-        const smallw = cw - gap - gainw;
+        const gap: f32 = if (w < 1200) 8 else 14;
+        const margin: f32 = if (w < 1200) 12 else 20;
+        const y: f32 = if (w < 1200) 60 else 70;
+        const cw = w - 2 * margin;
+        const ch = h - y - margin;
+        const lw = @floor((cw - 2 * gap) * 0.40);
+        const mw = @floor((cw - 2 * gap) * 0.18);
+        const rw = cw - 2 * gap - lw - mw;
+        const mx = margin + lw + gap;
+        const rx = mx + mw + gap;
+        const scene_h = @floor((ch - gap) * 0.49);
+        const state_h = @floor((ch - gap) * 0.39);
+        const control_h = @floor((ch - gap) * 0.39);
+        const empty = rect(margin, y, 1, 1);
         return .{
             .video_enabled = video_enabled,
-            .sidebar = rect(0, 0, side, h),
-            .top = rect(side, 0, w - side, 64),
-            .content = rect(x, y, cw, ch),
-            .video = rect(x, y, lw, upper),
-            .scene = rect(x, y + upper + gap, lw, ch - upper - gap),
-            .state = rect(rx, y, rw, state_h),
-            .thrusters = rect(rx, y + state_h + gap, rw * 0.48 - gap / 2, ch - state_h - gap),
-            .controls = rect(rx + rw * 0.48 + gap / 2, y + state_h + gap, rw * 0.52 - gap / 2, ch - state_h - gap),
-            .objects = rect(x, y + mission_scene + gap, (lw - gap) / 2, ch - mission_scene - gap),
-            .goals = rect(x + (lw + gap) / 2, y + mission_scene + gap, (lw - gap) / 2, ch - mission_scene - gap),
-            .editor = rect(rx, y, rw, ch),
-            .gains = rect(x, y, gainw, ch * 0.70 - gap / 2),
-            .observed = rect(x + gainw + gap, y, smallw, ch * 0.43 - gap / 2),
-            .update = rect(x, y + ch * 0.70 + gap / 2, gainw, ch * 0.30 - gap / 2),
+            .sidebar = rect(0, 0, 0, h),
+            .top = rect(0, 0, w, y - 8),
+            .content = rect(margin, y, cw, ch),
+            .scene = rect(margin, y, lw, scene_h),
+            .video = rect(margin, y + scene_h + gap, lw, ch - scene_h - gap),
+            .state = rect(mx, y, mw, state_h),
+            .thrusters = rect(mx, y + state_h + gap, mw, ch - state_h - gap),
+            .controls = rect(rx, y, rw, control_h),
+            .editor = rect(rx, y, rw, control_h),
+            .gains = rect(rx, y + control_h + gap, rw, ch - control_h - gap),
+            .objects = empty,
+            .goals = empty,
+            .observed = empty,
+            .update = empty,
         };
     }
-    pub fn sceneContent(self: Layout, ws: Workspace) Rect {
-        const r = if (ws == .mission)
-            rect(self.content.x, self.content.y, self.scene.width, self.objects.y - self.content.y - 14)
-        else if (!self.video_enabled)
-            rect(self.content.x, self.content.y, self.scene.width, self.content.height)
-        else
-            self.scene;
+    pub fn sceneContent(self: Layout, _: Workspace) Rect {
+        const r = self.scene;
         return rect(r.x + 8, r.y + 38, r.width - 16, r.height - 46);
     }
+
     pub fn pidRect(self: Layout, index: usize) Rect {
         const a = self.gains;
-        const left: f32 = 58;
-        const gap: f32 = 8;
-        const cell = (a.width - left - 20 - 5 * gap) / 6;
-        const row = (a.height - 102) / 3;
-        return rect(a.x + left + @as(f32, @floatFromInt(index % 6)) * (cell + gap), a.y + 88 + @as(f32, @floatFromInt(index / 6)) * row, cell, 22);
+        const left: f32 = 30;
+        const gap: f32 = 5;
+        const cell = (a.width - left - 12 - 5 * gap) / 6;
+        const row = @min(@as(f32, 58), (a.height - 145) / 3);
+        return rect(a.x + left + @as(f32, @floatFromInt(index % 6)) * (cell + gap), a.y + 82 + @as(f32, @floatFromInt(index / 6)) * row, cell, 23);
     }
+    pub fn resetPidRect(self: Layout) Rect {
+        return rect(self.gains.x + self.gains.width - 132, self.gains.y + 8, 120, 25);
+    }
+    pub fn dropdownRect(self: Layout) Rect {
+        return rect(self.controls.x + 12, self.controls.y + 38, self.controls.width - 108, 30);
+    }
+    pub fn activateRect(self: Layout) Rect {
+        return rect(self.controls.x + self.controls.width - 88, self.controls.y + 38, 76, 30);
+    }
+    pub fn dropdownOption(self: Layout, i: usize) Rect {
+        const r = self.dropdownRect();
+        return rect(r.x, r.y + r.height + @as(f32, @floatFromInt(i)) * 28, r.width, 28);
+    }
+
     pub fn listCapacity(r: Rect) usize {
         return @intFromFloat(@max(0, @floor((r.height - 78) / 20)));
     }
     pub fn navRect(self: Layout, i: usize) Rect {
-        return rect(10, 105 + @as(f32, @floatFromInt(i)) * 44, self.sidebar.width - 20, 36);
+        _ = self;
+        return rect(215 + @as(f32, @floatFromInt(i)) * 85, 14, 80, 28);
     }
     pub fn fontButton(self: Layout, increase: bool) Rect {
-        return rect(if (increase) 111 else 16, self.sidebar.height - 142, 38, 30);
+        return rect(self.top.width - (if (increase) @as(f32, 34) else 104), 15, 25, 27);
     }
     pub fn missionButton(self: Layout, i: usize) Rect {
-        return rect(self.editor.x + 14 + @as(f32, @floatFromInt(i)) * 98, self.editor.y + 82, 90, 32);
+        return rect(self.editor.x + 12 + @as(f32, @floatFromInt(i)) * 80, self.editor.y + 112, 75, 27);
     }
     pub fn sendButton(self: Layout) Rect {
-        return rect(self.editor.x + 14, self.editor.y + self.editor.height - 62, 170, 34);
+        return rect(self.editor.x + 12, self.editor.y + self.editor.height - 42, 150, 28);
     }
 };
 
@@ -177,6 +188,10 @@ pub const Data = struct {
     video_h: i32,
     scene: rl.RenderTexture2D,
     mission_control: bool,
+    chosen_mission: IO.CompiledConfig.MissionId,
+    active_mission: ?IO.CompiledConfig.MissionId,
+    dropdown_open: bool,
+    runtime_switch_pending: bool,
     socket_ok: bool,
     send_error: bool,
     translation: [3]f32,
@@ -208,58 +223,20 @@ fn observedGain(d: Data, i: usize) f32 {
         else => d.frame.kd[i % 6],
     };
 }
+fn runtimeName(mission_id: IO.CompiledConfig.MissionId) [:0]const u8 {
+    return switch (mission_id) {
+        .prequalify_coco => "Coco",
+        .prequalify_robosub => "RoboSub PQ",
+        .teleop => "Teleop",
+        .mission_control => "Command Mission",
+        .thruster_control => "Direct Thrusters",
+    };
+}
+
 fn button(font: rl.Font, r: Rect, label: [:0]const u8, active: bool) void {
     rl.drawRectangleRounded(r, 0.18, 6, if (active) teal else surface);
     rl.drawRectangleRoundedLinesEx(r, 0.18, 6, 1, border);
     text(font, label, r.x + 10, r.y + 9, 12, if (active) bg else white);
-}
-fn header(d: Data) void {
-    const l = d.layout;
-    box(l.sidebar, sidebar);
-    box(l.top, sidebar);
-    text(d.font, "AUV", 18, 19, 18, teal);
-    text(d.font, "AUTONOMY", 64, 20, 14, white);
-    text(d.font, "VIEWER", 64, 39, 11, muted);
-    line(14, 70, l.sidebar.width - 28);
-    text(d.font, "WORKSPACES", 18, 84, 11, muted);
-    const names = [_][:0]const u8{ "Operation", "Mission", "Tuning" };
-    for (names, 0..) |name, i| {
-        const r = l.navRect(i);
-        if (@backingInt(d.workspace) == i) rl.drawRectangleRounded(r, 0.15, 6, color(28, 64, 65, 255));
-        text(d.font, rl.textFormat("0%d", .{@as(c_int, @intCast(i + 1))}), r.x + 9, r.y + 10, 11, teal);
-        text(d.font, name, r.x + 34, r.y + 9, 14, white);
-    }
-    line(14, l.sidebar.height - 181, l.sidebar.width - 28);
-    text(d.font, "FONT SIZE", 18, l.sidebar.height - 169, 11, muted);
-    const decrease = l.fontButton(false);
-    const increase = l.fontButton(true);
-    button(d.font, decrease, "-", false);
-    button(d.font, increase, "+", false);
-    text(d.font, rl.textFormat("%d%%", .{@as(c_int, d.font_percent)}), 63, l.sidebar.height - 134, 12, white);
-    line(14, l.sidebar.height - 96, l.sidebar.width - 28);
-    text(d.font, "CONTROL MODE", 18, l.sidebar.height - 82, 11, muted);
-    text(d.font, if (d.mission_control) "Mission control" else "Teleoperation", 18, l.sidebar.height - 61, 13, white);
-    text(d.font, "T  switch mode", 18, l.sidebar.height - 38, 11, muted);
-    text(d.font, names[@backingInt(d.workspace)], l.top.x + 20, 12, 19, white);
-    const sx = l.top.x + l.top.width;
-    pill(d.font, rect(sx - 414, 19, 130, 28), "TLM", d.telemetry_status);
-    pill(d.font, rect(sx - 275, 19, 115, 28), "VIDEO", d.video_status);
-    pill(d.font, rect(sx - 151, 19, 137, 28), "SEND", if (!d.socket_ok or d.send_error) .unavailable else .ready);
-    const headline = switch (d.workspace) {
-        .operation => "Live operation",
-        .mission => "Mission debugging",
-        .tuning => "Controller tuning",
-    };
-    text(d.font, headline, l.content.x, 78, 24, white);
-    if (d.workspace == .mission) {
-        var step: [IO.telemetry_step_max + 1]u8 = undefined;
-        const n = @min(@as(usize, d.frame.step_len), d.frame.step.len);
-        @memcpy(step[0..n], d.frame.step[0..n]);
-        step[n] = 0;
-        text(d.font, if (d.telemetry_status == .live and n > 0) rl.textFormat("MISSION STEP: %s", .{step[0..n :0].ptr}) else "MISSION STEP: unavailable", l.content.x, 108, 13, muted);
-    } else {
-        text(d.font, if (d.workspace == .operation) "Vehicle, surroundings and active commands at a glance" else "Adjust gains live and compare with telemetry", l.content.x, 108, 13, muted);
-    }
 }
 fn frameContent(d: Data, r: Rect) void {
     const src = rect(0, 0, @floatFromInt(d.scene.texture.width), -@as(f32, @floatFromInt(d.scene.texture.height)));
@@ -331,138 +308,109 @@ fn thrusterPanel(d: Data, p: Rect) void {
 }
 fn statePanel(d: Data, p: Rect) void {
     panel(p);
-    title(d.font, "VEHICLE STATE", p);
+    title(d.font, "VEHICLE MEASUREMENTS", p);
     if (d.telemetry_status != .live) {
-        text(d.font, "Telemetry unavailable", p.x + 14, p.y + 48, 15, amber);
+        text(d.font, "Telemetry unavailable", p.x + 10, p.y + 40, 12, amber);
         return;
     }
     var buf: [IO.telemetry_step_max + 1]u8 = undefined;
     const n = @min(@as(usize, d.frame.step_len), d.frame.step.len);
     @memcpy(buf[0..n], d.frame.step[0..n]);
     buf[n] = 0;
-    text(d.font, "DEPTH", p.x + 14, p.y + 40, 11, muted);
-    text(d.font, if (d.frame.depth_ok) rl.textFormat("%.2f m", .{@as(f64, d.frame.depth)}) else "--", p.x + 14, p.y + 57, 23, white);
-    text(d.font, "MISSION STEP", p.x + p.width * 0.47, p.y + 40, 11, muted);
-    text(d.font, buf[0..n :0], p.x + p.width * 0.47, p.y + 62, 13, white);
-    line(p.x + 14, p.y + 92, p.width - 28);
-    text(d.font, rl.textFormat("Position: %.2f  %.2f  %.2f m", .{ @as(f64, d.frame.camera_pose.pos[0]), @as(f64, d.frame.camera_pose.pos[1]), @as(f64, d.frame.camera_pose.pos[2]) }), p.x + 14, p.y + 103, 13, white);
-    text(d.font, rl.textFormat("Position xyz: %s %s %s", .{ if (d.frame.position_ok.x) "OK" else "--", if (d.frame.position_ok.y) "OK" else "--", if (d.frame.position_ok.z) "OK" else "--" }), p.x + 14, p.y + 126, 12, if (d.frame.position_ok.x and d.frame.position_ok.y and d.frame.position_ok.z) teal else amber);
-    if (p.height > 175) text(d.font, rl.textFormat("Attitude xyz: %s %s %s", .{ if (d.frame.attitude_ok.x) "OK" else "--", if (d.frame.attitude_ok.y) "OK" else "--", if (d.frame.attitude_ok.z) "OK" else "--" }), p.x + 14, p.y + 148, 12, if (d.frame.attitude_ok.x and d.frame.attitude_ok.y and d.frame.attitude_ok.z) teal else amber);
+    text(d.font, "DEPTH", p.x + 10, p.y + 36, 10, muted);
+    text(d.font, if (d.frame.depth_ok) rl.textFormat("%.2f m", .{@as(f64, d.frame.depth)}) else "--", p.x + 10, p.y + 51, 18, white);
+    text(d.font, "MISSION STEP", p.x + 10, p.y + 76, 10, muted);
+    text(d.font, if (n > 0) buf[0..n :0] else "--", p.x + 10, p.y + 91, 11, white);
+    text(d.font, "POSITION X / Y / Z (m)", p.x + 10, p.y + 116, 10, muted);
+    text(d.font, rl.textFormat("%.2f  %.2f  %.2f", .{ @as(f64, d.frame.camera_pose.pos[0]), @as(f64, d.frame.camera_pose.pos[1]), @as(f64, d.frame.camera_pose.pos[2]) }), p.x + 10, p.y + 132, 11, white);
+    const angles = IO.Math.quaternionToEuler(d.frame.camera_pose.quat) * @as(@TypeOf(d.frame.camera_pose.pos), @splat(180.0 / std.math.pi));
+    text(d.font, "ROLL / PITCH / YAW (deg)", p.x + 10, p.y + 157, 10, muted);
+    text(d.font, rl.textFormat("%.1f  %.1f  %.1f", .{ @as(f64, angles[0]), @as(f64, angles[1]), @as(f64, angles[2]) }), p.x + 10, p.y + 173, 11, white);
+    if (p.height > 215) text(d.font, if (d.frame.position_ok.x and d.frame.position_ok.y and d.frame.position_ok.z and d.frame.attitude_ok.x and d.frame.attitude_ok.y and d.frame.attitude_ok.z) "Pose valid" else "Pose validity incomplete", p.x + 10, p.y + 198, 10, teal);
 }
-fn controlPanel(d: Data, p: Rect) void {
+fn dashboard(d: Data) void {
+    const l = d.layout;
+    box(l.top, sidebar);
+    text(d.font, "A", 16, 13, 20, teal);
+    text(d.font, "AUTONOMY VIEWER", 42, 14, 15, white);
+    const names = [_][:0]const u8{ "Operation", "Mission", "Tuning", "Runtime" };
+    for (names, 0..) |name, i| button(d.font, l.navRect(i), name, @backingInt(d.workspace) == i);
+    const sx = @max(@as(f32, 545), l.top.width - 470);
+    pill(d.font, rect(sx, 14, 108, 28), "TLM", d.telemetry_status);
+    pill(d.font, rect(sx + 113, 14, 120, 28), "VIDEO", d.video_status);
+    pill(d.font, rect(sx + 238, 14, 112, 28), "SEND", if (!d.socket_ok or d.send_error) .unavailable else .ready);
+    button(d.font, l.fontButton(false), "-", false);
+    button(d.font, l.fontButton(true), "+", false);
+    text(d.font, rl.textFormat("%d%%", .{@as(c_int, d.font_percent)}), l.top.width - 75, 22, 10, white);
+    scenePanel(d, l.sceneContent(.operation));
+    videoPanel(d, l.video);
+    statePanel(d, l.state);
+    thrusterPanel(d, l.thrusters);
+    const p = l.controls;
     panel(p);
-    title(d.font, "CONTROLS", p);
-    const rows = [_][:0]const u8{ "W / S   forward / back", "A / D   left / right", "R / F   down / up", "Arrows  yaw / pitch", "I / K   roll", "T       change mode" };
+    title(d.font, "CONTROL MODE", p);
+    button(d.font, l.dropdownRect(), runtimeName(d.chosen_mission), false);
+    text(d.font, "v", l.dropdownRect().x + l.dropdownRect().width - 18, l.dropdownRect().y + 8, 12, muted);
+    button(d.font, l.activateRect(), "Activate", true);
+    text(d.font, if (d.telemetry_status != .live) "Confirmed: unavailable" else rl.textFormat("Confirmed: %s", .{runtimeName((d.active_mission orelse d.config.mission_id)).ptr}), p.x + 12, p.y + 77, 11, if (d.telemetry_status == .live and !d.runtime_switch_pending) teal else amber);
+    if (d.runtime_switch_pending) text(d.font, "Request sent; awaiting telemetry", p.x + 12, p.y + 94, 10, amber);
     if (d.mission_control) {
-        text(d.font, "Mission control active", p.x + 12, p.y + 43, 12, amber);
-        text(d.font, "Open Mission workspace", p.x + 12, p.y + 65, 12, muted);
-        return;
-    }
-    const spacing = @min(@as(f32, 29), (p.height - 55) / 6);
-    for (rows, 0..) |row, i| text(d.font, row, p.x + 12, p.y + 44 + @as(f32, @floatFromInt(i)) * spacing, 11, white);
-    if (p.height > 285) {
-        const y = p.y + 48 + 6 * spacing;
-        line(p.x + 12, y, p.width - 24);
-        text(d.font, "COMMAND  X / Y / Z", p.x + 12, y + 12, 10, muted);
-        text(d.font, rl.textFormat("%.1f  %.1f  %.1f", .{ @as(f64, d.translation[0]), @as(f64, d.translation[1]), @as(f64, d.translation[2]) }), p.x + 12, y + 30, 12, white);
-    }
-}
-fn operation(d: Data) void {
-    if (d.layout.video_enabled) videoPanel(d, d.layout.video);
-    scenePanel(d, d.layout.sceneContent(.operation));
-    statePanel(d, d.layout.state);
-    thrusterPanel(d, d.layout.thrusters);
-    controlPanel(d, d.layout.controls);
-}
-fn mission(d: Data) void {
-    const l = d.layout;
-    scenePanel(d, l.sceneContent(.mission));
-    panel(l.objects);
-    title(d.font, "OBJECTS", l.objects);
-    panel(l.goals);
-    title(d.font, "QUEUED GOALS", l.goals);
-    if (d.telemetry_status == .live) {
-        text(d.font, rl.textFormat("%d detected", .{@as(c_int, d.frame.objects_len)}), l.objects.x + 12, l.objects.y + 39, 12, muted);
-        const maxrows = Layout.listCapacity(l.objects);
-        const object_end = @min(@as(usize, d.frame.objects_len), d.object_scroll + maxrows);
-        for (d.frame.objects[d.object_scroll..object_end], 0..) |o, i| text(d.font, rl.textFormat("ID %d  CLASS %d", .{ @as(c_uint, o.id), @as(c_uint, o.cls) }), l.objects.x + 12, l.objects.y + 62 + @as(f32, @floatFromInt(i)) * 20, 11, white);
-        text(d.font, rl.textFormat("%d goals", .{@as(c_int, d.frame.goals_len)}), l.goals.x + 12, l.goals.y + 39, 12, muted);
-        const goal_end = @min(@as(usize, d.frame.goals_len), d.goal_scroll + maxrows);
-        for (d.frame.goals[d.goal_scroll..goal_end], 0..) |g, i| text(d.font, rl.textFormat("%d  %.1f  %.1f  %.1f", .{ @as(c_int, @intCast(d.goal_scroll + i + 1)), @as(f64, g.position[0]), @as(f64, g.position[1]), @as(f64, g.position[2]) }), l.goals.x + 12, l.goals.y + 62 + @as(f32, @floatFromInt(i)) * 20, 11, white);
-        if (d.frame.objects_len > maxrows) text(d.font, "Scroll for more", l.objects.x + 12, l.objects.y + l.objects.height - 20, 11, muted);
-        if (d.frame.goals_len > maxrows) text(d.font, "Scroll for more", l.goals.x + 12, l.goals.y + l.goals.height - 20, 11, muted);
+        button(d.font, l.missionButton(0), "Point P", d.mission_kind == .point);
+        button(d.font, l.missionButton(1), "Object O", d.mission_kind == .object);
+        text(d.font, if (d.mission_kind == .point) (if (d.target_initialized) rl.textFormat("Target: %.2f  %.2f  %.2f m", .{ @as(f64, d.mission_position[0]), @as(f64, d.mission_position[1]), @as(f64, d.mission_position[2]) }) else "Target: waiting for telemetry") else rl.textFormat("Class %d  %s", .{ @as(c_uint, d.mission_class), @tagName(d.mission_maneuver).ptr }), p.x + 12, p.y + 147, 11, white);
+        text(d.font, if (d.mission_kind == .point) "WASD / RF target  |  Arrows look" else "Q / E class  |  M / B / C maneuver", p.x + 12, p.y + 166, 10, muted);
+        button(d.font, l.sendButton(), "Send command", false);
+        text(d.font, if (d.mission_sent) "Sent locally; receipt unconfirmed" else "Enter to send; receipt unconfirmed", p.x + 168, p.y + p.height - 34, 10, muted);
+    } else if ((d.active_mission orelse d.config.mission_id) == .teleop) {
+        text(d.font, "TELEOPERATION", p.x + 12, p.y + 116, 11, teal);
+        text(d.font, "W / S forward / back     A / D left / right", p.x + 12, p.y + 137, 11, white);
+        text(d.font, "R / F down / up           Arrows yaw / pitch", p.x + 12, p.y + 158, 11, white);
+        text(d.font, "I / K roll", p.x + 12, p.y + 179, 11, white);
     } else {
-        text(d.font, "Unavailable", l.objects.x + 12, l.objects.y + 42, 12, amber);
-        text(d.font, "Unavailable", l.goals.x + 12, l.goals.y + 42, 12, amber);
+        text(d.font, "Configured mission running", p.x + 12, p.y + 120, 12, white);
+        text(d.font, "Mission step is shown in measurements", p.x + 12, p.y + 142, 10, muted);
     }
-    const p = l.editor;
-    panel(p);
-    title(d.font, "MISSION COMMAND", p);
-    text(d.font, if (d.mission_control) "MISSION CONTROL ACTIVE" else "Press T to enable mission control", p.x + 14, p.y + 43, 12, if (d.mission_control) teal else amber);
-    button(d.font, l.missionButton(0), "Point  P", d.mission_kind == .point);
-    button(d.font, l.missionButton(1), "Object  O", d.mission_kind == .object);
-    text(d.font, if (d.mission_kind == .point) "TARGET POSITION (X / Y / Z)" else "TARGET OBJECT CLASS", p.x + 14, p.y + 132, 11, muted);
-    if (d.mission_kind == .point) {
-        text(d.font, if (d.target_initialized and d.telemetry_status == .live) rl.textFormat("%.2f  %.2f  %.2f m", .{ @as(f64, d.mission_position[0]), @as(f64, d.mission_position[1]), @as(f64, d.mission_position[2]) }) else if (!d.mission_control) "Enable mission mode to set target" else "Waiting for fresh telemetry", p.x + 14, p.y + 154, 15, white);
-        text(d.font, "LOOK DIRECTION", p.x + 14, p.y + 187, 11, muted);
-        text(d.font, rl.textFormat("%.2f  %.2f  %.2f", .{ @as(f64, d.mission_look[0]), @as(f64, d.mission_look[1]), @as(f64, d.mission_look[2]) }), p.x + 14, p.y + 207, 14, white);
-    } else {
-        text(d.font, rl.textFormat("Class %d  |  %s", .{ @as(c_int, d.mission_class), @tagName(d.mission_maneuver).ptr }), p.x + 14, p.y + 154, 15, white);
-        text(d.font, "Q / E class   M / B / C maneuver", p.x + 14, p.y + 187, 12, muted);
-    }
-    line(p.x + 14, p.y + 240, p.width - 28);
-    text(d.font, "WASD / RF: target   Arrows: look", p.x + 14, p.y + 255, 12, muted);
-    text(d.font, "UDP send does not confirm receipt.", p.x + 14, p.y + p.height - 110, 12, amber);
-    button(d.font, l.sendButton(), "Send command  Enter", d.mission_control and d.socket_ok and (d.mission_kind != .point or (d.target_initialized and d.telemetry_status == .live)));
-    text(d.font, if (d.send_error) "Send failed" else if (d.mission_sent) "Last command sent locally" else "No command sent", p.x + 14, p.y + p.height - 22, 11, if (d.send_error) red else muted);
-}
-fn tuning(d: Data) void {
-    const l = d.layout;
-    const p = l.gains;
-    panel(p);
-    title(d.font, "ODOMETRY PID GAINS", p);
-    text(d.font, "Live updates: the full configuration is sent immediately", p.x + 14, p.y + 34, 12, amber);
-    for (0..6) |a| {
-        const r = l.pidRect(a);
-        text(d.font, axis_names[a], r.x, r.y - 24, 11, muted);
+    const g = l.gains;
+    panel(g);
+    title(d.font, "ODOMETRY PID TUNING", g);
+    text(d.font, "Immediate updates  |  drag or Z / X", g.x + 12, g.y + 34, 10, amber);
+    button(d.font, l.resetPidRect(), "RESET ALL TO ZERO", d.telemetry_status == .live);
+    for (0..6) |axis| {
+        const r = l.pidRect(axis);
+        text(d.font, axis_names[axis], r.x + 2, r.y - 18, 10, muted);
     }
     for (0..18) |i| {
         const r = l.pidRect(i);
-        if (i % 6 == 0) text(d.font, groups[i / 6], p.x + 18, r.y, 17, teal);
-        const v = gain(d, i);
-        box(r, color(41, 68, 75, 255));
-        box(rect(r.x, r.y, r.width * std.math.clamp(v / gain_max[i / 6], 0, 1), r.height), if (i == d.tune_selection) amber else teal);
-        rl.drawRectangleLinesEx(r, 1, border);
-        text(d.font, rl.textFormat("%.2f", .{@as(f64, v)}), r.x + 3, r.y + r.height + 4, 11, white);
+        if (i % 6 == 0) text(d.font, groups[i / 6], g.x + 10, r.y + 4, 12, teal);
+        box(r, surface);
+        rl.drawRectangleLinesEx(r, 1, if (i == d.tune_selection) teal else border);
+        text(d.font, if (d.telemetry_status == .live) rl.textFormat("%.2f", .{@as(f64, gain(d, i))}) else "--", r.x + 4, r.y + 5, 11, white);
+        box(rect(r.x, r.y + r.height - 2, r.width * if (d.telemetry_status == .live) std.math.clamp(gain(d, i) / gain_max[i / 6], 0, 1) else 0, 2), teal);
     }
-    text(d.font, "Q / E select (teleop)   Z / X adjust   Drag a slider", p.x + 14, p.y + p.height - 22, 11, muted);
-    panel(l.observed);
-    title(d.font, "OBSERVED CONTROLLER", l.observed);
     if (d.telemetry_status == .live) {
-        text(d.font, "TRANSLATION ERROR", l.observed.x + 14, l.observed.y + 42, 11, muted);
-        text(d.font, rl.textFormat("%+.2f  %+.2f  %+.2f", .{ @as(f64, d.frame.translation_error[0]), @as(f64, d.frame.translation_error[1]), @as(f64, d.frame.translation_error[2]) }), l.observed.x + 14, l.observed.y + 62, 13, white);
-        text(d.font, "ATTITUDE ERROR", l.observed.x + 14, l.observed.y + 94, 11, muted);
-        text(d.font, rl.textFormat("%+.2f  %+.2f  %+.2f", .{ @as(f64, d.frame.attitude_error[0]), @as(f64, d.frame.attitude_error[1]), @as(f64, d.frame.attitude_error[2]) }), l.observed.x + 14, l.observed.y + 114, 13, white);
-    } else text(d.font, "Telemetry unavailable", l.observed.x + 14, l.observed.y + 45, 13, amber);
-    const t = rect(l.observed.x, l.observed.y + l.observed.height + 14, l.observed.width, l.content.y + l.content.height - l.observed.y - l.observed.height - 14);
-    thrusterPanel(d, t);
-    panel(l.update);
-    title(d.font, "LIVE UPDATE", l.update);
-    text(d.font, rl.textFormat("Requested: %.2f", .{@as(f64, gain(d, d.tune_selection))}), l.update.x + 14, l.update.y + 42, 14, white);
-    text(d.font, if (d.telemetry_status == .live) rl.textFormat("Observed: %.2f", .{@as(f64, observedGain(d, d.tune_selection))}) else "Observed: unavailable", l.update.x + 14, l.update.y + 66, 13, teal);
-    if (l.update.height > 110) text(d.font, if (d.send_error) "Send failed" else if (d.tune_sent) "Sent locally; no receipt confirmation" else "No gain update sent", l.update.x + 14, l.update.y + 91, 12, if (d.send_error) red else muted);
+        text(d.font, rl.textFormat("Position error (m): %+.2f  %+.2f  %+.2f", .{ @as(f64, d.frame.translation_error[0]), @as(f64, d.frame.translation_error[1]), @as(f64, d.frame.translation_error[2]) }), g.x + 12, g.y + g.height - 90, 10, muted);
+        text(d.font, rl.textFormat("Attitude error: %+.2f  %+.2f  %+.2f", .{ @as(f64, d.frame.attitude_error[0]), @as(f64, d.frame.attitude_error[1]), @as(f64, d.frame.attitude_error[2]) }), g.x + 12, g.y + g.height - 72, 10, muted);
+    }
+    const footer_y = g.y + g.height - 46;
+    text(d.font, if (d.telemetry_status == .live) rl.textFormat("Selected %s / %s   Requested %.2f", .{ groups[d.tune_selection / 6].ptr, axis_names[d.tune_selection % 6].ptr, @as(f64, gain(d, d.tune_selection)) }) else "Requested gains unavailable", g.x + 12, footer_y, 10, white);
+    text(d.font, if (d.telemetry_status == .live) rl.textFormat("Observed %.2f  |  receipt unconfirmed  |  Runtime: direct control", .{@as(f64, observedGain(d, d.tune_selection))}) else "Telemetry unavailable; tuning disabled", g.x + 12, footer_y + 18, 10, muted);
+    if (d.dropdown_open) {
+        const modes = @typeInfo(IO.CompiledConfig.MissionId).@"enum".field_names;
+        for (modes, 0..) |_, i| {
+            const mode: IO.CompiledConfig.MissionId = @fromBackingInt(@as(u8, @intCast(i)));
+            button(d.font, l.dropdownOption(i), runtimeName(mode), d.chosen_mission == mode);
+        }
+    }
 }
 pub fn draw(d: Data) void {
     font_scale = @as(f32, @floatFromInt(d.font_percent)) / 100.0;
     rl.clearBackground(bg);
-    rl.drawCircleGradient(.{ .x = d.layout.content.x + d.layout.content.width * 0.4, .y = 40 }, d.layout.content.width * 0.6, color(9, 84, 76, 105), color(9, 84, 76, 0));
-    rl.drawCircleGradient(.{ .x = d.layout.content.x + d.layout.content.width, .y = d.layout.content.y + d.layout.content.height }, d.layout.content.width * 0.55, color(11, 48, 85, 100), color(11, 48, 85, 0));
-    header(d);
-    switch (d.workspace) {
-        .operation => operation(d),
-        .mission => mission(d),
-        .tuning => tuning(d),
-    }
+    if (d.workspace == .runtime) {
+        box(d.layout.top, sidebar);
+        text(d.font, "AUTONOMY VIEWER", 16, 14, 15, white);
+        const names = [_][:0]const u8{ "Operation", "Mission", "Tuning", "Runtime" };
+        for (names, 0..) |name, i| button(d.font, d.layout.navRect(i), name, i == 3);
+    } else dashboard(d);
 }
 
 test "workspace layouts stay within supported window sizes" {
