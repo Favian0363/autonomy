@@ -1,11 +1,11 @@
 const std = @import("std");
-const Simulator = @import("Simulator.zig");
 const MissionContext = @import("MissionContext.zig");
+
+const simulator_enabled = @import("build_options").simulator;
 
 test {
     std.testing.refAllDecls(@import("BodyControl.zig"));
     std.testing.refAllDecls(@import("Serial.zig"));
-    std.testing.refAllDecls(@import("Simulator.zig"));
     std.testing.refAllDecls(@import("Protocol.zig"));
     std.testing.refAllDecls(MissionContext);
 }
@@ -13,9 +13,9 @@ test {
 pub fn main(init: std.process.Init) !void {
     const process_allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(process_allocator);
-    var windowed = Simulator.enabled;
+    var windowed = simulator_enabled;
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--headless") and Simulator.enabled) {
+        if (std.mem.eql(u8, arg, "--headless") and simulator_enabled) {
             windowed = false;
         } else {
             std.log.err("unknown argument: {s}", .{arg});

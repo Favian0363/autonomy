@@ -2,9 +2,9 @@ const std = @import("std");
 const types = @import("types.zig");
 const database = @import("database.zig");
 const S = @import("support.zig");
-const Runtime = @import("Runtime.zig");
+const Session = @import("Session.zig");
 
-pub fn evaluate(force: types.Force, runtime: *Runtime) !void {
+pub fn evaluate(force: types.Force, runtime: *Session) !void {
     switch (force) {
         .gravity => gravity(runtime),
         .hydrodynamics => try hydro(runtime),
@@ -20,7 +20,7 @@ fn coefficients(force: types.Vec3, basis: types.Quat, cd: types.Vec3, scale: f64
     return S.scale(force, factor);
 }
 
-fn gravity(runtime: *Runtime) void {
+fn gravity(runtime: *Session) void {
     @setFloatMode(.strict);
     const scene = runtime.scene;
     for (runtime.wrenches, scene.objects) |*wrench, slot| {
@@ -30,7 +30,7 @@ fn gravity(runtime: *Runtime) void {
     }
 }
 
-fn hydro(runtime: *Runtime) !void {
+fn hydro(runtime: *Session) !void {
     @setFloatMode(.strict);
     const model = runtime.scene;
     const bodies = runtime.backend.states;
@@ -118,7 +118,7 @@ fn hydro(runtime: *Runtime) !void {
     }
 }
 
-fn thrusters(runtime: *Runtime) void {
+fn thrusters(runtime: *Session) void {
     @setFloatMode(.strict);
     const model = runtime.scene;
     const bodies = runtime.backend.states;

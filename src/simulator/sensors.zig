@@ -3,7 +3,7 @@ const types = @import("types.zig");
 const database = @import("database.zig");
 const S = @import("support.zig");
 const Scene = @import("Scene.zig");
-const Runtime = @import("Runtime.zig");
+const Session = @import("Session.zig");
 const State = @This();
 
 fn extend(lo: *types.Vec3, hi: *types.Vec3, p: types.Vec3) void {
@@ -220,10 +220,10 @@ fn assemble(self: *State, scene: *const Scene) void {
     self.observation = out;
 }
 
-pub fn sample(runtime: *Runtime) void {
+pub fn sample(runtime: *Session) void {
     @setFloatMode(.strict);
     const self = &runtime.sensors;
-    const scene = runtime.scene;
+    const scene = &runtime.scene;
     const bodies = runtime.backend.states;
     const previous_linear = runtime.previous_linear;
     const previous_angular = runtime.previous_angular;
@@ -283,7 +283,7 @@ pub fn sample(runtime: *Runtime) void {
     self.assemble(scene);
 }
 
-pub fn hashSamples(runtime: *const Runtime, h: *S.Hash) void {
+pub fn hashSamples(runtime: *const Session, h: *S.Hash) void {
     const self = &runtime.sensors;
     const robot = runtime.scene.robot();
     for (0..runtime.scene.sensor_len) |index| {

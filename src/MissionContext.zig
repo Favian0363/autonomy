@@ -6,14 +6,27 @@ const bc = @import("BodyControl.zig");
 const Auv = @import("Auv.zig");
 const Serial = @import("Serial.zig");
 const Protocol = @import("Protocol.zig");
-const Simulator = @import("Simulator.zig");
 const MissionConfig = @import("MissionConfig.zig");
 const MissionIO = @import("MissionIO.zig");
 
+const simulator_enabled = @import("build_options").simulator;
+const SimSession = if (simulator_enabled) @import("simulator/Session.zig").Session else struct {
+    pub fn init(_: *@This(), _: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8, _: usize, _: bool) !void {
+        return error.SimulatorNotBuilt;
+    }
+    pub fn deinit(_: *@This()) void {}
+    pub fn setThrusters(_: *@This(), _: *const [MissionConfig.thruster_count]f32) !void {
+        return error.SimulatorNotBuilt;
+    }
+    pub fn nextFrame(_: *@This(), _: *Auv.Frame) !void {
+        return error.SimulatorNotBuilt;
+    }
+    pub fn rebaseClock(_: *@This()) void {}
+};
+
 const MissionContext = @This();
-const SimSession = Simulator.Session;
-const Visualizer = if (Simulator.enabled) @import("Visualizer.zig") else void;
-const EmbeddedView = if (Simulator.enabled) struct {
+const Visualizer = if (simulator_enabled) @import("Visualizer.zig") else void;
+const EmbeddedView = if (simulator_enabled) struct {
     viewer: Visualizer,
     last_idle_draw: ?Io.Clock.Timestamp = null,
     config_reply_revision: u64 = 0,
@@ -57,7 +70,7 @@ auv: ?Auv,
 mission_diyn_loader: ?MissionIO.MissionDiynLoader,
 serial: ?Serial,
 serial_parser: Protocol.Parser = .{},
-simulator: if (Simulator.enabled) ?SimSession else void = if (Simulator.enabled) null else {},
+simulator: if (simulator_enabled) ?SimSession else void = if (simulator_enabled) null else {},
 hardware_frame_time: ?Io.Clock.Timestamp = null,
 
 /// Live configuration, retained across mission attempts and while idle.
@@ -66,7 +79,7 @@ config: MissionConfig.MissionConfig,
 pub fn initProcess(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, windowed: bool) !void {
     ctx.io = io;
     ctx.config = MissionConfig.startup_config;
-    ctx.config.sensor_source = if (Simulator.enabled) .simulated else .plugin;
+    ctx.config.sensor_source = if (simulator_enabled) .simulated else .plugin;
     ctx.visualizer = null;
     if (windowed) ctx.config.telemetry_transport = .disabled;
 
@@ -82,7 +95,7 @@ pub fn initProcess(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, w
         ctx.telemetry.telemetry_error = ctx.telemetry.last_error;
     };
 
-    if (comptime Simulator.enabled) {
+    if (comptime simulator_enabled) {
         if (windowed) {
             const embedded = try allocator.create(EmbeddedView);
             embedded.* = .{
@@ -97,7 +110,7 @@ pub fn initProcess(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, w
 }
 
 pub fn deinitProcess(ctx: *MissionContext) void {
-    if (comptime Simulator.enabled) {
+    if (comptime simulator_enabled) {
         if (ctx.visualizer) |embedded| embedded.viewer.deinit();
     }
     ctx.telemetry.deinit(ctx.io);
@@ -109,7 +122,7 @@ pub fn serviceWithoutFrame(ctx: *MissionContext) !void {
 }
 
 fn present(ctx: *MissionContext, frame: ?*const MissionIO.TelemetryFrame) !void {
-    if (comptime !Simulator.enabled) return;
+    if (comptime !simulator_enabled) return;
     const embedded = ctx.visualizer orelse return;
     if (Visualizer.shouldClose()) return error.WindowClosed;
 
@@ -160,7 +173,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
     const telemetry = ctx.telemetry;
     const config = ctx.config;
     try config.validate();
-    if (!Simulator.enabled and config.serial_port.len == 0) return error.MissingOutput;
+    if (!simulator_enabled and config.serial_port.len == 0) return error.MissingOutput;
     const tam_len = config.tam_len;
 
     // MissionConfig compile-time preset checks bind Proteus to the six-channel
@@ -173,7 +186,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
     var auv: ?Auv = null;
     errdefer if (mission_diyn_loader) |*loader| loader.dynlib.close();
     errdefer if (auv) |loaded| loaded.deinit();
-    if (comptime !Simulator.enabled) {
+    if (comptime !simulator_enabled) {
         var loader = MissionIO.MissionDiynLoader.init(try config.sensor_library.slice());
         const loaded = try loader.load();
         mission_diyn_loader = loader;
@@ -211,7 +224,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         .auv = auv,
         .serial = serial,
         .serial_parser = parser,
-        .simulator = if (comptime Simulator.enabled) null else {},
+        .simulator = if (comptime simulator_enabled) null else {},
         .mission_diyn_loader = mission_diyn_loader,
 
         .config = ctx.config,
@@ -220,18 +233,10 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
     };
     ctx.queue = .initBuffer(&ctx.goal_queue_buf);
 
-    if (comptime Simulator.enabled) {
-        ctx.simulator = SimSession{
-            .allocator = allocator,
-            .io = io,
-            .catalog = undefined,
-            .scene_catalog = undefined,
-            .scene = undefined,
-            .runtime = undefined,
-            .realtime = ctx.visualizer != null or config.sim_realtime or config.serial_port.len != 0,
-            .tam_len = tam_len,
-            .started = undefined,
-        };
+    if (comptime simulator_enabled) {
+        const realtime = ctx.visualizer != null or config.sim_realtime or config.serial_port.len != 0;
+        // Init in place: scene BodySlot pointers must reference catalog.db in this Session, not a stack copy.
+        ctx.simulator = @as(SimSession, undefined);
         errdefer if (ctx.simulator) |*session| session.deinit();
         try ctx.simulator.?.init(
             allocator,
@@ -239,7 +244,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
             try config.sim_robot.slice(),
             try config.sim_scene.slice(),
             tam_len,
-            ctx.simulator.?.realtime,
+            realtime,
         );
         ctx.simulator.?.rebaseClock();
     }
@@ -249,7 +254,7 @@ pub fn deinit(ctx: *MissionContext) void {
     if (ctx.serial) |*port| port.deinit();
     if (ctx.auv) |auv| auv.deinit();
     if (ctx.mission_diyn_loader) |*loader| loader.dynlib.close();
-    if (comptime Simulator.enabled) if (ctx.simulator) |*session| session.deinit();
+    if (comptime simulator_enabled) if (ctx.simulator) |*session| session.deinit();
 }
 
 pub fn reset(ctx: *MissionContext) void {
@@ -278,7 +283,7 @@ fn paceHardwareFrame(ctx: *MissionContext) !void {
 pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     const start = Io.Clock.Timestamp.now(ctx.io, .awake);
     try ctx.telemetry.pollControl(ctx.io, &ctx.config);
-    if (comptime Simulator.enabled) {
+    if (comptime simulator_enabled) {
         try ctx.simulator.?.nextFrame(&ctx.frame);
     } else {
         try ctx.auv.?.yieldUntilNextFrame(&ctx.frame);
@@ -349,7 +354,7 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
         break :blk thruster_buffer[0..ctx.config.tam_len];
     } else ctx.controlStep(&thruster_buffer, telemetry_frame);
     if (!direct or ctx.telemetry.direct_command != null) {
-        if (comptime Simulator.enabled) try ctx.simulator.?.setThrusters(&thruster_buffer);
+        if (comptime simulator_enabled) try ctx.simulator.?.setThrusters(&thruster_buffer);
         if (ctx.serial) |*port| {
             const packet = Protocol.encode(&thruster_values[0..Protocol.protocol_v2_command_channel_count].*);
             try port.writeAll(&packet, 100);
@@ -407,7 +412,7 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
         dest.* = .{ .position = source.position, .look_at = source.look_at };
     }
     ctx.telemetry.publishTelemetry(ctx.io, telemetry_frame);
-    if (comptime Simulator.enabled) {
+    if (comptime simulator_enabled) {
         if (ctx.visualizer != null) {
             try ctx.present(telemetry_frame);
             try ctx.telemetry.pollControl(ctx.io, &ctx.config);
