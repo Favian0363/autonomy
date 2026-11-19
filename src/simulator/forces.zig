@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const database = @import("database.zig");
 const S = @import("support.zig");
 const Runtime = @import("Runtime.zig");
 
@@ -21,10 +22,11 @@ fn coefficients(force: types.Vec3, basis: types.Quat, cd: types.Vec3, scale: f64
 
 fn gravity(runtime: *Runtime) void {
     @setFloatMode(.strict);
-    for (runtime.wrenches, 0..) |*wrench, i| {
-        const body = runtime.scene.objects[i].body;
-        if (body.motion_type == .dynamic)
-            wrench.force = S.add(wrench.force, S.scale(runtime.scene.settings.gravity, body.dry_mass - body.mass));
+    const scene = runtime.scene;
+    for (runtime.wrenches, scene.objects) |*wrench, slot| {
+        const e = database.entity(slot);
+        if (database.motionFrom(e.motion) == .dynamic)
+            wrench.force = S.add(wrench.force, S.scale(scene.settings.gravity, e.dry_mass - e.mass));
     }
 }
 
@@ -33,6 +35,7 @@ fn hydro(runtime: *Runtime) !void {
     const model = runtime.scene;
     const bodies = runtime.backend.states;
     const w = runtime.wrenches;
+    const robot = model.robot();
     if (runtime.tick % model.settings.hydro_period == 0) {
         @memset(runtime.fluid, .{});
         var scratch = std.heap.FixedBufferAllocator.init(runtime.scratch);
@@ -42,26 +45,31 @@ fn hydro(runtime: *Runtime) !void {
         @memset(maxz, -std.math.inf(f64));
         const Wet = struct { lo: f64 = std.math.inf(f64), hi: f64 = -std.math.inf(f64) };
         var wet: [types.max_hulls]Wet = @splat(.{});
-        for (model.hulls, wet[0..model.hulls.len]) |h, *extent| {
-            const index = @backingInt(h.body);
-            const transform = S.compose(bodies[index].pose, h.pose);
-            for (h.positions) |position| {
+        const hull_count = database.ownedCount(robot.db.hulls.items, robot.slot);
+        for (0..hull_count) |hi| {
+            const h = database.hullAt(robot.db, robot.slot, hi);
+            const index = h.body;
+            const transform = S.compose(bodies[index].pose, database.poseOf(h.pos, h.quat));
+            const positions = database.vertexSlice(robot.db, h.vertex_start, h.vertex_count);
+            for (positions) |position| {
                 const z = S.point(transform, position)[2];
-                extent.lo = @min(extent.lo, z);
-                extent.hi = @max(extent.hi, z);
+                wet[hi].lo = @min(wet[hi].lo, z);
+                wet[hi].hi = @max(wet[hi].hi, z);
             }
-            minz[index] = @min(minz[index], extent.lo);
-            maxz[index] = @max(maxz[index], extent.hi);
+            minz[index] = @min(minz[index], wet[hi].lo);
+            maxz[index] = @max(maxz[index], wet[hi].hi);
         }
         for (w, 0..) |_, index| if (minz[index] > 0 and std.math.isFinite(minz[index])) {
-            const body = model.objects[index].body;
-            S.addForce(&runtime.fluid[index], S.scale(model.settings.gravity, -model.settings.water_density * body.volume), S.point(bodies[index].pose, body.buoyancy_center), bodies[index].center_of_mass);
+            const e = database.entity(model.objects[index]);
+            S.addForce(&runtime.fluid[index], S.scale(model.settings.gravity, -model.settings.water_density * e.volume), S.point(bodies[index].pose, e.buoyancy), bodies[index].center_of_mass);
         };
-        for (model.hulls, wet[0..model.hulls.len]) |h, extent| {
-            const index = @backingInt(h.body);
+        for (0..hull_count) |hi| {
+            const h = database.hullAt(robot.db, robot.slot, hi);
+            const extent = wet[hi];
+            const index = h.body;
             const body = bodies[index];
             if (maxz[index] <= 0) continue;
-            const transform = S.compose(body.pose, h.pose);
+            const transform = S.compose(body.pose, database.poseOf(h.pos, h.quat));
             const out = &runtime.fluid[index];
             if (minz[index] <= 0 and extent.hi > 0) {
                 const fraction = if (extent.lo > 0) 1 else extent.hi / (extent.hi - extent.lo);
@@ -71,11 +79,12 @@ fn hydro(runtime: *Runtime) !void {
             var pressure_angular = S.v(0, 0, 0);
             var skin_linear = S.v(0, 0, 0);
             var skin_angular = S.v(0, 0, 0);
+            const positions = database.vertexSlice(robot.db, h.vertex_start, h.vertex_count);
             var vertex: usize = 0;
-            while (vertex < h.positions.len) : (vertex += 3) {
-                const a = S.point(transform, h.positions[vertex]);
-                const b = S.point(transform, h.positions[vertex + 1]);
-                const d = S.point(transform, h.positions[vertex + 2]);
+            while (vertex < positions.len) : (vertex += 3) {
+                const a = S.point(transform, positions[vertex]);
+                const b = S.point(transform, positions[vertex + 1]);
+                const d = S.point(transform, positions[vertex + 2]);
                 var normal = S.cross(S.sub(b, a), S.sub(d, a));
                 const twice = S.norm(normal);
                 if (twice < 1e-6) continue;
@@ -114,19 +123,21 @@ fn thrusters(runtime: *Runtime) void {
     const model = runtime.scene;
     const bodies = runtime.backend.states;
     const dt = model.settings.timestep();
-    const count = model.thrusters.len;
-    for (model.thrusters, runtime.rotors[0..count], runtime.commands[0..count]) |thruster, *rotor, command| {
-        const index = @backingInt(thruster.body);
+    const robot = model.robot();
+    for (0..model.thruster_len) |ti| {
+        const t = database.thrusterAt(robot.db, robot.slot, ti);
+        const rotor = &runtime.rotors[ti];
+        const command = runtime.commands[ti];
+        const index = t.body;
         const body = bodies[index];
-        const spec = thruster.spec;
-        const max = spec.max_rpm / 60 * 2 * std.math.pi;
-        const target = spec.command_sign * std.math.clamp(command, -1, 1) * max;
+        const max = t.max_rpm / 60 * 2 * std.math.pi;
+        const target = t.command_sign * std.math.clamp(command, -1, 1) * max;
         const error_omega = target - rotor.omega;
         const damping = if (rotor.omega > 0) @abs(rotor.torque) else -@abs(rotor.torque);
-        rotor.omega = std.math.clamp((spec.inertia * rotor.omega + dt * (spec.kp * target + spec.ki * rotor.integral - damping)) / (spec.inertia + dt * spec.kp), -2 * max, 2 * max);
+        rotor.omega = std.math.clamp((t.inertia * rotor.omega + dt * (t.kp * target + t.ki * rotor.integral - damping)) / (t.inertia + dt * t.kp), -2 * max, 2 * max);
         rotor.integral = std.math.clamp(rotor.integral + error_omega * dt, -5, 5);
-        const p = S.point(body.pose, thruster.position);
-        const axis = S.rotate(body.pose.quat, thruster.direction);
+        const p = S.point(body.pose, t.position);
+        const axis = S.rotate(body.pose.quat, t.direction);
         rotor.thrust = 0;
         if (p[2] <= 0) {
             rotor.torque = 0;
@@ -134,10 +145,10 @@ fn thrusters(runtime: *Runtime) void {
         }
         const inflow = S.dot(axis, S.sub(S.add(body.linear_velocity, S.cross(body.angular_velocity, S.sub(p, body.center_of_mass))), model.settings.current));
         const n = rotor.omega / (2 * std.math.pi);
-        const d = spec.diameter;
+        const d = t.diameter;
         const rho = model.settings.water_density;
-        rotor.thrust = rho * d * d * d * @abs(n) * (d * spec.thrust * n - spec.thrust * inflow);
-        rotor.torque = -rho * d * d * d * d * @abs(n) * (d * spec.torque * n - spec.torque * inflow);
+        rotor.thrust = rho * d * d * d * @abs(n) * (d * t.thrust * n - t.thrust * inflow);
+        rotor.torque = -rho * d * d * d * d * @abs(n) * (d * t.torque * n - t.torque * inflow);
         const wrench = &runtime.wrenches[index];
         S.addForce(wrench, S.scale(axis, rotor.thrust), p, body.center_of_mass);
         wrench.torque = S.add(wrench.torque, S.scale(axis, rotor.torque));

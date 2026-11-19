@@ -9,29 +9,38 @@ test "the embedded scene catalog hydrates robosub_course meshes" {
     var catalog = try SceneCatalog.init(testing.allocator);
     defer catalog.deinit();
     const preset = catalog.find("robosub_course") orelse return error.MissingScene;
-    try testing.expectEqual(@as(usize, 14), preset.objects.len);
+    try testing.expectEqual(@as(usize, 14), preset.slots.len);
     try testing.expectEqual(@as(u32, 14), catalog.db.active.count);
-    try testing.expectEqualStrings("gate opening", preset.objects[0].body.name);
-    try testing.expect(!preset.objects[0].colliders[0].collisions);
-    try testing.expect(preset.objects[1].body.fuzz);
-    for (preset.objects) |object| {
-        try testing.expect(object.colliders.len == 1);
-        try testing.expect(object.colliders[0].shape == .mesh);
-        try testing.expect(object.colliders[0].shape.mesh.positions.len == 8);
-        try testing.expect(object.colliders[0].shape.mesh.triangles.len == 12);
+    const gate: database.BodySlot = .{ .db = &catalog.db, .slot = preset.slots[0] };
+    try testing.expectEqualStrings("gate opening", database.entityName(&catalog.db, preset.slots[0]));
+    try testing.expect(database.colliderAt(&catalog.db, preset.slots[0], 0).collisions == 0);
+    const second: database.BodySlot = .{ .db = &catalog.db, .slot = preset.slots[1] };
+    try testing.expect(database.entity(second).fuzz != 0);
+    for (preset.slots) |slot| {
+        const count = database.ownedCount(catalog.db.colliders.items, slot);
+        try testing.expect(count == 1);
+        const c = database.colliderAt(&catalog.db, slot, 0);
+        const shape = database.shapeFromRecord(&catalog.db, c);
+        try testing.expect(shape == .mesh);
+        try testing.expect(shape.mesh.positions.len == 8);
+        try testing.expect(shape.mesh.triangles.len == 12);
     }
+    _ = gate;
 
     var robot_catalog = try RobotCatalog.init(testing.allocator);
     defer robot_catalog.deinit();
     const robot_index = robot_catalog.index("proteus") orelse return error.MissingRobot;
-    const robot = &robot_catalog.robots[robot_index];
+    const robot = robot_catalog.body(robot_index);
     const membership = [_]database.Membership{
         .{ .db = &robot_catalog.db, .slots = robot_catalog.slots[robot_index..][0..1] },
         .{ .db = &catalog.db, .slots = preset.slots },
     };
-    var scene = try Scene.init(testing.allocator, robot, null, preset.objects, .{}, &.{}, &membership);
+    const extras = try testing.allocator.alloc(database.BodySlot, preset.slots.len);
+    defer testing.allocator.free(extras);
+    catalog.presetBodySlots(preset, extras);
+    var scene = try Scene.init(testing.allocator, robot, null, extras, .{}, &.{}, &membership);
     defer scene.deinit();
-    try testing.expect(scene.objects.len == preset.objects.len + 1);
+    try testing.expect(scene.objects.len == preset.slots.len + 1);
     try testing.expectEqual(robot_catalog.slots[robot_index], robot_catalog.db.active.head);
     try testing.expectEqual(@as(u32, 1), robot_catalog.db.active.count);
     try testing.expectEqual(preset.slots[0], catalog.db.active.head);

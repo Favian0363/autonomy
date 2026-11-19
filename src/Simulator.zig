@@ -128,20 +128,27 @@ test "native runtime validates inputs before stepping and applies faults on sche
     var catalog = try RobotCatalog.init(std.testing.allocator);
     defer catalog.deinit();
     const robot_index = catalog.index("proteus").?;
-    const robot = &catalog.robots[robot_index];
+    const robot = catalog.body(robot_index);
+    var extra_db = database.Database.init(std.testing.allocator);
+    defer extra_db.deinit();
+    const extra_slot = try extra_db.addEntity(.{
+        .name = "contact box",
+        .id = 100,
+        .initial_pose = .{ .pos = .{ 0, 0, 2 } },
+        .colliders = &.{.{ .shape = .box }},
+    });
+    const extra: database.BodySlot = .{ .db = &extra_db, .slot = extra_slot };
+    const additional = [_]database.BodySlot{extra};
     const membership = [_]database.Membership{
         .{ .db = &catalog.db, .slots = catalog.slots[robot_index..][0..1] },
-    };
-    // The sparse IDs are independent of both Zig slice positions and MuJoCo body IDs.
-    const objects = [_]types.Object{
-        .{ .body = .{ .id = 100, .name = "contact box", .initial_pose = .{ .pos = .{ 0, 0, 2 } } }, .colliders = &.{.{}} },
+        .{ .db = &extra_db, .slots = &[_]u32{extra_slot} },
     };
     const faults = [_]types.Fault{
         .{ .start = 0, .end = 2, .effect = .{ .weak = .{ .thruster = 0, .scale = 0.5 } } },
         .{ .start = 1, .end = 6, .effect = .{ .gyro_bias = .{ .sensor = @fromBackingInt(@intCast(1)), .bias = 0.5 } } },
         .{ .start = 1, .end = 7, .effect = .{ .disable_sensor = @fromBackingInt(@intCast(2)) } },
     };
-    var scene = try Scene.init(std.testing.allocator, robot, .{ .pos = .{ 0, 0, 2 } }, &objects, .{}, &faults, &membership);
+    var scene = try Scene.init(std.testing.allocator, robot, .{ .pos = .{ 0, 0, 2 } }, &additional, .{}, &faults, &membership);
     defer scene.deinit();
     var runtime = try Runtime.init(&scene);
     defer runtime.deinit();

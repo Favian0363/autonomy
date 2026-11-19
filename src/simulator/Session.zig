@@ -43,8 +43,8 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, robot_name
     self.scene_catalog = try SceneCatalog.init(allocator);
     errdefer self.scene_catalog.deinit();
     const robot_index = self.catalog.index(robot_name) orelse return error.UnknownSimRobot;
-    const robot = &self.catalog.robots[robot_index];
-    if (robot.thrusters.len != tam_len) return error.InvalidThrusterCount;
+    const robot = self.catalog.body(robot_index);
+    if (database.ownedCount(robot.db.thrusters.items, robot.slot) != tam_len) return error.InvalidThrusterCount;
     const robot_slots = self.catalog.slots[robot_index..][0..1];
 
     const robot_membership = [_]database.Membership{
@@ -59,7 +59,10 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, robot_name
             .{ .db = &self.catalog.db, .slots = robot_slots },
             .{ .db = &self.scene_catalog.db, .slots = preset.slots },
         };
-        break :blk try Scene.init(allocator, robot, start, preset.objects, .{}, &.{}, &membership);
+        const extras = try allocator.alloc(database.BodySlot, preset.slots.len);
+        defer allocator.free(extras);
+        self.scene_catalog.presetBodySlots(preset, extras);
+        break :blk try Scene.init(allocator, robot, start, extras, .{}, &.{}, &membership);
     } else return error.UnknownSimScene;
     self.scene = selected_scene;
     if (tam_len != self.scene.thruster_len) return error.InvalidThrusterCount;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const database = @import("database.zig");
 const S = @import("support.zig");
 const Scene = @import("Scene.zig");
 const Runtime = @import("Runtime.zig");
@@ -13,27 +14,44 @@ fn extend(lo: *types.Vec3, hi: *types.Vec3, p: types.Vec3) void {
     }
 }
 
-fn objectBounds(object: types.Object, lo: *types.Vec3, hi: *types.Vec3) void {
+fn objectBounds(slot: database.BodySlot, lo: *types.Vec3, hi: *types.Vec3) void {
     @setFloatMode(.strict);
     lo.* = S.v(std.math.inf(f64), std.math.inf(f64), std.math.inf(f64));
     hi.* = S.v(-std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64));
-    for (object.colliders) |shape| {
-        if (shape.shape == .mesh) {
-            for (shape.shape.mesh.positions) |position| extend(lo, hi, S.point(shape.pose, position));
-        } else {
-            var size = shape.size;
-            if (shape.shape == .sphere) size = S.v(size[0], size[0], size[0]);
-            if (shape.shape == .cylinder) size[1] = size[0];
-            var k: u32 = 0;
-            while (k < 8) : (k += 1) {
-                extend(lo, hi, S.point(shape.pose, S.v(
-                    if (k & 1 != 0) size[0] else -size[0],
-                    if (k & 2 != 0) size[1] else -size[1],
-                    if (k & 4 != 0) size[2] else -size[2],
-                )));
-            }
+    const count = database.ownedCount(slot.db.colliders.items, slot.slot);
+    for (0..count) |ki| {
+        const c = database.colliderAt(slot.db, slot.slot, ki);
+        const pose = database.poseOf(c.pos, c.quat);
+        const shape = database.shapeFromRecord(slot.db, c);
+        switch (shape) {
+            .mesh => |mesh| {
+                for (mesh.positions) |position| extend(lo, hi, S.point(pose, position));
+            },
+            else => {
+                var size = c.size;
+                if (shape == .sphere) size = S.v(size[0], size[0], size[0]);
+                if (shape == .cylinder) size[1] = size[0];
+                var k: u32 = 0;
+                while (k < 8) : (k += 1) {
+                    extend(lo, hi, S.point(pose, S.v(
+                        if (k & 1 != 0) size[0] else -size[0],
+                        if (k & 2 != 0) size[1] else -size[1],
+                        if (k & 4 != 0) size[2] else -size[2],
+                    )));
+                }
+            },
         }
     }
+}
+
+fn cameraFrom(record: *const database.SensorRecord) types.Camera {
+    return .{
+        .width = record.width,
+        .height = record.height,
+        .horizontal_fov = record.horizontal_fov,
+        .near_range = record.near_range,
+        .far_range = record.far_range,
+    };
 }
 
 fn project(camera: types.Camera, corners: [8]types.Vec3, out: *types.Detection) bool {
@@ -89,7 +107,7 @@ fn project(camera: types.Camera, corners: [8]types.Vec3, out: *types.Detection) 
 
 fn cameraSample(
     scene: *const Scene,
-    sensor: types.Sensor,
+    sensor: *const database.SensorRecord,
     camera: types.Camera,
     bodies: []const types.BodyState,
     objects: []types.Detection,
@@ -98,14 +116,16 @@ fn cameraSample(
     @setFloatMode(.strict);
     var count: usize = 0;
     const inverse = S.conjugate(mount.quat);
-    for (scene.objects, bodies, 0..) |object, body, index| {
-        if (!object.body.tracked or index == @backingInt(sensor.body)) continue;
+    const sensor_body = sensor.body;
+    for (scene.objects, bodies, 0..) |slot, body, index| {
+        const e = database.entity(slot);
+        if (e.tracked == 0 or index == sensor_body) continue;
         var lo: types.Vec3 = undefined;
         var hi: types.Vec3 = undefined;
-        objectBounds(object, &lo, &hi);
+        objectBounds(slot, &lo, &hi);
         var observation: types.Detection = .{
-            .id = object.body.id,
-            .cls = object.body.cls,
+            .id = e.id,
+            .cls = e.cls,
             .pose = .{ .pos = S.point(body.pose, S.scale(S.add(lo, hi), 0.5)), .quat = body.pose.quat },
             .size = S.sub(hi, lo),
         };
@@ -131,12 +151,12 @@ detections: []types.Detection,
 observation: types.Observation = .{},
 
 pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !State {
-    const samples = try allocator.alloc(types.SensorSample, scene.sensors.len);
+    const samples = try allocator.alloc(types.SensorSample, scene.sensor_len);
     errdefer allocator.free(samples);
     @memset(samples, .{});
     return .{
         .samples = samples,
-        .detections = try allocator.alloc(types.Detection, scene.sensors.len * scene.objects.len),
+        .detections = try allocator.alloc(types.Detection, scene.sensor_len * scene.objects.len),
     };
 }
 
@@ -149,15 +169,17 @@ pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
 fn assemble(self: *State, scene: *const Scene) void {
     @setFloatMode(.strict);
     var out: types.Observation = .{};
+    const robot = scene.robot();
     const tracking_index = if (scene.routing.get(.pose)) |ref| @backingInt(ref) else null;
     const tracking = if (tracking_index) |index| self.samples[index].value else null;
     if (tracking) |value| {
-        const mount = scene.sensors[tracking_index.?].pose;
+        const mount = database.poseOf(database.sensorAt(robot.db, robot.slot, tracking_index.?).pos, database.sensorAt(robot.db, robot.slot, tracking_index.?).quat);
         out.body.quat = S.multiply(value.pose.pose.quat, S.conjugate(mount.quat));
         out.attitude_axes = value.pose.axes.attitude_axes;
     }
     if (scene.routing.get(.imu)) |ref| if (self.samples[@backingInt(ref)].value) |value| {
-        const mount = scene.sensors[@backingInt(ref)].pose;
+        const s = database.sensorAt(robot.db, robot.slot, @intCast(@backingInt(ref)));
+        const mount = database.poseOf(s.pos, s.quat);
         out.imu = S.multiply(value.imu.orientation, S.conjugate(mount.quat));
         out.gyro = S.rotate(mount.quat, value.imu.gyro);
         out.accel = S.rotate(mount.quat, value.imu.accel);
@@ -167,14 +189,16 @@ fn assemble(self: *State, scene: *const Scene) void {
         }
     };
     if (tracking) |value| {
-        const mount = scene.sensors[tracking_index.?].pose;
+        const s = database.sensorAt(robot.db, robot.slot, tracking_index.?);
+        const mount = database.poseOf(s.pos, s.quat);
         if (out.attitude_axes == 7 or S.norm(mount.pos) == 0) {
             out.body.pos = S.sub(value.pose.pose.pos, S.rotate(out.body.quat, mount.pos));
             out.position_axes = value.pose.axes.position_axes;
         }
     }
     if (scene.routing.get(.pressure)) |ref| if (self.samples[@backingInt(ref)].value) |value| {
-        const mount = scene.sensors[@backingInt(ref)].pose;
+        const s = database.sensorAt(robot.db, robot.slot, @intCast(@backingInt(ref)));
+        const mount = database.poseOf(s.pos, s.quat);
         out.depth = value.pressure;
         out.depth_ok = true;
         if (out.position_axes & 4 == 0 and (out.attitude_axes == 7 or S.norm(mount.pos) == 0)) {
@@ -184,7 +208,8 @@ fn assemble(self: *State, scene: *const Scene) void {
     };
     if (scene.routing.get(.camera)) |ref| {
         const index = @backingInt(ref);
-        const camera = scene.sensors[index].settings.camera;
+        const record = database.sensorAt(robot.db, robot.slot, index);
+        const camera = cameraFrom(record);
         out.image_width = camera.width;
         out.image_height = camera.height;
         if (self.samples[index].value) |value| {
@@ -204,16 +229,23 @@ pub fn sample(runtime: *Runtime) void {
     const previous_angular = runtime.previous_angular;
     const tick = runtime.tick;
     const dt = scene.settings.timestep();
-    for (scene.sensors, self.samples, 0..) |sensor, *reading, index| {
-        if (tick != 0 and tick % sensor.period_ticks != 0) continue;
+    const robot = scene.robot();
+    for (0..scene.sensor_len) |index| {
+        const record = database.sensorAt(robot.db, robot.slot, index);
+        const reading = &self.samples[index];
+        if (tick != 0 and tick % record.period_ticks != 0) continue;
         reading.* = .{ .tick = tick };
-        if (!sensor.enabled) continue;
+        if (record.enabled == 0) continue;
 
-        const body_index = @backingInt(sensor.body);
+        const body_index = record.body;
         const body = bodies[body_index];
-        const mount = S.compose(body.pose, sensor.pose);
-        reading.value = switch (sensor.settings) {
-            .pose => |axes| .{ .pose = .{ .pose = mount, .axes = axes } },
+        const mount = S.compose(body.pose, database.poseOf(record.pos, record.quat));
+        const kind = database.sensorKind(record);
+        reading.value = switch (kind) {
+            .pose => .{ .pose = .{
+                .pose = mount,
+                .axes = .{ .position_axes = @intCast(record.position_axes), .attitude_axes = @intCast(record.attitude_axes) },
+            } },
             .imu => blk: {
                 const arm = S.sub(mount.pos, body.center_of_mass);
                 const alpha = S.scale(S.sub(body.angular_velocity, previous_angular[body_index]), 1 / dt);
@@ -225,9 +257,9 @@ pub fn sample(runtime: *Runtime) void {
                 } };
             },
             .pressure => .{ .pressure = mount.pos[2] },
-            .camera => |camera| .{ .camera = .{
+            .camera => .{ .camera = .{
                 .pose = mount,
-                .objects = cameraSample(scene, sensor, camera, bodies, self.detections[index * bodies.len ..][0..bodies.len], mount),
+                .objects = cameraSample(scene, record, cameraFrom(record), bodies, self.detections[index * bodies.len ..][0..bodies.len], mount),
             } },
         };
         const sensor_index: types.SensorIndex = @fromBackingInt(@intCast(index));
@@ -253,15 +285,18 @@ pub fn sample(runtime: *Runtime) void {
 
 pub fn hashSamples(runtime: *const Runtime, h: *S.Hash) void {
     const self = &runtime.sensors;
-    for (runtime.scene.sensors, self.samples) |sensor, reading| {
-        h.scalar(u32, sensor.id);
-        h.scalar(u32, @backingInt(sensor.kind()));
+    const robot = runtime.scene.robot();
+    for (0..runtime.scene.sensor_len) |index| {
+        const record = database.sensorAt(robot.db, robot.slot, index);
+        const reading = self.samples[index];
+        h.scalar(u32, record.id);
+        h.scalar(u32, @intFromEnum(database.sensorKind(record)));
         h.scalar(u64, reading.tick);
         const value = reading.value orelse {
             for (0..3) |_| h.scalar(u32, 0);
             continue;
         };
-        h.scalar(u32, @as(u32, 1) << @intCast(@backingInt(sensor.kind())));
+        h.scalar(u32, @as(u32, 1) << @intCast(@intFromEnum(database.sensorKind(record))));
         h.scalar(u32, if (value == .pose) value.pose.axes.position_axes else 0);
         h.scalar(u32, if (value == .pose) value.pose.axes.attitude_axes else 0);
         switch (value) {

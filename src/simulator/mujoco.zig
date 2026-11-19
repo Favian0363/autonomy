@@ -3,6 +3,7 @@ const std = @import("std");
 const mj = @import("mujoco_c");
 const types = @import("types.zig");
 const Scene = @import("Scene.zig");
+const database = @import("database.zig");
 const S = @import("support.zig");
 
 pub const MujocoBackend = struct {
@@ -26,8 +27,8 @@ pub const MujocoBackend = struct {
     }
 
     fn externalId(w: *const MujocoBackend, engine_id: c_int) u32 {
-        for (w.body_ids, w.source.objects) |id, object| {
-            if (id == engine_id) return object.body.id;
+        for (w.body_ids, w.source.objects) |id, slot| {
+            if (id == engine_id) return database.entity(slot).id;
         }
         return std.math.maxInt(u32);
     }
@@ -45,7 +46,7 @@ pub const MujocoBackend = struct {
             var velocity: [6]f64 = undefined;
             mj.mj_objectVelocity(m, d, mj.mjOBJ_BODY, @intCast(id), &velocity, 0);
             state.* = .{
-                .id = w.source.objects[i].body.id,
+                .id = database.entity(w.source.objects[i]).id,
                 .pose = .{ .pos = S.v(p[0], p[1], p[2]), .quat = S.q(q[1], q[2], q[3], q[0]) },
                 .center_of_mass = S.v(com[0], com[1], com[2]),
                 .linear_velocity = S.v(velocity[3], velocity[4], velocity[5]),
@@ -71,39 +72,42 @@ pub const MujocoBackend = struct {
 
     pub fn reset(w: *MujocoBackend, input: ?[]const types.BodyState) !void {
         if (input) |states| if (states.len != w.source.objects.len) return error.InvalidReset;
-        // Validate every entry before resetting or mutating engine state.
-        if (input) |states| for (states, w.source.objects) |*state, *object| {
-            const b = &object.body;
-            if (state.id != b.id or !S.finite3(state.linear_velocity) or !S.finite3(state.angular_velocity)) return error.InvalidReset;
+        if (input) |states| for (states, w.source.objects, 0..) |*state, slot, i| {
+            const initial = w.source.initialPose(i);
+            const e = database.entity(slot);
+            const motion = database.motionFrom(e.motion);
+            if (state.id != e.id or !S.finite3(state.linear_velocity) or !S.finite3(state.angular_velocity)) return error.InvalidReset;
             try S.validPose(state.pose);
-            if (b.motion_type == .static) {
-                for (state.pose.pos, b.initial_pose.pos) |a, z| if (a != z) return error.InvalidReset;
-                for (state.pose.quat, b.initial_pose.quat) |a, z| if (a != z) return error.InvalidReset;
+            if (motion == .static) {
+                for (state.pose.pos, initial.pos) |a, z| if (a != z) return error.InvalidReset;
+                for (state.pose.quat, initial.quat) |a, z| if (a != z) return error.InvalidReset;
             }
         };
         const m = w.model.?;
         const d = w.data.?;
         mj.mj_resetData(m, d);
-        for (w.source.objects, 0..) |*object, i| {
-            const b = &object.body;
+        for (w.source.objects, 0..) |slot, i| {
+            const e = database.entity(slot);
+            const initial = w.source.initialPose(i);
             const state: types.BodyState = if (input) |states| states[i] else .{
-                .id = b.id,
-                .pose = b.initial_pose,
+                .id = e.id,
+                .pose = initial,
                 .center_of_mass = @splat(0),
-                .linear_velocity = b.initial_velocity,
-                .angular_velocity = b.initial_angular_velocity,
+                .linear_velocity = e.initial_velocity,
+                .angular_velocity = e.initial_angular_velocity,
             };
             const id: usize = @intCast(w.body_ids[i]);
-            if (b.motion_type == .dynamic) {
+            const motion = database.motionFrom(e.motion);
+            if (motion == .dynamic) {
                 const joint: usize = @intCast(m.body_jntadr[id]);
                 const qa: usize = @intCast(m.jnt_qposadr[joint]);
                 const va: usize = @intCast(m.jnt_dofadr[joint]);
                 transform(d.qpos + qa, d.qpos + qa + 3, state.pose);
-                // Freejoint translation is at the body origin; simulator velocity is at COM.
-                const offset = S.rotate(state.pose.quat, b.center_of_mass.pos);
+                const com = database.entityCenterOfMass(slot.db, slot.slot);
+                const offset = S.rotate(state.pose.quat, com.pos);
                 xyz(d.qvel + va, S.sub(state.linear_velocity, S.cross(state.angular_velocity, offset)));
                 xyz(d.qvel + va + 3, S.rotate(S.conjugate(state.pose.quat), state.angular_velocity));
-            } else if (b.motion_type == .kinematic) {
+            } else if (motion == .kinematic) {
                 const k: usize = @intCast(m.body_mocapid[id]);
                 transform(d.mocap_pos + 3 * k, d.mocap_quat + 4 * k, state.pose);
             }
@@ -111,11 +115,10 @@ pub const MujocoBackend = struct {
         try w.refresh();
     }
 
-    /// Input is one world-frame wrench per body in scene order.
     pub fn step(w: *MujocoBackend, input: []const types.Wrench) !void {
         if (input.len != w.source.objects.len) return error.InvalidWrenchCount;
-        for (input, w.source.objects) |wrench, object| {
-            if (wrench.id != object.body.id or !S.finite3(wrench.force) or !S.finite3(wrench.torque))
+        for (input, w.source.objects) |wrench, slot| {
+            if (wrench.id != database.entity(slot).id or !S.finite3(wrench.force) or !S.finite3(wrench.torque))
                 return error.InvalidWrench;
         }
         const m = w.model.?;
@@ -153,57 +156,60 @@ pub const MujocoBackend = struct {
         const root = mj.mjs_findBody(spec, "world");
         if (root == null) return error.MuJoCoRootMissing;
         var name_buffer: [80]u8 = undefined;
-        for (scene.objects, 0..) |*object, i| {
-            const b = &object.body;
+        for (scene.objects, 0..) |slot, i| {
+            const e = database.entity(slot);
+            const initial = scene.initialPose(i);
             const body = mj.mjs_addBody(root, null);
             if (body == null) return error.OutOfMemory;
-            _ = mj.mjs_setName(body.*.element, (try namePrint(&name_buffer, "b{d}", .{b.id})).ptr);
-            transform(&body.*.pos, &body.*.quat, b.initial_pose);
-            body.*.mocap = if (@TypeOf(body.*.mocap) == bool) b.motion_type == .kinematic else @intFromBool(b.motion_type == .kinematic);
-            if (b.motion_type == .dynamic) {
+            _ = mj.mjs_setName(body.*.element, (try namePrint(&name_buffer, "b{d}", .{e.id})).ptr);
+            transform(&body.*.pos, &body.*.quat, initial);
+            const motion = database.motionFrom(e.motion);
+            body.*.mocap = if (@TypeOf(body.*.mocap) == bool) motion == .kinematic else @intFromBool(motion == .kinematic);
+            if (motion == .dynamic) {
                 if (mj.mjs_addFreeJoint(body) == null) return error.OutOfMemory;
                 body.*.explicitinertial = if (@TypeOf(body.*.explicitinertial) == bool) true else 1;
-                transform(&body.*.ipos, &body.*.iquat, b.center_of_mass);
-                body.*.mass = b.mass;
-                // Compile with isotropic inertia, then restore calibrated moments below.
-                const placeholder = @max(b.inertia[0], b.inertia[1], b.inertia[2]);
+                const com = database.entityCenterOfMass(slot.db, slot.slot);
+                transform(&body.*.ipos, &body.*.iquat, com);
+                body.*.mass = e.mass;
+                const placeholder = @max(e.inertia[0], e.inertia[1], e.inertia[2]);
                 xyz(&body.*.inertia, S.v(placeholder, placeholder, placeholder));
             }
-            for (object.colliders, 0..) |*g, k| {
-                if (g.restitution != 0) return error.UnsupportedRestitution;
+            const collider_count = database.ownedCount(slot.db.colliders.items, slot.slot);
+            for (0..collider_count) |k| {
+                const c = database.colliderAt(slot.db, slot.slot, k);
+                if (c.restitution != 0) return error.UnsupportedRestitution;
                 const geom = mj.mjs_addGeom(body, null);
                 if (geom == null) return error.OutOfMemory;
                 _ = mj.mjs_setName(geom.*.element, (try namePrint(&name_buffer, "g{d}_{d}", .{ i, k })).ptr);
-                transform(&geom.*.pos, &geom.*.quat, g.pose);
+                transform(&geom.*.pos, &geom.*.quat, database.poseOf(c.pos, c.quat));
                 geom.*.density = 0;
-                geom.*.contype = @intFromBool(g.collisions);
-                geom.*.conaffinity = @intFromBool(g.collisions);
-                xyz(&geom.*.friction, S.v(g.friction, 0, 0));
-                if (g.shape == .mesh) {
-                    const geometry = g.shape.mesh;
+                geom.*.contype = @intFromBool(c.collisions != 0);
+                geom.*.conaffinity = @intFromBool(c.collisions != 0);
+                xyz(&geom.*.friction, S.v(c.friction, 0, 0));
+                const shape = database.shapeFromRecord(slot.db, c);
+                if (shape == .mesh) {
                     const mesh = mj.mjs_addMesh(spec, null);
                     if (mesh == null) return error.OutOfMemory;
                     const name = try namePrint(&name_buffer, "m{d}_{d}", .{ i, k });
                     _ = mj.mjs_setName(mesh.*.element, name.ptr);
                     mj.mjs_setString(geom.*.meshname, name.ptr);
-                    const positions = try w.allocator.alloc(f32, geometry.positions.len * 3);
+                    const positions = try w.allocator.alloc(f32, shape.mesh.positions.len * 3);
                     defer w.allocator.free(positions);
-                    const triangles = try w.allocator.alloc(c_int, geometry.triangles.len * 3);
+                    const triangles = try w.allocator.alloc(c_int, shape.mesh.triangles.len * 3);
                     defer w.allocator.free(triangles);
-                    for (geometry.positions, 0..) |position, v|
+                    for (shape.mesh.positions, 0..) |position, v|
                         @memcpy(positions[3 * v ..][0..3], &position);
-                    for (geometry.triangles, 0..) |face, face_index| {
+                    for (shape.mesh.triangles, 0..) |face, face_index| {
                         triangles[3 * face_index ..][0..3].* = .{
                             @intCast(face.a), @intCast(face.b), @intCast(face.c),
                         };
                     }
-                    // These C setters copy into MuJoCo-owned asset buffers.
                     mj.mjs_setFloat(mesh.*.uservert, positions.ptr, @intCast(positions.len));
                     mj.mjs_setInt(mesh.*.userface, triangles.ptr, @intCast(triangles.len));
                     geom.*.type = mj.mjGEOM_MESH;
                 } else {
-                    geom.*.type = if (g.shape == .box) mj.mjGEOM_BOX else if (g.shape == .sphere) mj.mjGEOM_SPHERE else mj.mjGEOM_CYLINDER;
-                    if (g.shape == .box) xyz(&geom.*.size, g.size) else if (g.shape == .sphere) geom.*.size[0] = g.size[0] else xyz(&geom.*.size, S.v(g.size[0], g.size[2], 0));
+                    geom.*.type = if (shape == .box) mj.mjGEOM_BOX else if (shape == .sphere) mj.mjGEOM_SPHERE else mj.mjGEOM_CYLINDER;
+                    if (shape == .box) xyz(&geom.*.size, c.size) else if (shape == .sphere) geom.*.size[0] = c.size[0] else xyz(&geom.*.size, S.v(c.size[0], c.size[2], 0));
                 }
             }
         }
@@ -213,13 +219,14 @@ pub const MujocoBackend = struct {
             return error.MuJoCoCompileFailed;
         }
         const m = w.model.?;
-        for (scene.objects, 0..) |*object, i| {
-            const b = &object.body;
-            const id = mj.mj_name2id(m, mj.mjOBJ_BODY, (try namePrint(&name_buffer, "b{d}", .{b.id})).ptr);
+        for (scene.objects, 0..) |slot, i| {
+            const e = database.entity(slot);
+            const id = mj.mj_name2id(m, mj.mjOBJ_BODY, (try namePrint(&name_buffer, "b{d}", .{e.id})).ptr);
             if (id < 0) return error.MuJoCoBodyMissing;
             w.body_ids[i] = id;
-            if (b.motion_type == .dynamic) xyz(m.body_inertia + 3 * @as(usize, @intCast(id)), b.inertia);
-            for (0..object.colliders.len) |k| {
+            if (database.motionFrom(e.motion) == .dynamic) xyz(m.body_inertia + 3 * @as(usize, @intCast(id)), e.inertia);
+            const collider_count = database.ownedCount(slot.db.colliders.items, slot.slot);
+            for (0..collider_count) |k| {
                 const geom_id = mj.mj_name2id(m, mj.mjOBJ_GEOM, (try namePrint(&name_buffer, "g{d}_{d}", .{ i, k })).ptr);
                 if (geom_id < 0) return error.MuJoCoGeomMissing;
             }
@@ -248,12 +255,10 @@ fn namePrint(buffer: []u8, comptime format: []const u8, args: anytype) ![:0]u8 {
 fn xyz(out: [*c]f64, vector: types.Vec3) void {
     for (0..3) |i| out[i] = vector[i];
 }
-fn quaternion(out: [*c]f64, q: types.Quat) void {
-    // Shared xyzw quaternions and MuJoCo wxyz, both in NED coordinates.
-    out[0] = q[3];
-    for (0..3) |i| out[i + 1] = q[i];
-}
-fn transform(pos: [*c]f64, quat: [*c]f64, p: types.Pose) void {
-    xyz(pos, p.pos);
-    quaternion(quat, p.quat);
+fn transform(pos: [*c]f64, quat: [*c]f64, pose: types.Pose) void {
+    xyz(pos, pose.pos);
+    quat[0] = pose.quat[3];
+    quat[1] = pose.quat[0];
+    quat[2] = pose.quat[1];
+    quat[3] = pose.quat[2];
 }

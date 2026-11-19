@@ -2,7 +2,6 @@ const std = @import("std");
 const database = @import("database.zig");
 const types = @import("types.zig");
 const RobotCatalog = @import("robots.zig").RobotCatalog;
-const MissionConfig = @import("../MissionConfig.zig");
 const Scene = @import("Scene.zig");
 
 test "the embedded catalog builds a scene for each robot preset" {
@@ -18,19 +17,23 @@ test "the embedded catalog builds a scene for each robot preset" {
         };
         var scene = try Scene.init(testing.allocator, robot, null, &.{}, .{}, &.{}, &membership);
         defer scene.deinit();
-        try testing.expectEqualStrings(name, scene.objects[0].body.name);
-        try testing.expect(robot.thrusters.len <= MissionConfig.thruster_count);
-        try testing.expectEqual(@as(u8, @intCast(robot.thrusters.len)), scene.thruster_len);
+        try testing.expectEqualStrings(name, database.entityName(robot.db, robot.slot));
+        const thrusters = database.ownedCount(robot.db.thrusters.items, robot.slot);
+        try testing.expect(thrusters <= types.thruster_count);
+        try testing.expectEqual(@as(u8, @intCast(thrusters)), scene.thruster_len);
         try testing.expectEqual(catalog.slots[i], catalog.db.active.head);
         try testing.expectEqual(@as(u32, 1), catalog.db.active.count);
     }
     const proteus = catalog.find("proteus").?;
-    try testing.expectEqual(@as(u64, 0x404feb7b0b640c44), @as(u64, @bitCast(proteus.body.mass)));
-    try testing.expectEqual(@as(usize, 6), proteus.thrusters.len);
-    try testing.expectEqual(@as(usize, 1), proteus.hulls.len);
-    try testing.expect(proteus.colliders[0].shape == .mesh);
-    try testing.expect(proteus.colliders[0].shape.mesh.positions.len >= 4);
-    try testing.expect(proteus.hulls[0].positions.len % 3 == 0);
+    const pe = database.entity(proteus);
+    try testing.expectEqual(@as(u64, 0x404feb7b0b640c44), @as(u64, @bitCast(pe.mass)));
+    try testing.expectEqual(@as(usize, 6), database.ownedCount(proteus.db.thrusters.items, proteus.slot));
+    try testing.expectEqual(@as(usize, 1), database.ownedCount(proteus.db.hulls.items, proteus.slot));
+    const c0 = database.colliderAt(proteus.db, proteus.slot, 0);
+    try testing.expect(database.shapeFromRecord(proteus.db, c0) == .mesh);
+    try testing.expect(database.shapeFromRecord(proteus.db, c0).mesh.positions.len >= 4);
+    const h0 = database.hullAt(proteus.db, proteus.slot, 0);
+    try testing.expect(database.vertexSlice(proteus.db, h0.vertex_start, h0.vertex_count).len % 3 == 0);
 }
 
 test "catalog round trip keeps the embedded bytes" {
@@ -79,11 +82,10 @@ test "slots stay addressable until release bumps the generation" {
     defer loaded.deinit();
     try testing.expectEqual(@as(u32, 1), loaded.active.count);
     try testing.expectEqual(id, loaded.active.head);
-    const object = try loaded.objectView(testing.allocator, id);
-    defer database.freeObject(testing.allocator, object);
-    try testing.expectEqualStrings("buoy", object.body.name);
-    try testing.expect(object.colliders[0].shape == .box);
-    try testing.expectEqual(types.Vec3{ 1, 2, 3 }, object.colliders[0].size);
+    try testing.expectEqualStrings("buoy", database.entityName(&loaded, id));
+    const c = database.colliderAt(&loaded, id, 0);
+    try testing.expect(database.shapeFromRecord(&loaded, c) == .box);
+    try testing.expectEqual(types.Vec3{ 1, 2, 3 }, c.size);
     const held = loaded.ref(id);
     try testing.expectEqual(id, loaded.live(held).?);
     loaded.release(id);

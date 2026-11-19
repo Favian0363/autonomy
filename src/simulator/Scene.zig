@@ -7,46 +7,48 @@ const database = @import("database.zig");
 
 allocator: std.mem.Allocator,
 settings: types.Settings,
-objects: []const types.Object,
+objects: []const database.BodySlot,
+robot_spawn_pose: ?types.Pose = null,
 thruster_len: u8,
-thrusters: []const types.Thruster,
-hulls: []const types.Hull,
-sensors: []const types.Sensor,
+sensor_len: u8,
 routing: types.Routing,
 faults: []const types.Fault,
 forces: []const types.Force = &.{ .gravity, .hydrodynamics, .thrusters },
 
-/// Robot and additional collider definitions borrow immutable preset assets.
-/// The scene owns its object and fault arrays. Membership replaces each
-/// database active list with the slots that share this simulation.
+pub fn robot(self: *const Scene) database.BodySlot {
+    return self.objects[0];
+}
+
 pub fn init(
     allocator: std.mem.Allocator,
-    robot: *const types.Robot,
+    robot_slot: database.BodySlot,
     start: ?types.Pose,
-    additional: []const types.Object,
+    additional: []const database.BodySlot,
     settings: types.Settings,
     faults: []const types.Fault,
     membership: []const database.Membership,
 ) !Scene {
-    if (additional.len >= 4096 or robot.thrusters.len > types.thruster_count or
-        robot.hulls.len > types.max_hulls or robot.sensors.len > 64) return error.SceneCapacity;
+    if (additional.len >= 4096) return error.SceneCapacity;
+    const thruster_count = database.ownedCount(robot_slot.db.thrusters.items, robot_slot.slot);
+    const hull_count = database.ownedCount(robot_slot.db.hulls.items, robot_slot.slot);
+    const sensor_count = database.ownedCount(robot_slot.db.sensors.items, robot_slot.slot);
+    if (thruster_count > types.thruster_count or hull_count > types.max_hulls or sensor_count > 64)
+        return error.SceneCapacity;
 
-    const objects = try allocator.alloc(types.Object, additional.len + 1);
+    const objects = try allocator.alloc(database.BodySlot, additional.len + 1);
     errdefer allocator.free(objects);
-    objects[0] = .{ .body = robot.body, .colliders = robot.colliders };
-    if (start) |pose| objects[0].body.initial_pose = pose;
+    objects[0] = robot_slot;
     @memcpy(objects[1..], additional);
     const owned_faults = try allocator.dupe(types.Fault, faults);
     errdefer allocator.free(owned_faults);
-    if (robot.thrusters.len > types.thruster_count or robot.thrusters.len > std.math.maxInt(u8)) return error.SceneCapacity;
+    if (thruster_count > std.math.maxInt(u8)) return error.SceneCapacity;
     var scene: Scene = .{
         .allocator = allocator,
         .settings = settings,
         .objects = objects,
-        .thruster_len = @intCast(robot.thrusters.len),
-        .thrusters = robot.thrusters,
-        .hulls = robot.hulls,
-        .sensors = robot.sensors,
+        .robot_spawn_pose = start,
+        .thruster_len = @intCast(thruster_count),
+        .sensor_len = @intCast(sensor_count),
         .routing = .initFill(null),
         .faults = owned_faults,
     };
@@ -61,6 +63,17 @@ pub fn deinit(self: *Scene) void {
     self.* = undefined;
 }
 
+pub fn initialPose(self: *const Scene, index: usize) types.Pose {
+    const o = self.objects[index];
+    const override = if (index == 0) self.robot_spawn_pose else null;
+    return database.entityInitialPose(o.db, o.slot, override);
+}
+
+pub fn centerOfMass(self: *const Scene, index: usize) types.Pose {
+    const o = self.objects[index];
+    return database.entityCenterOfMass(o.db, o.slot);
+}
+
 fn validate(self: *Scene) !void {
     const s = self.settings;
     if (s.dt_numerator == 0 or s.dt_denominator == 0 or s.hydro_period == 0 or
@@ -69,64 +82,68 @@ fn validate(self: *Scene) !void {
         return error.InvalidSettings;
 
     for (self.objects, 0..) |object, i| {
-        const b = object.body;
-        if (b.id == std.math.maxInt(u32) or b.name.len >= 64 or
-            !math.finite3(b.initial_velocity) or !math.finite3(b.initial_angular_velocity) or
-            !math.finite3(b.inertia) or !math.finite3(b.buoyancy_center) or
-            !nonnegative(b.mass) or !nonnegative(b.dry_mass) or !nonnegative(b.volume))
+        const e = database.entity(object);
+        const name = database.entityName(object.db, object.slot);
+        if (e.id == std.math.maxInt(u32) or name.len >= 64 or
+            !math.finite3(e.initial_velocity) or !math.finite3(e.initial_angular_velocity) or
+            !math.finite3(e.inertia) or !math.finite3(e.buoyancy) or
+            !nonnegative(e.mass) or !nonnegative(e.dry_mass) or !nonnegative(e.volume))
             return error.InvalidBody;
-        if (b.motion_type == .dynamic and
-            !(positive(b.mass) and positive(b.inertia[0]) and positive(b.inertia[1]) and positive(b.inertia[2])))
+        const motion = database.motionFrom(e.motion);
+        if (motion == .dynamic and
+            !(positive(e.mass) and positive(e.inertia[0]) and positive(e.inertia[1]) and positive(e.inertia[2])))
             return error.InvalidBody;
-        try math.validPose(b.initial_pose);
-        try math.validPose(b.center_of_mass);
-        for (self.objects[0..i]) |other| if (b.id == other.body.id) return error.DuplicateBodyId;
-        if (object.colliders.len == 0 or object.colliders.len > 1024) return error.InvalidColliders;
-        for (object.colliders) |collider| try validateCollider(collider);
+        try math.validPose(self.initialPose(i));
+        try math.validPose(database.entityCenterOfMass(object.db, object.slot));
+        for (self.objects[0..i]) |other| if (e.id == database.entity(other).id) return error.DuplicateBodyId;
+        const collider_count = database.ownedCount(object.db.colliders.items, object.slot);
+        if (collider_count == 0 or collider_count > 1024) return error.InvalidColliders;
+        for (0..collider_count) |k| try validateCollider(object.db, database.colliderAt(object.db, object.slot, k));
     }
-    for (self.thrusters) |thruster| {
-        const spec = thruster.spec;
-        if (@backingInt(thruster.body) >= self.objects.len or !math.finite3(thruster.position) or
-            !math.finite3(thruster.direction) or @abs(math.norm(thruster.direction) - 1) >= 1e-4 or
-            !positive(spec.max_rpm) or !positive(spec.diameter) or !positive(spec.inertia) or
-            !std.math.isFinite(spec.thrust) or !std.math.isFinite(spec.torque) or
-            !nonnegative(spec.kp) or !nonnegative(spec.ki) or
-            (spec.command_sign != 1 and spec.command_sign != -1)) return error.InvalidThruster;
+    const robot_slot = self.robot();
+    for (0..self.thruster_len) |index| {
+        const t = database.thrusterAt(robot_slot.db, robot_slot.slot, index);
+        if (t.body >= self.objects.len or !math.finite3(t.position) or !math.finite3(t.direction) or
+            @abs(math.norm(t.direction) - 1) >= 1e-4 or !positive(t.max_rpm) or !positive(t.diameter) or !positive(t.inertia) or
+            !std.math.isFinite(t.thrust) or !std.math.isFinite(t.torque) or !nonnegative(t.kp) or !nonnegative(t.ki) or
+            (t.command_sign != 1 and t.command_sign != -1)) return error.InvalidThruster;
     }
-    for (self.hulls) |hull| {
-        if (@backingInt(hull.body) >= self.objects.len or hull.positions.len == 0 or
-            hull.positions.len % 3 != 0 or !math.finite3(hull.drag) or !math.finite3(hull.skin) or
-            !math.finite3(hull.centroid) or !nonnegative(hull.volume)) return error.InvalidHull;
-        try math.validPose(hull.pose);
-        try math.validPose(.{ .quat = hull.coefficient_frame });
-        for (hull.positions) |position| if (!math.finite3(position)) return error.InvalidHull;
+    const hull_count = database.ownedCount(robot_slot.db.hulls.items, robot_slot.slot);
+    for (0..hull_count) |index| {
+        const h = database.hullAt(robot_slot.db, robot_slot.slot, index);
+        if (h.body >= self.objects.len or h.vertex_count == 0 or h.vertex_count % 3 != 0 or
+            !math.finite3(h.drag) or !math.finite3(h.skin) or !math.finite3(h.centroid) or !nonnegative(h.volume))
+            return error.InvalidHull;
+        try math.validPose(database.poseOf(h.pos, h.quat));
+        try math.validPose(.{ .quat = h.coefficient_frame });
+        const positions = database.vertexSlice(robot_slot.db, h.vertex_start, h.vertex_count);
+        for (positions) |position| if (!math.finite3(position)) return error.InvalidHull;
     }
-    for (self.sensors, 0..) |sensor, index| {
-        if (@backingInt(sensor.body) >= self.objects.len or sensor.period_ticks == 0) return error.InvalidSensor;
-        try math.validPose(sensor.pose);
-        for (self.sensors[0..index]) |other| if (sensor.id == other.id) return error.DuplicateSensorId;
-        if (sensor.settings == .camera) {
-            const camera = sensor.settings.camera;
-            if (camera.width == 0 or camera.height == 0 or camera.width > 65536 or camera.height > 65536 or
-                !positive(camera.horizontal_fov) or camera.horizontal_fov >= 180 or
-                !positive(camera.near_range) or !positive(camera.far_range) or camera.far_range <= camera.near_range)
+    for (0..self.sensor_len) |index| {
+        const sensor = database.sensorAt(robot_slot.db, robot_slot.slot, index);
+        if (sensor.body >= self.objects.len or sensor.period_ticks == 0) return error.InvalidSensor;
+        try math.validPose(database.poseOf(sensor.pos, sensor.quat));
+        for (0..index) |other| if (sensor.id == database.sensorAt(robot_slot.db, robot_slot.slot, other).id) return error.DuplicateSensorId;
+        if (database.sensorKind(sensor) == .camera) {
+            if (sensor.width == 0 or sensor.height == 0 or sensor.width > 65536 or sensor.height > 65536 or
+                !positive(sensor.horizontal_fov) or sensor.horizontal_fov >= 180 or
+                !positive(sensor.near_range) or !positive(sensor.far_range) or sensor.far_range <= sensor.near_range)
                 return error.InvalidCamera;
         }
-        // Match the preset rule of routing the last sensor of each kind.
-        self.routing.set(sensor.kind(), @fromBackingInt(@intCast(index)));
+        self.routing.set(database.sensorKind(sensor), @fromBackingInt(@intCast(index)));
     }
     var routed_body: ?types.BodyIndex = null;
-    for (self.routing.values) |ref| if (ref) |index| {
-        const body = self.sensors[@backingInt(index)].body;
-        if (routed_body) |previous| if (body != previous) return error.InvalidSensorRouting;
-        routed_body = body;
+    for (self.routing.values) |ref| if (ref) |sensor_index| {
+        const body_index: types.BodyIndex = @enumFromInt(database.sensorAt(robot_slot.db, robot_slot.slot, @intCast(@backingInt(sensor_index))).body);
+        if (routed_body) |previous| if (body_index != previous) return error.InvalidSensorRouting;
+        routed_body = body_index;
     };
     for (self.faults) |fault| {
         if (fault.start >= fault.end) return error.InvalidFault;
         const valid = switch (fault.effect) {
-            .dead => |index| index < self.thrusters.len,
-            .weak => |weak| weak.thruster < self.thrusters.len and nonnegative(weak.scale) and weak.scale <= 1,
-            .disable_sensor => |index| @backingInt(index) < self.sensors.len,
+            .dead => |channel| channel < self.thruster_len,
+            .weak => |weak| weak.thruster < self.thruster_len and nonnegative(weak.scale) and weak.scale <= 1,
+            .disable_sensor => |ref| @backingInt(ref) < self.sensor_len,
             .gyro_bias => |gyro| self.sensorIs(gyro.sensor, .imu) and std.math.isFinite(gyro.bias),
             .depth_bias => |depth| self.sensorIs(depth.sensor, .pressure) and std.math.isFinite(depth.bias),
         };
@@ -136,15 +153,18 @@ fn validate(self: *Scene) !void {
 
 fn sensorIs(self: *const Scene, ref: types.SensorIndex, kind: types.SensorKind) bool {
     const index = @backingInt(ref);
-    return index < self.sensors.len and self.sensors[index].kind() == kind;
+    const robot_slot = self.robot();
+    return index < self.sensor_len and database.sensorKind(database.sensorAt(robot_slot.db, robot_slot.slot, index)) == kind;
 }
 
-fn validateCollider(c: types.Collider) !void {
-    try math.validPose(c.pose);
+fn validateCollider(db: *const database.Database, c: *const database.ColliderRecord) !void {
+    const pose = database.poseOf(c.pos, c.quat);
+    try math.validPose(pose);
     if (!math.finite3(c.size) or !math.finite3(c.drag) or !math.finite3(c.skin) or
         !nonnegative(c.friction) or !nonnegative(c.restitution) or c.restitution > 1)
         return error.InvalidCollider;
-    switch (c.shape) {
+    const shape = database.shapeFromRecord(db, c);
+    switch (shape) {
         .mesh => |mesh| {
             if (mesh.positions.len < 4 or mesh.positions.len > 1000000 or
                 mesh.triangles.len == 0 or mesh.triangles.len > 2000000) return error.InvalidMesh;

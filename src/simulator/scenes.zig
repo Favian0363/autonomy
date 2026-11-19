@@ -1,5 +1,4 @@
 const std = @import("std");
-const types = @import("types.zig");
 const database = @import("database.zig");
 
 pub const SceneCatalog = struct {
@@ -9,7 +8,6 @@ pub const SceneCatalog = struct {
 
     pub const LoadedScene = struct {
         name: []const u8,
-        objects: []types.Object,
         slots: []u32,
     };
 
@@ -22,28 +20,14 @@ pub const SceneCatalog = struct {
         errdefer db.deinit();
         const scenes = try allocator.alloc(LoadedScene, db.names.items.len);
         errdefer allocator.free(scenes);
-        var built: usize = 0;
-        errdefer for (scenes[0..built]) |scene| freeScene(allocator, scene);
-
         for (db.names.items, 0..) |name, i| {
-            const objects = try allocator.alloc(types.Object, name.entity_count);
-            errdefer allocator.free(objects);
             const slots = try allocator.alloc(u32, name.entity_count);
             errdefer allocator.free(slots);
-            var hydrated: usize = 0;
-            errdefer for (objects[0..hydrated]) |object| database.freeObject(allocator, object);
-            for (0..name.entity_count) |j| {
-                const slot = name.entity_start + @as(u32, @intCast(j));
-                slots[j] = slot;
-                objects[j] = try db.objectView(allocator, slot);
-                hydrated += 1;
-            }
+            for (0..name.entity_count) |j| slots[j] = name.entity_start + @as(u32, @intCast(j));
             scenes[i] = .{
                 .name = db.string(name.name_offset, name.name_len),
-                .objects = objects,
                 .slots = slots,
             };
-            built += 1;
         }
         return .{ .allocator = allocator, .db = db, .scenes = scenes };
     }
@@ -53,24 +37,14 @@ pub const SceneCatalog = struct {
         return null;
     }
 
+    pub fn presetBodySlots(self: *const SceneCatalog, preset: *const LoadedScene, out: []database.BodySlot) void {
+        for (preset.slots, out) |slot, *body| body.* = .{ .db = &self.db, .slot = slot };
+    }
+
     pub fn deinit(self: *SceneCatalog) void {
-        var i = self.scenes.len;
-        while (i > 0) {
-            i -= 1;
-            freeScene(self.allocator, self.scenes[i]);
-        }
+        for (self.scenes) |scene| self.allocator.free(scene.slots);
         self.allocator.free(self.scenes);
         self.db.deinit();
         self.* = undefined;
     }
 };
-
-fn freeScene(allocator: std.mem.Allocator, scene: SceneCatalog.LoadedScene) void {
-    var i = scene.objects.len;
-    while (i > 0) {
-        i -= 1;
-        database.freeObject(allocator, scene.objects[i]);
-    }
-    allocator.free(scene.objects);
-    allocator.free(scene.slots);
-}

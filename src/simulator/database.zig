@@ -5,154 +5,25 @@
 //! columns only, and load rebuilds the active list in entity order.
 const std = @import("std");
 const types = @import("types.zig");
+const abi = @import("abi.zig");
 
-pub const nil: u32 = std.math.maxInt(u32);
-pub const magic = "SIMDB001";
-pub const version: u32 = 1;
-pub const table_count: u32 = 9;
-pub const directory_at: usize = magic.len + 8;
-pub const entry_size: usize = 12;
-pub const header_size: usize = directory_at + table_count * entry_size;
-
-pub const table = struct {
-    pub const strings: usize = 0;
-    pub const entities: usize = 1;
-    pub const colliders: usize = 2;
-    pub const thrusters: usize = 3;
-    pub const hulls: usize = 4;
-    pub const sensors: usize = 5;
-    pub const positions: usize = 6;
-    pub const indices: usize = 7;
-    pub const names: usize = 8;
-};
-
-pub const TableEntry = struct { offset: u32, count: u32, stride: u32 };
-
-pub const EntityRecord = extern struct {
-    name_offset: u32,
-    name_len: u32,
-    asset_offset: u32,
-    asset_len: u32,
-    asset_hash: [32]u8,
-    id: u32,
-    cls: u32,
-    motion: u32,
-    tracked: u8,
-    fuzz: u8,
-    pad0: u16,
-    mass: f64,
-    inertia: [3]f32,
-    pad1: u32,
-    com_pos: [3]f32,
-    com_quat: [4]f32,
-    initial_pos: [3]f32,
-    initial_quat: [4]f32,
-    initial_velocity: [3]f32,
-    initial_angular_velocity: [3]f32,
-    dry_mass: f64,
-    volume: f64,
-    buoyancy: [3]f32,
-    pad2: u32,
-};
-
-pub const ColliderRecord = extern struct {
-    owner: u32,
-    shape: u32,
-    collisions: u8,
-    pad0: [3]u8,
-    pos: [3]f32,
-    quat: [4]f32,
-    size: [3]f32,
-    drag: [3]f32,
-    skin: [3]f32,
-    pad1: u32,
-    friction: f64,
-    restitution: f64,
-    vertex_start: u32,
-    vertex_count: u32,
-    triangle_start: u32,
-    triangle_count: u32,
-};
-
-pub const ThrusterRecord = extern struct {
-    owner: u32,
-    body: u32,
-    position: [3]f32,
-    direction: [3]f32,
-    max_rpm: f64,
-    diameter: f64,
-    thrust: f64,
-    torque: f64,
-    inertia: f64,
-    kp: f64,
-    ki: f64,
-    command_sign: f64,
-};
-
-pub const HullRecord = extern struct {
-    owner: u32,
-    body: u32,
-    pos: [3]f32,
-    quat: [4]f32,
-    drag: [3]f32,
-    skin: [3]f32,
-    centroid: [3]f32,
-    coefficient_frame: [4]f32,
-    volume: f64,
-    vertex_start: u32,
-    vertex_count: u32,
-};
-
-pub const SensorRecord = extern struct {
-    owner: u32,
-    body: u32,
-    id: u32,
-    enabled: u8,
-    pad0: [3]u8,
-    period_ticks: u32,
-    pos: [3]f32,
-    quat: [4]f32,
-    kind: u32,
-    position_axes: u8,
-    attitude_axes: u8,
-    pad1: u16,
-    width: u32,
-    height: u32,
-    horizontal_fov: f64,
-    near_range: f64,
-    far_range: f64,
-};
-
-pub const NameRecord = extern struct {
-    name_offset: u32,
-    name_len: u32,
-    entity_start: u32,
-    entity_count: u32,
-};
-
-const strides = [table_count]u32{
-    1,
-    @sizeOf(EntityRecord),
-    @sizeOf(ColliderRecord),
-    @sizeOf(ThrusterRecord),
-    @sizeOf(HullRecord),
-    @sizeOf(SensorRecord),
-    @sizeOf(f32),
-    @sizeOf(u32),
-    @sizeOf(NameRecord),
-};
-
-const aligns = [table_count]u32{
-    1,
-    @alignOf(EntityRecord),
-    @alignOf(ColliderRecord),
-    @alignOf(ThrusterRecord),
-    @alignOf(HullRecord),
-    @alignOf(SensorRecord),
-    @alignOf(f32),
-    @alignOf(u32),
-    @alignOf(NameRecord),
-};
+pub const nil = abi.nil;
+pub const magic = abi.magic;
+pub const version = abi.version;
+pub const table_count = abi.table_count;
+pub const directory_at = abi.directory_at;
+pub const entry_size = abi.entry_size;
+pub const header_size = abi.header_size;
+pub const table = abi.table;
+pub const TableEntry = abi.TableEntry;
+pub const EntityRecord = abi.EntityRecord;
+pub const ColliderRecord = abi.ColliderRecord;
+pub const ThrusterRecord = abi.ThrusterRecord;
+pub const HullRecord = abi.HullRecord;
+pub const SensorRecord = abi.SensorRecord;
+pub const NameRecord = abi.NameRecord;
+const strides = abi.strides;
+const aligns = abi.aligns;
 
 pub const Ref = struct { id: u32, generation: u32 };
 
@@ -160,6 +31,68 @@ pub const Membership = struct {
     db: *Database,
     slots: []const u32,
 };
+
+/// Body row in a specific loaded catalog (required when a scene joins multiple DBs).
+pub const BodySlot = struct {
+    db: *const Database,
+    slot: u32,
+};
+
+pub fn entity(slot: BodySlot) *const EntityRecord {
+    return &slot.db.entities.items[slot.slot];
+}
+
+pub fn entityName(db: *const Database, slot: u32) []const u8 {
+    const e = &db.entities.items[slot];
+    return db.string(e.name_offset, e.name_len);
+}
+
+pub fn entityInitialPose(db: *const Database, slot: u32, spawn_override: ?types.Pose) types.Pose {
+    if (spawn_override) |pose| return pose;
+    const e = &db.entities.items[slot];
+    return poseOf(e.initial_pos, e.initial_quat);
+}
+
+pub fn entityCenterOfMass(db: *const Database, slot: u32) types.Pose {
+    const e = &db.entities.items[slot];
+    return poseOf(e.com_pos, e.com_quat);
+}
+
+pub fn ownedNth(comptime Row: type, records: []const Row, owner: u32, nth: usize) usize {
+    var seen: usize = 0;
+    for (records, 0..) |record, i| {
+        if (record.owner != owner) continue;
+        if (seen == nth) return i;
+        seen += 1;
+    }
+    unreachable;
+}
+
+pub fn colliderAt(db: *const Database, owner: u32, nth: usize) *const ColliderRecord {
+    return &db.colliders.items[ownedNth(ColliderRecord, db.colliders.items, owner, nth)];
+}
+
+pub fn thrusterAt(db: *const Database, owner: u32, nth: usize) *const ThrusterRecord {
+    return &db.thrusters.items[ownedNth(ThrusterRecord, db.thrusters.items, owner, nth)];
+}
+
+pub fn hullAt(db: *const Database, owner: u32, nth: usize) *const HullRecord {
+    return &db.hulls.items[ownedNth(HullRecord, db.hulls.items, owner, nth)];
+}
+
+pub fn sensorAt(db: *const Database, owner: u32, nth: usize) *const SensorRecord {
+    return &db.sensors.items[ownedNth(SensorRecord, db.sensors.items, owner, nth)];
+}
+
+pub fn sensorKind(record: *const SensorRecord) types.SensorKind {
+    return switch (record.kind) {
+        0 => .pose,
+        1 => .imu,
+        2 => .pressure,
+        3 => .camera,
+        else => unreachable,
+    };
+}
 
 pub const EntityInput = struct {
     name: []const u8,
@@ -389,182 +322,15 @@ pub const Database = struct {
         return db;
     }
 
-    pub fn objectView(self: *const Database, allocator: std.mem.Allocator, slot: u32) !types.Object {
-        return .{
-            .body = self.bodyView(slot),
-            .colliders = try self.colliderViews(allocator, slot),
-        };
-    }
-
-    pub fn robotView(self: *const Database, allocator: std.mem.Allocator, slot: u32) !types.Robot {
-        const entity = self.entities.items[slot];
-        const colliders = try self.colliderViews(allocator, slot);
-        errdefer allocator.free(colliders);
-        const thrusters = try self.thrusterViews(allocator, slot);
-        errdefer allocator.free(thrusters);
-        const hulls = try self.hullViews(allocator, slot);
-        errdefer allocator.free(hulls);
-        const sensors = try self.sensorViews(allocator, slot);
-        const name = self.string(entity.name_offset, entity.name_len);
-        return .{
-            .name = name,
-            .asset_file = self.string(entity.asset_offset, entity.asset_len),
-            .asset_hash = entity.asset_hash,
-            .body = self.bodyView(slot),
-            .colliders = colliders,
-            .thrusters = thrusters,
-            .hulls = hulls,
-            .sensors = sensors,
-        };
-    }
-
-    fn bodyView(self: *const Database, slot: u32) types.RealtimeUnderwaterBody {
-        const entity = self.entities.items[slot];
-        return .{
-            .id = entity.id,
-            .name = self.string(entity.name_offset, entity.name_len),
-            .cls = entity.cls,
-            .motion_type = motionFrom(entity.motion),
-            .tracked = entity.tracked != 0,
-            .fuzz = entity.fuzz != 0,
-            .mass = entity.mass,
-            .inertia = entity.inertia,
-            .center_of_mass = poseOf(entity.com_pos, entity.com_quat),
-            .initial_pose = poseOf(entity.initial_pos, entity.initial_quat),
-            .initial_velocity = entity.initial_velocity,
-            .initial_angular_velocity = entity.initial_angular_velocity,
-            .dry_mass = entity.dry_mass,
-            .volume = entity.volume,
-            .buoyancy_center = entity.buoyancy,
-        };
-    }
-
-    fn colliderViews(self: *const Database, allocator: std.mem.Allocator, slot: u32) ![]types.Collider {
-        const out = try allocator.alloc(types.Collider, ownedCount(self.colliders.items, slot));
-        var n: usize = 0;
-        for (self.colliders.items) |record| if (record.owner == slot) {
-            out[n] = .{
-                .shape = self.shapeView(record),
-                .collisions = record.collisions != 0,
-                .pose = poseOf(record.pos, record.quat),
-                .size = record.size,
-                .drag = record.drag,
-                .skin = record.skin,
-                .friction = record.friction,
-                .restitution = record.restitution,
-            };
-            n += 1;
-        };
-        return out;
-    }
-
-    fn thrusterViews(self: *const Database, allocator: std.mem.Allocator, slot: u32) ![]types.Thruster {
-        const out = try allocator.alloc(types.Thruster, ownedCount(self.thrusters.items, slot));
-        var n: usize = 0;
-        for (self.thrusters.items) |record| if (record.owner == slot) {
-            out[n] = .{
-                .body = @fromBackingInt(record.body),
-                .position = record.position,
-                .direction = record.direction,
-                .spec = .{
-                    .max_rpm = record.max_rpm,
-                    .diameter = record.diameter,
-                    .thrust = record.thrust,
-                    .torque = record.torque,
-                    .inertia = record.inertia,
-                    .kp = record.kp,
-                    .ki = record.ki,
-                    .command_sign = record.command_sign,
-                },
-            };
-            n += 1;
-        };
-        return out;
-    }
-
-    fn hullViews(self: *const Database, allocator: std.mem.Allocator, slot: u32) ![]types.Hull {
-        const out = try allocator.alloc(types.Hull, ownedCount(self.hulls.items, slot));
-        var n: usize = 0;
-        for (self.hulls.items) |record| if (record.owner == slot) {
-            out[n] = .{
-                .body = @fromBackingInt(record.body),
-                .pose = poseOf(record.pos, record.quat),
-                .positions = self.vertexSlice(record.vertex_start, record.vertex_count),
-                .drag = record.drag,
-                .skin = record.skin,
-                .centroid = record.centroid,
-                .coefficient_frame = record.coefficient_frame,
-                .volume = record.volume,
-            };
-            n += 1;
-        };
-        return out;
-    }
-
-    fn sensorViews(self: *const Database, allocator: std.mem.Allocator, slot: u32) ![]types.Sensor {
-        const out = try allocator.alloc(types.Sensor, ownedCount(self.sensors.items, slot));
-        var n: usize = 0;
-        for (self.sensors.items) |record| if (record.owner == slot) {
-            out[n] = .{
-                .id = record.id,
-                .body = @fromBackingInt(record.body),
-                .pose = poseOf(record.pos, record.quat),
-                .enabled = record.enabled != 0,
-                .period_ticks = record.period_ticks,
-                .settings = switch (record.kind) {
-                    0 => .{ .pose = .{
-                        .position_axes = @intCast(record.position_axes),
-                        .attitude_axes = @intCast(record.attitude_axes),
-                    } },
-                    1 => .imu,
-                    2 => .pressure,
-                    3 => .{ .camera = .{
-                        .width = record.width,
-                        .height = record.height,
-                        .horizontal_fov = record.horizontal_fov,
-                        .near_range = record.near_range,
-                        .far_range = record.far_range,
-                    } },
-                    else => unreachable,
-                },
-            };
-            n += 1;
-        };
-        return out;
-    }
-
-    fn shapeView(self: *const Database, record: ColliderRecord) types.Shape {
-        return switch (record.shape) {
-            0 => .box,
-            1 => .sphere,
-            2 => .cylinder,
-            3 => .{ .mesh = .{
-                .positions = self.vertexSlice(record.vertex_start, record.vertex_count),
-                .triangles = self.triangleSlice(record.triangle_start, record.triangle_count),
-            } },
-            else => unreachable,
-        };
-    }
-
-    fn vertexSlice(self: *const Database, start: u32, count: u32) []const types.Vec3 {
-        const floats = self.positions.items[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
-        return std.mem.bytesAsSlice(types.Vec3, std.mem.sliceAsBytes(floats));
-    }
-
-    fn triangleSlice(self: *const Database, start: u32, count: u32) []const types.Triangle {
-        const idxs = self.indices.items[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
-        return std.mem.bytesAsSlice(types.Triangle, std.mem.sliceAsBytes(idxs));
-    }
-
     fn validate(self: *const Database) !void {
         if (self.positions.items.len % 3 != 0 or self.indices.items.len % 3 != 0) return error.InvalidDatabase;
         const vertex_total: u64 = self.positions.items.len / 3;
         const triangle_total: u64 = self.indices.items.len / 3;
         for (self.positions.items) |component| if (!std.math.isFinite(component)) return error.InvalidDatabase;
-        for (self.entities.items) |entity| {
-            try bounds(self.strings.items.len, entity.name_offset, entity.name_len);
-            try bounds(self.strings.items.len, entity.asset_offset, entity.asset_len);
-            if (entity.name_len == 0 or entity.tracked > 1 or entity.fuzz > 1 or entity.motion > 2)
+        for (self.entities.items) |row| {
+            try bounds(self.strings.items.len, row.name_offset, row.name_len);
+            try bounds(self.strings.items.len, row.asset_offset, row.asset_len);
+            if (row.name_len == 0 or row.tracked > 1 or row.fuzz > 1 or row.motion > 2)
                 return error.InvalidDatabase;
         }
         for (self.colliders.items) |collider| {
@@ -715,17 +481,6 @@ pub const Database = struct {
     }
 };
 
-pub fn freeRobot(allocator: std.mem.Allocator, robot: types.Robot) void {
-    allocator.free(robot.sensors);
-    allocator.free(robot.hulls);
-    allocator.free(robot.thrusters);
-    allocator.free(robot.colliders);
-}
-
-pub fn freeObject(allocator: std.mem.Allocator, object: types.Object) void {
-    allocator.free(object.colliders);
-}
-
 pub fn readHeader(bytes: []const u8) ![table_count]TableEntry {
     if (bytes.len < header_size or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidDatabase;
     if (std.mem.readInt(u32, bytes[magic.len..][0..4], .little) != version) return error.UnsupportedDatabaseVersion;
@@ -809,12 +564,35 @@ fn copyColumn(
     allocator.free(items);
 }
 
-fn ownedCount(records: anytype, owner: u32) usize {
+pub fn ownedCount(records: anytype, owner: u32) usize {
     var n: usize = 0;
     for (records) |record| {
         if (record.owner == owner) n += 1;
     }
     return n;
+}
+
+pub fn shapeFromRecord(db: *const Database, record: *const ColliderRecord) types.Shape {
+    return switch (record.shape) {
+        0 => .box,
+        1 => .sphere,
+        2 => .cylinder,
+        3 => .{ .mesh = .{
+            .positions = vertexSlice(db, record.vertex_start, record.vertex_count),
+            .triangles = triangleSlice(db, record.triangle_start, record.triangle_count),
+        } },
+        else => unreachable,
+    };
+}
+
+pub fn vertexSlice(db: *const Database, start: u32, count: u32) []const types.Vec3 {
+    const floats = db.positions.items[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
+    return std.mem.bytesAsSlice(types.Vec3, std.mem.sliceAsBytes(floats));
+}
+
+pub fn triangleSlice(db: *const Database, start: u32, count: u32) []const types.Triangle {
+    const idxs = db.indices.items[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
+    return std.mem.bytesAsSlice(types.Triangle, std.mem.sliceAsBytes(idxs));
 }
 
 fn bounds(len: usize, offset: u32, size: u32) !void {
@@ -834,7 +612,7 @@ fn motionTag(motion: types.Motion) u32 {
     };
 }
 
-fn motionFrom(value: u32) types.Motion {
+pub fn motionFrom(value: u32) types.Motion {
     return switch (value) {
         0 => .static,
         1 => .dynamic,
@@ -842,6 +620,6 @@ fn motionFrom(value: u32) types.Motion {
     };
 }
 
-fn poseOf(pos: [3]f32, quat: [4]f32) types.Pose {
+pub fn poseOf(pos: [3]f32, quat: [4]f32) types.Pose {
     return .{ .pos = pos, .quat = quat };
 }

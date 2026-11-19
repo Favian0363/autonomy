@@ -4,13 +4,13 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
 
     const robot_catalog_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/simulator/robot_geometry_test.zig"),
+        .root_source_file = b.path("src/simulator_catalog_tests.zig"),
         .target = b.graph.host,
     }) }));
     b.step("test-simulator-geometry", "Validate the embedded simulator geometry catalog").dependOn(&robot_catalog_tests.step);
 
     const scene_catalog_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/simulator/scene_geometry_test.zig"),
+        .root_source_file = b.path("src/simulator_scene_catalog_tests.zig"),
         .target = b.graph.host,
     }) }));
     b.step("test-simulator-scene-geometry", "Validate the embedded simulator scene catalog").dependOn(&scene_catalog_tests.step);

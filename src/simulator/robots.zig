@@ -1,11 +1,9 @@
 const std = @import("std");
-const types = @import("types.zig");
 const database = @import("database.zig");
 
 pub const RobotCatalog = struct {
     allocator: std.mem.Allocator,
     db: database.Database,
-    robots: []types.Robot,
     slots: []u32,
 
     pub fn init(allocator: std.mem.Allocator) !RobotCatalog {
@@ -15,40 +13,33 @@ pub const RobotCatalog = struct {
     pub fn initFromBytes(allocator: std.mem.Allocator, bytes: []const u8) !RobotCatalog {
         var db = try database.Database.load(allocator, bytes);
         errdefer db.deinit();
-        const robots = try allocator.alloc(types.Robot, db.names.items.len);
-        errdefer allocator.free(robots);
         const slots = try allocator.alloc(u32, db.names.items.len);
         errdefer allocator.free(slots);
-        var built: usize = 0;
-        errdefer for (robots[0..built]) |robot| database.freeRobot(allocator, robot);
-
         for (db.names.items, 0..) |name, i| {
             if (name.entity_count != 1) return error.InvalidDatabase;
             slots[i] = name.entity_start;
-            robots[i] = try db.robotView(allocator, name.entity_start);
-            built += 1;
         }
-        return .{ .allocator = allocator, .db = db, .robots = robots, .slots = slots };
+        return .{ .allocator = allocator, .db = db, .slots = slots };
+    }
+
+    pub fn body(self: *const RobotCatalog, robot_index: usize) database.BodySlot {
+        return .{ .db = &self.db, .slot = self.slots[robot_index] };
     }
 
     pub fn index(self: *const RobotCatalog, name: []const u8) ?usize {
-        for (self.robots, 0..) |robot, i| if (std.mem.eql(u8, name, robot.name)) return i;
+        for (self.slots, 0..) |slot, i| {
+            if (std.mem.eql(u8, name, database.entityName(&self.db, slot))) return i;
+        }
         return null;
     }
 
-    pub fn find(self: *const RobotCatalog, name: []const u8) ?*const types.Robot {
+    pub fn find(self: *const RobotCatalog, name: []const u8) ?database.BodySlot {
         const i = self.index(name) orelse return null;
-        return &self.robots[i];
+        return self.body(i);
     }
 
     pub fn deinit(self: *RobotCatalog) void {
-        var i = self.robots.len;
-        while (i > 0) {
-            i -= 1;
-            database.freeRobot(self.allocator, self.robots[i]);
-        }
         self.allocator.free(self.slots);
-        self.allocator.free(self.robots);
         self.db.deinit();
         self.* = undefined;
     }

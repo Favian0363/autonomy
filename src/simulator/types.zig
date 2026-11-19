@@ -35,26 +35,10 @@ pub const Collider = struct {
     restitution: f64 = 0,
 };
 
+pub const abi = @import("abi.zig");
 pub const Motion = enum { static, dynamic, kinematic };
-pub const RealtimeUnderwaterBody = struct {
-    id: u32,
-    name: []const u8,
-    cls: u32 = 0,
-    motion_type: Motion = .static,
-    tracked: bool = false,
-    fuzz: bool = false,
-    mass: f64 = 0,
-    inertia: Vec3 = @splat(1),
-    center_of_mass: Pose = .{},
-    initial_pose: Pose = .{},
-    initial_velocity: Vec3 = @splat(0),
-    initial_angular_velocity: Vec3 = @splat(0),
-    dry_mass: f64 = 0,
-    volume: f64 = 0,
-    buoyancy_center: Vec3 = @splat(0),
-};
 
-pub const Object = struct { body: RealtimeUnderwaterBody, colliders: []const Collider };
+/// Authoring-only thruster row for `EntityInput` / export tools.
 pub const RotorSpec = struct {
     max_rpm: f64,
     diameter: f64,
@@ -120,17 +104,6 @@ pub const Fault = struct {
     pub fn active(self: Fault, tick: u64) bool {
         return tick >= self.start and tick < self.end;
     }
-};
-
-pub const Robot = struct {
-    name: []const u8,
-    asset_file: []const u8,
-    asset_hash: [32]u8,
-    body: RealtimeUnderwaterBody,
-    colliders: []const Collider,
-    thrusters: []const Thruster,
-    hulls: []const Hull,
-    sensors: []const Sensor,
 };
 
 pub const Integrator = enum { default, euler, implicit, implicit_fast, rk4 };

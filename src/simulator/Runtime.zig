@@ -4,6 +4,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const S = @import("support.zig");
 const Scene = @import("Scene.zig");
+const database = @import("database.zig");
 const MujocoBackend = @import("mujoco.zig").MujocoBackend;
 const forces = @import("forces.zig");
 const Sensors = @import("sensors.zig");
@@ -103,7 +104,7 @@ pub fn step(self: *Runtime, commands: *const types.ThrusterCommands) !void {
             else => {},
         }
     }
-    for (self.wrenches, self.scene.objects) |*wrench, object| wrench.* = .{ .id = object.body.id };
+    for (self.wrenches, self.scene.objects) |*wrench, slot| wrench.* = .{ .id = database.entity(slot).id };
     self.saveVelocities();
     for (self.scene.forces) |force| try forces.evaluate(force, self);
 
@@ -120,7 +121,7 @@ pub fn step(self: *Runtime, commands: *const types.ThrusterCommands) !void {
 
 fn validateReadback(self: *const Runtime) !void {
     for (self.backend.states, self.scene.objects) |body, object| {
-        if (body.id != object.body.id or !S.finite3(body.linear_velocity) or !S.finite3(body.angular_velocity) or
+        if (body.id != database.entity(object).id or !S.finite3(body.linear_velocity) or !S.finite3(body.angular_velocity) or
             !S.finite3(body.center_of_mass)) return error.InvalidBodyState;
         try S.validPose(body.pose);
     }
@@ -151,7 +152,7 @@ pub fn hash(self: *const Runtime) u64 {
     h.scalar(u64, self.tick);
     h.scalar(u64, self.backend.hash());
     for (self.backend.states) |body| h.state(body);
-    for (self.rotors[0..self.scene.thrusters.len], self.commands[0..self.scene.thrusters.len]) |rotor, command| {
+    for (self.rotors[0..self.scene.thruster_len], self.commands[0..self.scene.thruster_len]) |rotor, command| {
         h.scalar(f64, rotor.omega);
         h.scalar(f64, rotor.integral);
         h.scalar(f64, rotor.torque);
