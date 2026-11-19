@@ -1,3 +1,16 @@
+//! Simulator types: compile-time scene authoring and ephemeral per-tick outputs.
+//!
+//! **Use `abi.zig` in application/runtime code** for any simulation-time state that is
+//! persisted or round-tripped (`SIMSESS001`: body states, wrenches, fluid wrenches,
+//! rotor state, contacts, previous velocities, tick, commands, embedded catalogs).
+//!
+//! **Keep types here** for:
+//! - Rich catalog authoring (`ColliderInput`, `HullInput`, `SensorInput`); stored rows are `abi.*`
+//! - Scene policy (`Settings`, `Fault`, `Force`) — not in session snapshots
+//! - Mission/control buffers (`ThrusterCommands`, `ThrusterCommandInput`)
+//! - Recomputed after load (`Observation`, `SensorSample`, `Detection`, `Imu`)
+//!
+//! Shared primitives (`Vec3`, `Quat`, `Pose`) are layout-compatible with `abi.Vec3` / `abi.Quat`.
 //! Simulator data uses XYZW quaternions and world-frame velocities at the center of mass.
 pub const Vec3 = [3]f32;
 pub const Quat = [4]f32;
@@ -10,9 +23,8 @@ pub const BodyIndex = enum(usize) { robot = 0, _ };
 pub const SensorIndex = enum(usize) { _ };
 pub const max_hulls = 5;
 
-const MissionConfig = @import("../MissionConfig.zig");
-/// Maximum thruster command width; from MissionConfig, not simulator-local constants.
-pub const thruster_count = MissionConfig.thruster_count;
+/// Must match `MissionConfig.thruster_count` (see `src/MissionConfig.zig`).
+pub const thruster_count = 8;
 /// Full thruster command vector passed into the simulator runtime.
 pub const ThrusterCommands = [thruster_count]f64;
 /// Control-side thruster command buffer shared with the mission controller.
@@ -24,7 +36,7 @@ pub const Mesh = struct {
     triangles: []const Triangle,
 };
 pub const Shape = union(enum) { box, sphere, cylinder, mesh: Mesh };
-pub const Collider = struct {
+pub const ColliderInput = struct {
     shape: Shape = .box,
     collisions: bool = true,
     pose: Pose = .{},
@@ -35,27 +47,9 @@ pub const Collider = struct {
     restitution: f64 = 0,
 };
 
-pub const abi = @import("abi.zig");
 pub const Motion = enum { static, dynamic, kinematic };
 
-/// Authoring-only thruster row for `EntityInput` / export tools.
-pub const RotorSpec = struct {
-    max_rpm: f64,
-    diameter: f64,
-    thrust: f64,
-    torque: f64,
-    inertia: f64,
-    kp: f64,
-    ki: f64,
-    command_sign: f64,
-};
-pub const Thruster = struct {
-    body: BodyIndex = .robot,
-    position: Vec3,
-    direction: Vec3,
-    spec: RotorSpec,
-};
-pub const Hull = struct {
+pub const HullInput = struct {
     body: BodyIndex = .robot,
     pose: Pose,
     positions: []const Vec3,
@@ -76,7 +70,7 @@ pub const Camera = struct {
     near_range: f64,
     far_range: f64,
 };
-pub const Sensor = struct {
+pub const SensorInput = struct {
     id: u32,
     body: BodyIndex = .robot,
     pose: Pose,
@@ -84,7 +78,7 @@ pub const Sensor = struct {
     period_ticks: u32,
     settings: union(SensorKind) { pose: Tracking, imu, pressure, camera: Camera },
 
-    pub fn kind(self: Sensor) SensorKind {
+    pub fn kind(self: SensorInput) SensorKind {
         return self.settings;
     }
 };
@@ -128,31 +122,7 @@ pub const Settings = struct {
 };
 pub const Force = enum { gravity, hydrodynamics, thrusters };
 
-pub const BodyState = struct {
-    id: u32,
-    pose: Pose,
-    center_of_mass: Vec3,
-    linear_velocity: Vec3,
-    angular_velocity: Vec3,
-};
-pub const Wrench = struct {
-    id: u32 = 0,
-    force: Vec3 = @splat(0),
-    torque: Vec3 = @splat(0),
-};
-pub const Contact = struct {
-    a: u32,
-    b: u32,
-    position: Vec3,
-    normal: Vec3,
-    normal_force: f64,
-};
-pub const RotorState = struct {
-    omega: f64 = 0,
-    integral: f64 = 0,
-    torque: f64 = 0,
-    thrust: f64 = 0,
-};
+/// Ephemeral: rebuilt each tick / after `Session.refreshSensors()`; not in `SIMSESS001`.
 pub const Detection = struct {
     id: u32,
     cls: u32,
@@ -163,7 +133,9 @@ pub const Detection = struct {
     x1: u32 = 0,
     y1: u32 = 0,
 };
+/// Ephemeral: per-sensor tick cache; not in `SIMSESS001`.
 pub const Imu = struct { orientation: Quat, gyro: Vec3, accel: Vec3 };
+/// Ephemeral: per-sensor tick cache; not in `SIMSESS001`.
 pub const SensorSample = struct {
     tick: u64 = 0,
     value: ?union(SensorKind) {
@@ -174,6 +146,7 @@ pub const SensorSample = struct {
     } = null,
 };
 
+/// Ephemeral: fused view for mission I/O; not in `SIMSESS001`.
 pub const Observation = struct {
     body: Pose = .{},
     position_axes: AxisMask = 0,

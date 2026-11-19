@@ -27,6 +27,22 @@ zig build run -Dsimulator
 zig build run -Dsimulator -- --headless
 ```
 
+Scene geometry is loaded from a SIMDB scene catalog. Resolution order (first match wins):
+
+| Priority | `MissionConfig` | Source |
+|----------|-----------------|--------|
+| 1 | `sim_scene_catalog` set | SIMDB file on disk |
+| 2 | `sim_blend` set | Blender collection → in-memory catalog (`sim_blend_collection`, default `robosub_course`) |
+| 3 | (default) | Embedded `src/simulator/scenes.bin` |
+
+`sim_scene` is the preset **name** inside that catalog (`robot_only`, `robosub_course`, etc.). Robots always come from embedded `robots.bin`. Refresh the committed default catalog with:
+
+```sh
+zig build export-scene
+zig build export-scene -- --preset robosub
+zig build export-scene -- path/to/course.blend --collection robosub_course
+```
+
 ## ZED sensor plugin
 
 ```sh
@@ -54,13 +70,6 @@ sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   gstreamer1.0-plugins-bad gstreamer1.0-libav
 zig build viewer -Dviewer-gstreamer
 ./zig-out/bin/viewer --video rtp://0.0.0.0:5612
-```
-
-## Teleop sender
-
-```sh
-zig build teleop-sender
-./zig-out/bin/teleop_sender 8080
 ```
 
 ## Legacy Stonefish plugin

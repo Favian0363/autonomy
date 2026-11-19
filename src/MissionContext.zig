@@ -238,14 +238,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         // Init in place: scene BodySlot pointers must reference catalog.db in this Session, not a stack copy.
         ctx.simulator = @as(SimSession, undefined);
         errdefer if (ctx.simulator) |*session| session.deinit();
-        try ctx.simulator.?.init(
-            allocator,
-            io,
-            try config.sim_robot.slice(),
-            try config.sim_scene.slice(),
-            tam_len,
-            realtime,
-        );
+        try ctx.simulator.?.init(allocator, io, &ctx.config, tam_len, realtime);
         ctx.simulator.?.rebaseClock();
     }
 }

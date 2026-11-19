@@ -4,6 +4,7 @@ const database = @import("database.zig");
 const S = @import("support.zig");
 const Scene = @import("Scene.zig");
 const Session = @import("Session.zig");
+const abi = @import("abi.zig");
 const State = @This();
 
 fn extend(lo: *types.Vec3, hi: *types.Vec3, p: types.Vec3) void {
@@ -22,7 +23,7 @@ fn objectBounds(slot: database.BodySlot, lo: *types.Vec3, hi: *types.Vec3) void 
     for (0..count) |ki| {
         const c = database.colliderAt(slot.db, slot.slot, ki);
         const pose = database.poseOf(c.pos, c.quat);
-        const shape = database.shapeFromRecord(slot.db, c);
+        const shape = database.shapeFrom(slot.db, c);
         switch (shape) {
             .mesh => |mesh| {
                 for (mesh.positions) |position| extend(lo, hi, S.point(pose, position));
@@ -44,7 +45,7 @@ fn objectBounds(slot: database.BodySlot, lo: *types.Vec3, hi: *types.Vec3) void 
     }
 }
 
-fn cameraFrom(record: *const database.SensorRecord) types.Camera {
+fn cameraFrom(record: *const database.Sensor) types.Camera {
     return .{
         .width = record.width,
         .height = record.height,
@@ -107,9 +108,9 @@ fn project(camera: types.Camera, corners: [8]types.Vec3, out: *types.Detection) 
 
 fn cameraSample(
     scene: *const Scene,
-    sensor: *const database.SensorRecord,
+    sensor: *const database.Sensor,
     camera: types.Camera,
-    bodies: []const types.BodyState,
+    bodies: []const abi.BodyState,
     objects: []types.Detection,
     mount: types.Pose,
 ) []const types.Detection {
@@ -126,13 +127,16 @@ fn cameraSample(
         var observation: types.Detection = .{
             .id = e.id,
             .cls = e.cls,
-            .pose = .{ .pos = S.point(body.pose, S.scale(S.add(lo, hi), 0.5)), .quat = body.pose.quat },
+            .pose = blk2: {
+                const pose = S.bodyPose(body);
+                break :blk2 .{ .pos = S.point(pose, S.scale(S.add(lo, hi), 0.5)), .quat = pose.quat };
+            },
             .size = S.sub(hi, lo),
         };
         var corners: [8]types.Vec3 = undefined;
         var k: u32 = 0;
         while (k < 8) : (k += 1) {
-            corners[k] = S.rotate(inverse, S.sub(S.point(body.pose, S.v(
+            corners[k] = S.rotate(inverse, S.sub(S.point(S.bodyPose(body), S.v(
                 if (k & 1 != 0) hi[0] else lo[0],
                 if (k & 2 != 0) hi[1] else lo[1],
                 if (k & 4 != 0) hi[2] else lo[2],
@@ -239,7 +243,7 @@ pub fn sample(runtime: *Session) void {
 
         const body_index = record.body;
         const body = bodies[body_index];
-        const mount = S.compose(body.pose, database.poseOf(record.pos, record.quat));
+        const mount = S.compose(S.bodyPose(body), database.poseOf(record.pos, record.quat));
         const kind = database.sensorKind(record);
         reading.value = switch (kind) {
             .pose => .{ .pose = .{
@@ -247,12 +251,12 @@ pub fn sample(runtime: *Session) void {
                 .axes = .{ .position_axes = @intCast(record.position_axes), .attitude_axes = @intCast(record.attitude_axes) },
             } },
             .imu => blk: {
-                const arm = S.sub(mount.pos, body.center_of_mass);
-                const alpha = S.scale(S.sub(body.angular_velocity, previous_angular[body_index]), 1 / dt);
-                const acceleration = S.add(S.add(S.scale(S.sub(body.linear_velocity, previous_linear[body_index]), 1 / dt), S.cross(alpha, arm)), S.cross(body.angular_velocity, S.cross(body.angular_velocity, arm)));
+                const arm = S.sub(mount.pos, body.com);
+                const alpha = S.scale(S.sub(body.angular_vel, previous_angular[body_index]), 1 / dt);
+                const acceleration = S.add(S.add(S.scale(S.sub(body.linear_vel, previous_linear[body_index]), 1 / dt), S.cross(alpha, arm)), S.cross(body.angular_vel, S.cross(body.angular_vel, arm)));
                 break :blk .{ .imu = .{
                     .orientation = mount.quat,
-                    .gyro = S.rotate(S.conjugate(mount.quat), body.angular_velocity),
+                    .gyro = S.rotate(S.conjugate(mount.quat), body.angular_vel),
                     .accel = S.rotate(S.conjugate(mount.quat), S.sub(acceleration, scene.settings.gravity)),
                 } };
             },

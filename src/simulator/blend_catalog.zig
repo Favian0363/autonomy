@@ -1,8 +1,7 @@
 //! Minimal .blend reader for scene export. Pinned to Blender 4.x file format.
 const std = @import("std");
-const sim = @import("sim");
-const types = sim.types;
-const database = sim.database;
+const types = @import("types.zig");
+const database = @import("database.zig");
 
 pub const pinned_version_major: u8 = 4;
 

@@ -16,12 +16,12 @@ pub const entry_size = abi.entry_size;
 pub const header_size = abi.header_size;
 pub const table = abi.table;
 pub const TableEntry = abi.TableEntry;
-pub const EntityRecord = abi.EntityRecord;
-pub const ColliderRecord = abi.ColliderRecord;
-pub const ThrusterRecord = abi.ThrusterRecord;
-pub const HullRecord = abi.HullRecord;
-pub const SensorRecord = abi.SensorRecord;
-pub const NameRecord = abi.NameRecord;
+pub const Entity = abi.Entity;
+pub const Collider = abi.Collider;
+pub const Thruster = abi.Thruster;
+pub const Hull = abi.Hull;
+pub const Sensor = abi.Sensor;
+pub const Name = abi.Name;
 const strides = abi.strides;
 const aligns = abi.aligns;
 
@@ -38,7 +38,7 @@ pub const BodySlot = struct {
     slot: u32,
 };
 
-pub fn entity(slot: BodySlot) *const EntityRecord {
+pub fn entity(slot: BodySlot) *const Entity {
     return &slot.db.entities.items[slot.slot];
 }
 
@@ -68,23 +68,23 @@ pub fn ownedNth(comptime Row: type, records: []const Row, owner: u32, nth: usize
     unreachable;
 }
 
-pub fn colliderAt(db: *const Database, owner: u32, nth: usize) *const ColliderRecord {
-    return &db.colliders.items[ownedNth(ColliderRecord, db.colliders.items, owner, nth)];
+pub fn colliderAt(db: *const Database, owner: u32, nth: usize) *const Collider {
+    return &db.colliders.items[ownedNth(Collider, db.colliders.items, owner, nth)];
 }
 
-pub fn thrusterAt(db: *const Database, owner: u32, nth: usize) *const ThrusterRecord {
-    return &db.thrusters.items[ownedNth(ThrusterRecord, db.thrusters.items, owner, nth)];
+pub fn thrusterAt(db: *const Database, owner: u32, nth: usize) *const Thruster {
+    return &db.thrusters.items[ownedNth(Thruster, db.thrusters.items, owner, nth)];
 }
 
-pub fn hullAt(db: *const Database, owner: u32, nth: usize) *const HullRecord {
-    return &db.hulls.items[ownedNth(HullRecord, db.hulls.items, owner, nth)];
+pub fn hullAt(db: *const Database, owner: u32, nth: usize) *const Hull {
+    return &db.hulls.items[ownedNth(Hull, db.hulls.items, owner, nth)];
 }
 
-pub fn sensorAt(db: *const Database, owner: u32, nth: usize) *const SensorRecord {
-    return &db.sensors.items[ownedNth(SensorRecord, db.sensors.items, owner, nth)];
+pub fn sensorAt(db: *const Database, owner: u32, nth: usize) *const Sensor {
+    return &db.sensors.items[ownedNth(Sensor, db.sensors.items, owner, nth)];
 }
 
-pub fn sensorKind(record: *const SensorRecord) types.SensorKind {
+pub fn sensorKind(record: *const Sensor) types.SensorKind {
     return switch (record.kind) {
         0 => .pose,
         1 => .imu,
@@ -112,10 +112,10 @@ pub const EntityInput = struct {
     dry_mass: f64 = 0,
     volume: f64 = 0,
     buoyancy_center: types.Vec3 = @splat(0),
-    colliders: []const types.Collider = &.{},
-    thrusters: []const types.Thruster = &.{},
-    hulls: []const types.Hull = &.{},
-    sensors: []const types.Sensor = &.{},
+    colliders: []const types.ColliderInput = &.{},
+    thrusters: []const abi.Thruster = &.{},
+    hulls: []const types.HullInput = &.{},
+    sensors: []const types.SensorInput = &.{},
 };
 
 pub const IntrusiveList = struct {
@@ -155,17 +155,17 @@ pub const IntrusiveList = struct {
 pub const Database = struct {
     allocator: std.mem.Allocator,
     strings: std.ArrayList(u8) = .empty,
-    entities: std.ArrayList(EntityRecord) = .empty,
+    entities: std.ArrayList(Entity) = .empty,
     prev: std.ArrayList(u32) = .empty,
     next: std.ArrayList(u32) = .empty,
     generation: std.ArrayList(u32) = .empty,
-    colliders: std.ArrayList(ColliderRecord) = .empty,
-    thrusters: std.ArrayList(ThrusterRecord) = .empty,
-    hulls: std.ArrayList(HullRecord) = .empty,
-    sensors: std.ArrayList(SensorRecord) = .empty,
+    colliders: std.ArrayList(Collider) = .empty,
+    thrusters: std.ArrayList(Thruster) = .empty,
+    hulls: std.ArrayList(Hull) = .empty,
+    sensors: std.ArrayList(Sensor) = .empty,
     positions: std.ArrayList(f32) = .empty,
     indices: std.ArrayList(u32) = .empty,
-    names: std.ArrayList(NameRecord) = .empty,
+    names: std.ArrayList(Name) = .empty,
     active: IntrusiveList = .{},
 
     pub fn init(allocator: std.mem.Allocator) Database {
@@ -218,15 +218,95 @@ pub const Database = struct {
     }
 
     pub fn addEntity(self: *Database, input: EntityInput) !u32 {
+        // New entity slot id equals current entity column length (append order).
         const id = try asU32(self.entities.items.len);
+
+        // Copy display name and optional asset path into the shared string blob.
         const name = try self.putString(input.name);
         const asset = try self.putString(input.asset_file);
-        for (input.colliders) |collider| try self.appendCollider(id, collider);
-        for (input.thrusters) |thruster| try self.appendThruster(id, thruster);
-        for (input.hulls) |hull| try self.appendHull(id, hull);
-        for (input.sensors) |sensor| try self.appendSensor(id, sensor);
 
-        var record = std.mem.zeroes(EntityRecord);
+        // Child rows reference `owner = id` and append to their respective SIMDB columns.
+        for (input.colliders) |collider| {
+            var row = std.mem.zeroes(Collider);
+            row.owner = id;
+            row.collisions = @intFromBool(collider.collisions);
+            row.pos = collider.pose.pos;
+            row.quat = collider.pose.quat;
+            row.size = collider.size;
+            row.drag = collider.drag;
+            row.skin = collider.skin;
+            row.friction = collider.friction;
+            row.restitution = collider.restitution;
+            switch (collider.shape) {
+                .box => row.shape = 0,
+                .sphere => row.shape = 1,
+                .cylinder => row.shape = 2,
+                .mesh => |mesh| {
+                    if (mesh.positions.len < 4 or mesh.triangles.len == 0) return error.InvalidDatabase;
+                    row.shape = 3;
+                    const mesh_vertices = try self.appendVertices(mesh.positions);
+                    const mesh_triangles = try self.appendTriangles(mesh.triangles);
+                    row.vertex_start = mesh_vertices.start;
+                    row.vertex_count = mesh_vertices.count;
+                    row.triangle_start = mesh_triangles.start;
+                    row.triangle_count = mesh_triangles.count;
+                },
+            }
+            try self.colliders.append(self.allocator, row);
+        }
+        for (input.thrusters) |thruster| {
+            var row = thruster;
+            row.owner = id;
+            try self.thrusters.append(self.allocator, row);
+        }
+        for (input.hulls) |hull| {
+            if (hull.positions.len == 0 or hull.positions.len % 3 != 0) return error.InvalidDatabase;
+            const hull_vertices = try self.appendVertices(hull.positions);
+            try self.hulls.append(self.allocator, .{
+                .owner = id,
+                .body = @intCast(@backingInt(hull.body)),
+                .pos = hull.pose.pos,
+                .quat = hull.pose.quat,
+                .drag = hull.drag,
+                .skin = hull.skin,
+                .centroid = hull.centroid,
+                .coefficient_frame = hull.coefficient_frame,
+                .volume = hull.volume,
+                .vertex_start = hull_vertices.start,
+                .vertex_count = hull_vertices.count,
+            });
+        }
+        for (input.sensors) |sensor| {
+            var row = std.mem.zeroes(Sensor);
+            row.owner = id;
+            row.body = @intCast(@backingInt(sensor.body));
+            row.id = sensor.id;
+            row.enabled = @intFromBool(sensor.enabled);
+            row.period_ticks = sensor.period_ticks;
+            row.pos = sensor.pose.pos;
+            row.quat = sensor.pose.quat;
+            switch (sensor.settings) {
+                .pose => |tracking| {
+                    row.kind = 0;
+                    row.position_axes = tracking.position_axes;
+                    row.attitude_axes = tracking.attitude_axes;
+                },
+                .imu => row.kind = 1,
+                .pressure => row.kind = 2,
+                .camera => |camera| {
+                    row.kind = 3;
+                    row.width = camera.width;
+                    row.height = camera.height;
+                    row.horizontal_fov = camera.horizontal_fov;
+                    row.near_range = camera.near_range;
+                    row.far_range = camera.far_range;
+                },
+            }
+            try self.sensors.append(self.allocator, row);
+        }
+
+        // Materialize the entity row (ABI layout) and register intrusive-list links.
+        var record = std.mem.zeroes(Entity);
         record.name_offset = name.offset;
         record.name_len = name.len;
         record.asset_offset = asset.offset;
@@ -234,7 +314,11 @@ pub const Database = struct {
         record.asset_hash = input.asset_hash;
         record.id = input.id;
         record.cls = input.cls;
-        record.motion = motionTag(input.motion_type);
+        record.motion = switch (input.motion_type) {
+            .static => 0,
+            .dynamic => 1,
+            .kinematic => 2,
+        };
         record.tracked = @intFromBool(input.tracked);
         record.fuzz = @intFromBool(input.fuzz);
         record.mass = input.mass;
@@ -303,14 +387,14 @@ pub const Database = struct {
         var db = Database.init(allocator);
         errdefer db.deinit();
         try copyColumn(u8, allocator, &db.strings, bytes, entries[table.strings]);
-        try copyColumn(EntityRecord, allocator, &db.entities, bytes, entries[table.entities]);
-        try copyColumn(ColliderRecord, allocator, &db.colliders, bytes, entries[table.colliders]);
-        try copyColumn(ThrusterRecord, allocator, &db.thrusters, bytes, entries[table.thrusters]);
-        try copyColumn(HullRecord, allocator, &db.hulls, bytes, entries[table.hulls]);
-        try copyColumn(SensorRecord, allocator, &db.sensors, bytes, entries[table.sensors]);
+        try copyColumn(Entity, allocator, &db.entities, bytes, entries[table.entities]);
+        try copyColumn(Collider, allocator, &db.colliders, bytes, entries[table.colliders]);
+        try copyColumn(Thruster, allocator, &db.thrusters, bytes, entries[table.thrusters]);
+        try copyColumn(Hull, allocator, &db.hulls, bytes, entries[table.hulls]);
+        try copyColumn(Sensor, allocator, &db.sensors, bytes, entries[table.sensors]);
         try copyColumn(f32, allocator, &db.positions, bytes, entries[table.positions]);
         try copyColumn(u32, allocator, &db.indices, bytes, entries[table.indices]);
-        try copyColumn(NameRecord, allocator, &db.names, bytes, entries[table.names]);
+        try copyColumn(Name, allocator, &db.names, bytes, entries[table.names]);
         try db.prev.resize(allocator, db.entities.items.len);
         try db.next.resize(allocator, db.entities.items.len);
         try db.generation.resize(allocator, db.entities.items.len);
@@ -364,99 +448,6 @@ pub const Database = struct {
             if (name.name_len == 0 or name.entity_count == 0) return error.InvalidDatabase;
             if (@as(u64, name.entity_start) + name.entity_count > self.entities.items.len) return error.InvalidDatabase;
         }
-    }
-
-    fn appendCollider(self: *Database, owner: u32, collider: types.Collider) !void {
-        var record = std.mem.zeroes(ColliderRecord);
-        record.owner = owner;
-        record.collisions = @intFromBool(collider.collisions);
-        record.pos = collider.pose.pos;
-        record.quat = collider.pose.quat;
-        record.size = collider.size;
-        record.drag = collider.drag;
-        record.skin = collider.skin;
-        record.friction = collider.friction;
-        record.restitution = collider.restitution;
-        switch (collider.shape) {
-            .box => record.shape = 0,
-            .sphere => record.shape = 1,
-            .cylinder => record.shape = 2,
-            .mesh => |mesh| {
-                if (mesh.positions.len < 4 or mesh.triangles.len == 0) return error.InvalidDatabase;
-                record.shape = 3;
-                const mesh_vertices = try self.appendVertices(mesh.positions);
-                const mesh_triangles = try self.appendTriangles(mesh.triangles);
-                record.vertex_start = mesh_vertices.start;
-                record.vertex_count = mesh_vertices.count;
-                record.triangle_start = mesh_triangles.start;
-                record.triangle_count = mesh_triangles.count;
-            },
-        }
-        try self.colliders.append(self.allocator, record);
-    }
-
-    fn appendThruster(self: *Database, owner: u32, thruster: types.Thruster) !void {
-        try self.thrusters.append(self.allocator, .{
-            .owner = owner,
-            .body = @intCast(@backingInt(thruster.body)),
-            .position = thruster.position,
-            .direction = thruster.direction,
-            .max_rpm = thruster.spec.max_rpm,
-            .diameter = thruster.spec.diameter,
-            .thrust = thruster.spec.thrust,
-            .torque = thruster.spec.torque,
-            .inertia = thruster.spec.inertia,
-            .kp = thruster.spec.kp,
-            .ki = thruster.spec.ki,
-            .command_sign = thruster.spec.command_sign,
-        });
-    }
-
-    fn appendHull(self: *Database, owner: u32, hull: types.Hull) !void {
-        if (hull.positions.len == 0 or hull.positions.len % 3 != 0) return error.InvalidDatabase;
-        const hull_vertices = try self.appendVertices(hull.positions);
-        try self.hulls.append(self.allocator, .{
-            .owner = owner,
-            .body = @intCast(@backingInt(hull.body)),
-            .pos = hull.pose.pos,
-            .quat = hull.pose.quat,
-            .drag = hull.drag,
-            .skin = hull.skin,
-            .centroid = hull.centroid,
-            .coefficient_frame = hull.coefficient_frame,
-            .volume = hull.volume,
-            .vertex_start = hull_vertices.start,
-            .vertex_count = hull_vertices.count,
-        });
-    }
-
-    fn appendSensor(self: *Database, owner: u32, sensor: types.Sensor) !void {
-        var record = std.mem.zeroes(SensorRecord);
-        record.owner = owner;
-        record.body = @intCast(@backingInt(sensor.body));
-        record.id = sensor.id;
-        record.enabled = @intFromBool(sensor.enabled);
-        record.period_ticks = sensor.period_ticks;
-        record.pos = sensor.pose.pos;
-        record.quat = sensor.pose.quat;
-        switch (sensor.settings) {
-            .pose => |tracking| {
-                record.kind = 0;
-                record.position_axes = tracking.position_axes;
-                record.attitude_axes = tracking.attitude_axes;
-            },
-            .imu => record.kind = 1,
-            .pressure => record.kind = 2,
-            .camera => |camera| {
-                record.kind = 3;
-                record.width = camera.width;
-                record.height = camera.height;
-                record.horizontal_fov = camera.horizontal_fov;
-                record.near_range = camera.near_range;
-                record.far_range = camera.far_range;
-            },
-        }
-        try self.sensors.append(self.allocator, record);
     }
 
     fn appendVertices(self: *Database, points: []const types.Vec3) !struct { start: u32, count: u32 } {
@@ -572,7 +563,7 @@ pub fn ownedCount(records: anytype, owner: u32) usize {
     return n;
 }
 
-pub fn shapeFromRecord(db: *const Database, record: *const ColliderRecord) types.Shape {
+pub fn shapeFrom(db: *const Database, record: *const Collider) types.Shape {
     return switch (record.shape) {
         0 => .box,
         1 => .sphere,
@@ -602,14 +593,6 @@ fn bounds(len: usize, offset: u32, size: u32) !void {
 fn asU32(value: usize) !u32 {
     if (value > std.math.maxInt(u32)) return error.InvalidDatabase;
     return @intCast(value);
-}
-
-fn motionTag(motion: types.Motion) u32 {
-    return switch (motion) {
-        .static => 0,
-        .dynamic => 1,
-        .kinematic => 2,
-    };
 }
 
 pub fn motionFrom(value: u32) types.Motion {

@@ -157,13 +157,13 @@ fn sensorIs(self: *const Scene, ref: types.SensorIndex, kind: types.SensorKind) 
     return index < self.sensor_len and database.sensorKind(database.sensorAt(robot_slot.db, robot_slot.slot, index)) == kind;
 }
 
-fn validateCollider(db: *const database.Database, c: *const database.ColliderRecord) !void {
+fn validateCollider(db: *const database.Database, c: *const database.Collider) !void {
     const pose = database.poseOf(c.pos, c.quat);
     try math.validPose(pose);
     if (!math.finite3(c.size) or !math.finite3(c.drag) or !math.finite3(c.skin) or
         !nonnegative(c.friction) or !nonnegative(c.restitution) or c.restitution > 1)
         return error.InvalidCollider;
-    const shape = database.shapeFromRecord(db, c);
+    const shape = database.shapeFrom(db, c);
     switch (shape) {
         .mesh => |mesh| {
             if (mesh.positions.len < 4 or mesh.positions.len > 1000000 or

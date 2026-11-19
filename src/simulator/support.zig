@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const abi = @import("abi.zig");
 
 pub fn v(x: f64, y: f64, z: f64) types.Vec3 {
     return .{ @floatCast(x), @floatCast(y), @floatCast(z) };
@@ -104,17 +105,21 @@ pub const Hash = struct {
         for (a) |f| self.scalar(f32, f);
     }
 
-    pub fn state(self: *Hash, s: types.BodyState) void {
+    pub fn state(self: *Hash, s: abi.BodyState) void {
         self.scalar(u32, s.id);
-        self.vec(s.pose.pos);
-        self.quat(s.pose.quat);
-        self.vec(s.center_of_mass);
-        self.vec(s.linear_velocity);
-        self.vec(s.angular_velocity);
+        self.vec(s.pose_pos);
+        self.quat(s.pose_quat);
+        self.vec(s.com);
+        self.vec(s.linear_vel);
+        self.vec(s.angular_vel);
     }
 };
 
-pub fn addForce(w: *types.Wrench, f: types.Vec3, p: types.Vec3, com: types.Vec3) void {
-    w.*.force = add(w.*.force, f);
-    w.*.torque = add(w.*.torque, cross(sub(p, com), f));
+pub fn bodyPose(s: abi.BodyState) types.Pose {
+    return .{ .pos = s.pose_pos, .quat = s.pose_quat };
+}
+
+pub fn addForce(w: *abi.Wrench, f: types.Vec3, p: types.Vec3, com: types.Vec3) void {
+    w.force = add(w.force, f);
+    w.torque = add(w.torque, cross(sub(p, com), f));
 }

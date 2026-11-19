@@ -227,8 +227,28 @@ pub fn draw(self: *Self, font: rl.Font, bounds: rl.Rectangle, packet: *const IO.
         self.dirty = true;
     }
     y += 36;
-    inline for (.{ "sensor_library", "serial_port", "sim_robot", "sim_scene", "telemetry_addr", "telemetry_log_path" }, 0..) |name, i| {
-        const labels = [_][]const u8{ "Sensor library", "Serial port", "Robot", "Scene", "Telemetry address", "Log file" };
+    inline for (.{
+        "sensor_library",
+        "serial_port",
+        "sim_robot",
+        "sim_scene",
+        "sim_scene_catalog",
+        "sim_blend",
+        "sim_blend_collection",
+        "telemetry_addr",
+        "telemetry_log_path",
+    }, 0..) |name, i| {
+        const labels = [_][]const u8{
+            "Sensor library",
+            "Serial port",
+            "Robot",
+            "Scene",
+            "Scene catalog",
+            "Blender file",
+            "Blend collection",
+            "Telemetry address",
+            "Log file",
+        };
         self.editText(font, labels[i], &@field(self.draft, name), i, .{ .x = x, .y = y, .width = w, .height = 26 });
         y += 30;
     }

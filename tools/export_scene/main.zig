@@ -1,6 +1,5 @@
 const std = @import("std");
-const emit = @import("emit.zig");
-const blend = @import("blend.zig");
+const catalog_emit = @import("catalog_emit");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -44,21 +43,21 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const objects: []emit.SourceObject = if (preset) |name| blk: {
+    const objects: []catalog_emit.SourceObject = if (preset) |name| blk: {
         if (!std.mem.eql(u8, name, "robosub")) return error.UnknownPreset;
-        break :blk try emit.metadataObjectsFromPresets(allocator);
+        break :blk try catalog_emit.metadataObjectsFromPresets(allocator);
     } else if (blend_path) |path| blk: {
-        var file = try blend.BlendFile.load(allocator, io, path);
+        var file = try catalog_emit.BlendFile.load(allocator, io, path);
         defer file.deinit();
-        break :blk try emit.sourcesFromBlend(allocator, &file, collection);
+        break :blk try catalog_emit.sourcesFromBlend(allocator, &file, collection);
     } else {
         std.debug.print("{s}", .{usage});
         return error.MissingInput;
     };
-    defer if (blend_path != null) emit.freeSources(allocator, objects, true) else allocator.free(objects);
+    defer if (blend_path != null) catalog_emit.freeSources(allocator, objects, true) else allocator.free(objects);
 
     const scene_name = if (preset != null) "robosub_course" else collection;
-    const catalog = try emit.writeCatalog(allocator, scene_name, objects);
+    const catalog = try catalog_emit.writeCatalog(allocator, scene_name, objects);
     defer allocator.free(catalog);
 
     const dir = std.Io.Dir.cwd();

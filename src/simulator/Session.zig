@@ -11,6 +11,8 @@ const MissionConfig = @import("../MissionConfig.zig");
 const MujocoBackend = @import("mujoco.zig").MujocoBackend;
 const forces = @import("forces.zig");
 const Sensors = @import("sensors.zig");
+const abi = @import("abi.zig");
+const session_snapshot = @import("session_snapshot.zig");
 
 pub const Session = @This();
 
@@ -23,13 +25,15 @@ scene_catalog: SceneCatalog,
 scene: Scene,
 backend: MujocoBackend,
 sensors: Sensors,
-wrenches: []types.Wrench,
-fluid: []types.Wrench,
-previous_linear: []types.Vec3,
-previous_angular: []types.Vec3,
+wrenches: []abi.Wrench,
+fluid: []abi.Wrench,
+previous_linear: []abi.Vec3,
+previous_angular: []abi.Vec3,
 scratch: []align(@alignOf(f64)) u8,
 thruster_len: u8,
-rotors: [types.thruster_count]types.RotorState = @splat(.{}),
+rotors: [types.thruster_count]abi.RotorState = @splat(abi.RotorState{ .omega = 0, .integral = 0, .torque = 0, .thrust = 0 }),
+preset_robot: []const u8 = "",
+preset_scene: []const u8 = "",
 commands: types.ThrusterCommands = @splat(0),
 tick: u64 = 0,
 realtime: bool,
@@ -37,7 +41,29 @@ tam_len: usize,
 failed: bool = false,
 started: std.Io.Clock.Timestamp,
 
-pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, robot_name: []const u8, scene_name: []const u8, tam_len: usize, realtime: bool) !void {
+fn loadSceneCatalog(allocator: std.mem.Allocator, io: std.Io, config: *const MissionConfig.MissionConfig) !SceneCatalog {
+    const catalog_path = try config.sim_scene_catalog.slice();
+    const blend_path = try config.sim_blend.slice();
+    const collection = try config.sim_blend_collection.slice();
+    const scene_name = try config.sim_scene.slice();
+    if (catalog_path.len > 0) {
+        return SceneCatalog.initResolved(allocator, io, .{ .file_path = catalog_path });
+    }
+    if (blend_path.len > 0) {
+        const collection_name = if (collection.len > 0) collection else "robosub_course";
+        const catalog_name = if (collection.len > 0) collection else scene_name;
+        return SceneCatalog.initResolved(allocator, io, .{ .blend = .{
+            .path = blend_path,
+            .collection = collection_name,
+            .catalog_name = catalog_name,
+        } });
+    }
+    return SceneCatalog.initResolved(allocator, io, .embedded);
+}
+
+pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *const MissionConfig.MissionConfig, tam_len: usize, realtime: bool) !void {
+    const robot_name = try config.sim_robot.slice();
+    const scene_name = try config.sim_scene.slice();
     if (tam_len == 0 or tam_len > MissionConfig.thruster_count) return error.InvalidThrusterCount;
     self.* = .{
         .io = io,
@@ -59,7 +85,7 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, robot_name
     };
     self.catalog = try RobotCatalog.init(allocator);
     errdefer self.catalog.deinit();
-    self.scene_catalog = try SceneCatalog.init(allocator);
+    self.scene_catalog = try loadSceneCatalog(allocator, io, config);
     errdefer self.scene_catalog.deinit();
     const robot_index = self.catalog.index(robot_name) orelse return error.UnknownSimRobot;
     const robot = self.catalog.body(robot_index);
@@ -71,9 +97,12 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, robot_name
     };
     const selected_scene = if (std.mem.eql(u8, scene_name, "robot_only"))
         try Scene.init(allocator, robot, null, &.{}, .{}, &.{}, &robot_membership)
-    else if (std.mem.eql(u8, scene_name, "robosub_course")) blk: {
-        const start: types.Pose = .{ .pos = .{ 0, 2, 2 }, .quat = .{ 0, 0, 1, 0 } };
-        const preset = self.scene_catalog.find("robosub_course") orelse return error.UnknownSimScene;
+    else blk: {
+        const preset = self.scene_catalog.find(scene_name) orelse return error.UnknownSimScene;
+        const start: ?types.Pose = if (std.mem.eql(u8, scene_name, "robosub_course"))
+            .{ .pos = .{ 0, 2, 2 }, .quat = .{ 0, 0, 1, 0 } }
+        else
+            null;
         const membership = [_]database.Membership{
             .{ .db = &self.catalog.db, .slots = robot_slots },
             .{ .db = &self.scene_catalog.db, .slots = preset.slots },
@@ -82,10 +111,14 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, robot_name
         defer allocator.free(extras);
         self.scene_catalog.presetBodySlots(preset, extras);
         break :blk try Scene.init(allocator, robot, start, extras, .{}, &.{}, &membership);
-    } else return error.UnknownSimScene;
+    };
     self.scene = selected_scene;
     if (tam_len != self.scene.thruster_len) return error.InvalidThrusterCount;
     errdefer self.scene.deinit();
+    self.preset_robot = try allocator.dupe(u8, robot_name);
+    errdefer self.scene.allocator.free(self.preset_robot);
+    self.preset_scene = try allocator.dupe(u8, scene_name);
+    errdefer self.scene.allocator.free(self.preset_scene);
     try self.initPhysics();
     errdefer self.deinitPhysics();
     self.rebaseClock();
@@ -113,6 +146,10 @@ pub fn initWithScene(self: *Session, io: std.Io, scene: Scene, tam_len: usize, r
         .started = undefined,
     };
     errdefer self.scene.deinit();
+    self.preset_robot = try scene.allocator.dupe(u8, "");
+    errdefer scene.allocator.free(self.preset_robot);
+    self.preset_scene = try scene.allocator.dupe(u8, "");
+    errdefer scene.allocator.free(self.preset_scene);
     try self.initPhysics();
     errdefer self.deinitPhysics();
     self.rebaseClock();
@@ -127,13 +164,13 @@ fn initPhysics(self: *Session) !void {
     errdefer self.sensors.deinit(allocator);
     self.thruster_len = scene.thruster_len;
     const count = scene.objects.len;
-    self.wrenches = try allocator.alloc(types.Wrench, count);
+    self.wrenches = try allocator.alloc(abi.Wrench, count);
     errdefer allocator.free(self.wrenches);
-    self.fluid = try allocator.alloc(types.Wrench, count);
+    self.fluid = try allocator.alloc(abi.Wrench, count);
     errdefer allocator.free(self.fluid);
-    self.previous_linear = try allocator.alloc(types.Vec3, count);
+    self.previous_linear = try allocator.alloc(abi.Vec3, count);
     errdefer allocator.free(self.previous_linear);
-    self.previous_angular = try allocator.alloc(types.Vec3, count);
+    self.previous_angular = try allocator.alloc(abi.Vec3, count);
     errdefer allocator.free(self.previous_angular);
     // Hydrodynamics uses two temporary f64 extents per body.
     self.scratch = try allocator.alignedAlloc(u8, .of(f64), 2 * count * @sizeOf(f64));
@@ -153,7 +190,10 @@ fn deinitPhysics(self: *Session) void {
 }
 
 pub fn deinit(self: *Session) void {
+    const allocator = self.scene.allocator;
     self.deinitPhysics();
+    if (self.preset_robot.len != 0) allocator.free(self.preset_robot);
+    if (self.preset_scene.len != 0) allocator.free(self.preset_scene);
     self.scene.deinit();
     if (self.catalogs_owned) {
         self.scene_catalog.deinit();
@@ -175,20 +215,21 @@ pub fn timestamp(self: *const Session) u64 {
     return @intCast(@as(u128, self.tick) * self.scene.settings.dt_numerator * 1_000_000_000 / self.scene.settings.dt_denominator);
 }
 
-pub fn reset(self: *Session, states: ?[]const types.BodyState) !void {
+pub fn reset(self: *Session, states: ?[]const abi.BodyState) !void {
     try self.backend.reset(states);
     try self.initializeTick();
 }
 
 fn initializeTick(self: *Session) !void {
     self.tick = 0;
-    self.rotors = @splat(.{});
+    self.rotors = @splat(abi.RotorState{ .omega = 0, .integral = 0, .torque = 0, .thrust = 0 });
     self.commands = @splat(0);
-    @memset(self.fluid, .{});
-    @memset(self.wrenches, .{});
+    const zero_wrench = abi.Wrench{ .id = 0, .force = @splat(0), .torque = @splat(0) };
+    @memset(self.fluid, zero_wrench);
+    @memset(self.wrenches, zero_wrench);
     try self.validateReadback();
     self.saveVelocities();
-    self.sample();
+    self.refreshSensors();
 }
 
 pub fn step(self: *Session, commands: *const types.ThrusterCommands) !void {
@@ -215,7 +256,11 @@ fn advanceTick(self: *Session, effective: []f64) !void {
             else => {},
         }
     }
-    for (self.wrenches, self.scene.objects) |*wrench, slot| wrench.* = .{ .id = database.entity(slot).id };
+    const zero_wrench = abi.Wrench{ .id = 0, .force = @splat(0), .torque = @splat(0) };
+    for (self.wrenches, self.scene.objects) |*wrench, slot| {
+        wrench.* = zero_wrench;
+        wrench.id = database.entity(slot).id;
+    }
     self.saveVelocities();
     for (self.scene.forces) |force| try forces.evaluate(force, self);
 
@@ -224,17 +269,17 @@ fn advanceTick(self: *Session, effective: []f64) !void {
     try self.validateReadback();
     const bounds = self.scene.settings.bounds;
     for (self.backend.states) |body| {
-        if (S.norm(body.pose.pos) > bounds.position or S.norm(body.linear_velocity) > bounds.speed or
-            S.norm(body.angular_velocity) > bounds.angular_speed) return error.SimulationBoundsExceeded;
+        if (S.norm(body.pose_pos) > bounds.position or S.norm(body.linear_vel) > bounds.speed or
+            S.norm(body.angular_vel) > bounds.angular_speed) return error.SimulationBoundsExceeded;
     }
-    self.sample();
+    self.refreshSensors();
 }
 
 fn validateReadback(self: *const Session) !void {
     for (self.backend.states, self.scene.objects) |body, object| {
-        if (body.id != database.entity(object).id or !S.finite3(body.linear_velocity) or !S.finite3(body.angular_velocity) or
-            !S.finite3(body.center_of_mass)) return error.InvalidBodyState;
-        try S.validPose(body.pose);
+        if (body.id != database.entity(object).id or !S.finite3(body.linear_vel) or !S.finite3(body.angular_vel) or
+            !S.finite3(body.com)) return error.InvalidBodyState;
+        try S.validPose(S.bodyPose(body));
     }
     for (self.backend.contacts.items) |contact| {
         if (!S.finite3(contact.position) or !S.finite3(contact.normal) or
@@ -244,12 +289,12 @@ fn validateReadback(self: *const Session) !void {
 
 fn saveVelocities(self: *Session) void {
     for (self.backend.states, self.previous_linear, self.previous_angular) |body, *linear, *angular| {
-        linear.* = body.linear_velocity;
-        angular.* = body.angular_velocity;
+        linear.* = body.linear_vel;
+        angular.* = body.angular_vel;
     }
 }
 
-fn sample(self: *Session) void {
+pub fn refreshSensors(self: *Session) void {
     Sensors.sample(self);
 }
 
@@ -258,10 +303,10 @@ pub fn observation(self: *const Session) types.Observation {
     return self.sensors.observation;
 }
 
-pub fn hash(self: *const Session) u64 {
+/// Hash of serialized dynamics (excludes MuJoCo integration buffer in `backend.hash()`).
+pub fn dynamicsHash(self: *const Session) u64 {
     var h: S.Hash = .{};
     h.scalar(u64, self.tick);
-    h.scalar(u64, self.backend.hash());
     for (self.backend.states) |body| h.state(body);
     for (self.rotors[0..self.scene.thruster_len], self.commands[0..self.scene.thruster_len]) |rotor, command| {
         h.scalar(f64, rotor.omega);
@@ -277,6 +322,13 @@ pub fn hash(self: *const Session) u64 {
     for (self.previous_linear) |value| h.vec(value);
     for (self.previous_angular) |value| h.vec(value);
     Sensors.hashSamples(self, &h);
+    return h.value;
+}
+
+pub fn hash(self: *const Session) u64 {
+    var h: S.Hash = .{};
+    h.scalar(u64, self.backend.hash());
+    h.scalar(u64, self.dynamicsHash());
     return h.value;
 }
 
@@ -317,4 +369,34 @@ pub fn nextFrame(self: *Session, out: *Auv.Frame) !void {
         out.objects_len += 1;
         out.objects2d_len += 1;
     }
+}
+
+pub fn snapshot(self: *const Session, allocator: std.mem.Allocator) ![]u8 {
+    var snap = try session_snapshot.capture(allocator, self);
+    defer snap.deinit();
+    return try session_snapshot.save(allocator, &snap);
+}
+
+pub fn restoreSnapshot(self: *Session, allocator: std.mem.Allocator, bytes: []const u8) !void {
+    var snap = try session_snapshot.load(allocator, bytes);
+    defer snap.deinit();
+    try session_snapshot.restore(self, &snap);
+}
+
+test "session snapshot round trip preserves hash" {
+    if (!@import("build_options").simulator) return error.SkipZigTest;
+    var session: Session = undefined;
+    var config = MissionConfig.startup_config;
+    config.sim_robot = .fromLiteral("proteus");
+    config.sim_scene = .fromLiteral("robot_only");
+    try session.init(std.testing.allocator, std.testing.io, &config, 6, false);
+    defer session.deinit();
+    const idle: types.ThrusterCommandInput = @splat(0);
+    try session.setThrusters(&idle);
+  for (0..12) |_| try session.step(&session.commands);
+    const before = session.dynamicsHash();
+    const bytes = try session.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try session.restoreSnapshot(std.testing.allocator, bytes);
+    try std.testing.expectEqual(before, session.dynamicsHash());
 }

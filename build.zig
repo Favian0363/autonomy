@@ -3,8 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
 
-    const export_scene_sim = b.createModule(.{
-        .root_source_file = b.path("src/simulator/geometry_pkg.zig"),
+    const export_scene_catalog_emit = b.createModule(.{
+        .root_source_file = b.path("src/simulator/catalog_emit.zig"),
         .target = b.graph.host,
     });
     const export_scene = b.addExecutable(.{
@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) !void {
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
             .imports = &.{
-                .{ .name = "sim", .module = export_scene_sim },
+                .{ .name = "catalog_emit", .module = export_scene_catalog_emit },
             },
         }),
     });
@@ -91,25 +91,6 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.link_libc = true;
     exe.root_module.addIncludePath(b.path("include"));
     b.installArtifact(exe);
-    const teleop_sender = b.addExecutable(.{
-        .name = "teleop_sender",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        }),
-    });
-    teleop_sender.root_module.addCSourceFile(.{
-        .file = b.path("tools/teleop_sender/main.cpp"),
-        .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
-    });
-    teleop_sender.root_module.linkSystemLibrary("SDL2", .{ .use_pkg_config = .force });
-
-    const install_teleop_sender = b.addInstallArtifact(teleop_sender, .{});
-    const teleop_sender_step = b.step("teleop-sender", "Build the optional SDL2 keyboard teleop sender");
-    teleop_sender_step.dependOn(&install_teleop_sender.step);
-
     const raylib_dep = b.dependency("raylib_zig", .{
         .target = target,
         .optimize = optimize,

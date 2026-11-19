@@ -1,9 +1,10 @@
 const std = @import("std");
-const sim = @import("sim");
-const types = sim.types;
-const database = sim.database;
-const presets = @import("presets.zig");
-const blend = @import("blend.zig");
+const types = @import("types.zig");
+const database = @import("database.zig");
+const blend = @import("blend_catalog.zig");
+const presets = @import("scene_presets.zig");
+
+pub const BlendFile = blend.BlendFile;
 
 pub const SourceObject = struct {
     name: []const u8,
@@ -49,7 +50,7 @@ pub fn writeCatalog(allocator: std.mem.Allocator, scene_name: []const u8, object
         const box = database.boxMesh(object.hx, object.hy, object.hz);
         const positions = if (object.positions.len == 0) &box.positions else object.positions;
         const triangles = if (object.triangles.len == 0) &box.triangles else object.triangles;
-        var collider = types.Collider{
+        var collider = types.ColliderInput{
             .shape = .{ .mesh = .{ .positions = positions, .triangles = triangles } },
             .collisions = object.collisions,
             .size = .{ object.hx, object.hy, object.hz },
@@ -92,6 +93,20 @@ pub fn sourcesFromBlend(allocator: std.mem.Allocator, file: *blend.BlendFile, co
         };
     }
     return out;
+}
+
+pub fn sceneCatalogBytesFromBlend(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    blend_path: []const u8,
+    collection: []const u8,
+    catalog_name: []const u8,
+) ![]u8 {
+    var file = try blend.BlendFile.load(allocator, io, blend_path);
+    defer file.deinit();
+    const objects = try sourcesFromBlend(allocator, &file, collection);
+    defer freeSources(allocator, objects, true);
+    return try writeCatalog(allocator, catalog_name, objects);
 }
 
 fn ext(positions: []const types.Vec3, axis: usize) f32 {
