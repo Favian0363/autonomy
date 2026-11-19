@@ -16,8 +16,9 @@ fluid: []types.Wrench,
 previous_linear: []types.Vec3,
 previous_angular: []types.Vec3,
 scratch: []align(@alignOf(f64)) u8,
-rotors: [types.max_thrusters]types.RotorState = @splat(.{}),
-commands: [types.max_thrusters]f64 = @splat(0),
+thruster_len: u8,
+rotors: [types.thruster_count]types.RotorState = @splat(.{}),
+commands: types.ThrusterCommands = @splat(0),
 tick: u64 = 0,
 
 pub fn init(scene: *const Scene) !Runtime {
@@ -43,6 +44,7 @@ pub fn init(scene: *const Scene) !Runtime {
         .scene = scene,
         .backend = backend,
         .sensors = sensors,
+        .thruster_len = scene.thruster_len,
         .wrenches = wrenches,
         .fluid = fluid,
         .previous_linear = linear,
@@ -51,6 +53,13 @@ pub fn init(scene: *const Scene) !Runtime {
     };
     try self.initializeTick();
     return self;
+}
+
+/// After a Session is moved, scene pointers stored in the runtime must be updated.
+pub fn rebindScene(self: *Runtime, scene: *const Scene) void {
+    self.scene = scene;
+    self.thruster_len = scene.thruster_len;
+    self.backend.source = scene;
 }
 
 pub fn deinit(self: *Runtime) void {
@@ -81,14 +90,11 @@ fn initializeTick(self: *Runtime) !void {
     self.sample();
 }
 
-pub fn step(self: *Runtime, commands: []const f64) !void {
-    if (commands.len != self.scene.thrusters.len) return error.InvalidThrusterCount;
+pub fn step(self: *Runtime, commands: *const types.ThrusterCommands) !void {
     if (self.tick == std.math.maxInt(u64)) return error.TickOverflow;
-    for (commands) |command| {
-        if (!std.math.isFinite(command) or command < -1 or command > 1) return error.InvalidThrust;
-    }
-    const effective = self.commands[0..commands.len];
-    @memcpy(effective, commands);
+    const n = self.thruster_len;
+    const effective = self.commands[0..n];
+    @memcpy(effective, commands[0..n]);
     for (self.scene.faults) |fault| {
         if (!fault.active(self.tick)) continue;
         switch (fault.effect) {

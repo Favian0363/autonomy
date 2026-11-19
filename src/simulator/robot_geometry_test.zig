@@ -2,6 +2,7 @@ const std = @import("std");
 const database = @import("database.zig");
 const types = @import("types.zig");
 const RobotCatalog = @import("robots.zig").RobotCatalog;
+const MissionConfig = @import("../MissionConfig.zig");
 const Scene = @import("Scene.zig");
 
 test "the embedded catalog builds a scene for each robot preset" {
@@ -18,6 +19,8 @@ test "the embedded catalog builds a scene for each robot preset" {
         var scene = try Scene.init(testing.allocator, robot, null, &.{}, .{}, &.{}, &membership);
         defer scene.deinit();
         try testing.expectEqualStrings(name, scene.objects[0].body.name);
+        try testing.expect(robot.thrusters.len <= MissionConfig.thruster_count);
+        try testing.expectEqual(@as(u8, @intCast(robot.thrusters.len)), scene.thruster_len);
         try testing.expectEqual(catalog.slots[i], catalog.db.active.head);
         try testing.expectEqual(@as(u32, 1), catalog.db.active.count);
     }

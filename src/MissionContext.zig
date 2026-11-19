@@ -57,7 +57,7 @@ auv: ?Auv,
 mission_diyn_loader: ?MissionIO.MissionDiynLoader,
 serial: ?Serial,
 serial_parser: Protocol.Parser = .{},
-simulator: ?*SimSession,
+simulator: if (Simulator.enabled) ?SimSession else void = if (Simulator.enabled) null else {},
 hardware_frame_time: ?Io.Clock.Timestamp = null,
 
 /// Live configuration, retained across mission attempts and while idle.
@@ -169,11 +169,6 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         .proteus_hwd => {},
         .stonefish_sim => return error.InvalidThrusterCount,
     };
-    const simulator: ?*SimSession = if (comptime Simulator.enabled)
-        try SimSession.create(allocator, io, try config.sim_robot.slice(), try config.sim_scene.slice(), tam_len, ctx.visualizer != null or config.sim_realtime or config.serial_port.len != 0)
-    else
-        null;
-    errdefer if (simulator) |session| session.destroy();
     var mission_diyn_loader: ?MissionIO.MissionDiynLoader = null;
     var auv: ?Auv = null;
     errdefer if (mission_diyn_loader) |*loader| loader.dynlib.close();
@@ -198,8 +193,6 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         try ctx.waitForReady(port, &parser);
         std.log.info("READY on {s} at 115200 baud", .{try config.serial_port.slice()});
     }
-    if (simulator) |session| session.rebaseClock();
-
     ctx.* = .{
         .frame = undefined,
 
@@ -218,7 +211,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         .auv = auv,
         .serial = serial,
         .serial_parser = parser,
-        .simulator = simulator,
+        .simulator = if (comptime Simulator.enabled) null else {},
         .mission_diyn_loader = mission_diyn_loader,
 
         .config = ctx.config,
@@ -226,13 +219,37 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         .io = io,
     };
     ctx.queue = .initBuffer(&ctx.goal_queue_buf);
+
+    if (comptime Simulator.enabled) {
+        ctx.simulator = SimSession{
+            .allocator = allocator,
+            .io = io,
+            .catalog = undefined,
+            .scene_catalog = undefined,
+            .scene = undefined,
+            .runtime = undefined,
+            .realtime = ctx.visualizer != null or config.sim_realtime or config.serial_port.len != 0,
+            .tam_len = tam_len,
+            .started = undefined,
+        };
+        errdefer if (ctx.simulator) |*session| session.deinit();
+        try ctx.simulator.?.init(
+            allocator,
+            io,
+            try config.sim_robot.slice(),
+            try config.sim_scene.slice(),
+            tam_len,
+            ctx.simulator.?.realtime,
+        );
+        ctx.simulator.?.rebaseClock();
+    }
 }
 
 pub fn deinit(ctx: *MissionContext) void {
     if (ctx.serial) |*port| port.deinit();
     if (ctx.auv) |auv| auv.deinit();
     if (ctx.mission_diyn_loader) |*loader| loader.dynlib.close();
-    if (ctx.simulator) |session| session.destroy();
+    if (comptime Simulator.enabled) if (ctx.simulator) |*session| session.deinit();
 }
 
 pub fn reset(ctx: *MissionContext) void {

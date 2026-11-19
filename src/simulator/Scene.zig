@@ -8,6 +8,7 @@ const database = @import("database.zig");
 allocator: std.mem.Allocator,
 settings: types.Settings,
 objects: []const types.Object,
+thruster_len: u8,
 thrusters: []const types.Thruster,
 hulls: []const types.Hull,
 sensors: []const types.Sensor,
@@ -27,7 +28,7 @@ pub fn init(
     faults: []const types.Fault,
     membership: []const database.Membership,
 ) !Scene {
-    if (additional.len >= 4096 or robot.thrusters.len > types.max_thrusters or
+    if (additional.len >= 4096 or robot.thrusters.len > types.thruster_count or
         robot.hulls.len > types.max_hulls or robot.sensors.len > 64) return error.SceneCapacity;
 
     const objects = try allocator.alloc(types.Object, additional.len + 1);
@@ -37,10 +38,12 @@ pub fn init(
     @memcpy(objects[1..], additional);
     const owned_faults = try allocator.dupe(types.Fault, faults);
     errdefer allocator.free(owned_faults);
+    if (robot.thrusters.len > types.thruster_count or robot.thrusters.len > std.math.maxInt(u8)) return error.SceneCapacity;
     var scene: Scene = .{
         .allocator = allocator,
         .settings = settings,
         .objects = objects,
+        .thruster_len = @intCast(robot.thrusters.len),
         .thrusters = robot.thrusters,
         .hulls = robot.hulls,
         .sensors = robot.sensors,

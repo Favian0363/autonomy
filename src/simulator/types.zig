@@ -8,8 +8,15 @@ pub const Pose = struct {
 
 pub const BodyIndex = enum(usize) { robot = 0, _ };
 pub const SensorIndex = enum(usize) { _ };
-pub const max_thrusters = 8;
 pub const max_hulls = 5;
+
+const MissionConfig = @import("../MissionConfig.zig");
+/// Maximum thruster command width; from MissionConfig, not simulator-local constants.
+pub const thruster_count = MissionConfig.thruster_count;
+/// Full thruster command vector passed into the simulator runtime.
+pub const ThrusterCommands = [thruster_count]f64;
+/// Control-side thruster command buffer shared with the mission controller.
+pub const ThrusterCommandInput = [thruster_count]f32;
 
 pub const Triangle = struct { a: u32, b: u32, c: u32 };
 pub const Mesh = struct {

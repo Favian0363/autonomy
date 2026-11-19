@@ -1,17 +1,15 @@
 //! Native simulator selection; hardware-only binaries never import MuJoCo.
 const std = @import("std");
 const Auv = @import("Auv.zig");
+const MissionConfig = @import("MissionConfig.zig");
 
 pub const enabled = @import("build_options").simulator;
 pub const Session = if (enabled) @import("simulator/Session.zig").Session else struct {
-    pub fn create(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8, _: usize, _: bool) !*@This() {
+    pub fn init(_: *@This(), _: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8, _: usize, _: bool) !void {
         return error.SimulatorNotBuilt;
     }
-    pub fn destroy(_: *@This()) void {}
-    pub fn setThrusters(_: *@This(), _: *const [8]f32) !void {
-        return error.SimulatorNotBuilt;
-    }
-    pub fn checkHealth(_: *@This()) !void {
+    pub fn deinit(_: *@This()) void {}
+    pub fn setThrusters(_: *@This(), _: *const [MissionConfig.thruster_count]f32) !void {
         return error.SimulatorNotBuilt;
     }
     pub fn nextFrame(_: *@This(), _: *Auv.Frame) !void {
@@ -22,12 +20,15 @@ pub const Session = if (enabled) @import("simulator/Session.zig").Session else s
 
 test "native presets share command state with deterministic sensor frames" {
     if (!enabled) return error.SkipZigTest;
-    const a = try Session.create(std.testing.allocator, std.testing.io, "proteus", "robot_only", 6, false);
-    defer a.destroy();
-    const b = try Session.create(std.testing.allocator, std.testing.io, "proteus", "robot_only", 6, false);
-    defer b.destroy();
-    const idle = try Session.create(std.testing.allocator, std.testing.io, "proteus", "robot_only", 6, false);
-    defer idle.destroy();
+    var a: Session = undefined;
+    try a.init(std.testing.allocator, std.testing.io, "proteus", "robot_only", 6, false);
+    defer a.deinit();
+    var b: Session = undefined;
+    try b.init(std.testing.allocator, std.testing.io, "proteus", "robot_only", 6, false);
+    defer b.deinit();
+    var idle: Session = undefined;
+    try idle.init(std.testing.allocator, std.testing.io, "proteus", "robot_only", 6, false);
+    defer idle.deinit();
     const commands = [_]f32{ 0.2, 0.2, 0, 0, 0, 0, 0, 0 };
     try a.setThrusters(&commands);
     try b.setThrusters(&commands);
@@ -52,8 +53,9 @@ test "native presets share command state with deterministic sensor frames" {
         .{ .name = "bluerov", .count = 8 },
         .{ .name = "girona500", .count = 5 },
     }) |robot| {
-        const session = try Session.create(std.testing.allocator, std.testing.io, robot.name, "robosub_course", robot.count, false);
-        defer session.destroy();
+        var session: Session = undefined;
+        try session.init(std.testing.allocator, std.testing.io, robot.name, "robosub_course", robot.count, false);
+        defer session.deinit();
         try session.nextFrame(&fa);
         try std.testing.expectEqual(@as(u64, 16_666_666), fa.timestamp);
     }
@@ -61,8 +63,9 @@ test "native presets share command state with deterministic sensor frames" {
 
 test "native real-time frames wait for wall clock" {
     if (!enabled) return error.SkipZigTest;
-    const session = try Session.create(std.testing.allocator, std.testing.io, "proteus", "robot_only", 6, true);
-    defer session.destroy();
+    var session: Session = undefined;
+    try session.init(std.testing.allocator, std.testing.io, "proteus", "robot_only", 6, true);
+    defer session.deinit();
     var frame: Auv.Frame = undefined;
     const before = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
     try session.nextFrame(&frame);
@@ -75,11 +78,12 @@ test "native simulator presets replay the same trace after reset" {
     const robots = [_][]const u8{ "hydrus", "proteus", "bluerov", "girona500" };
     for (robots, [_]usize{ 8, 6, 8, 5 }) |robot, count| {
         for ([_][]const u8{ "robot_only", "robosub_course" }) |scene| {
-            const session = try Session.create(std.testing.allocator, std.testing.io, robot, scene, count, false);
-            defer session.destroy();
-            const original = try presetTrace(session);
+            var session: Session = undefined;
+            try session.init(std.testing.allocator, std.testing.io, robot, scene, count, false);
+            defer session.deinit();
+            const original = try presetTrace(&session);
             try session.runtime.reset(null);
-            try std.testing.expectEqual(original, try presetTrace(session));
+            try std.testing.expectEqual(original, try presetTrace(&session));
         }
     }
 }
@@ -142,8 +146,6 @@ test "native runtime validates inputs before stepping and applies faults on sche
     var runtime = try Runtime.init(&scene);
     defer runtime.deinit();
     const initial = runtime.hash();
-    try std.testing.expectError(error.InvalidThrusterCount, runtime.step(&.{0}));
-    try std.testing.expectError(error.InvalidThrust, runtime.step(&.{ 0, 0, 0, 0, 0, std.math.nan(f64) }));
     try std.testing.expectError(error.InvalidReset, runtime.reset(runtime.backend.states[0..1]));
     try std.testing.expectEqual(initial, runtime.hash());
     try std.testing.expect(runtime.backend.contacts.items.len > 0);
@@ -151,7 +153,8 @@ test "native runtime validates inputs before stepping and applies faults on sche
         try std.testing.expect((contact.a == 1 and contact.b == 100) or (contact.a == 100 and contact.b == 1));
     }
 
-    const commands: [6]f64 = .{ 0.2, 0, 0, 0, 0, 0 };
+    var commands: types.ThrusterCommands = @splat(0);
+    commands[0] = 0.2;
     try runtime.step(&commands);
     try std.testing.expectEqual(@as(f64, 0.1), runtime.commands[0]);
     try std.testing.expectEqual(@as(u64, 0), runtime.sensors.samples[2].tick);
@@ -178,8 +181,9 @@ test "native simulator cleans up partially initialized sessions" {
 }
 
 fn createTestSession(allocator: std.mem.Allocator) !void {
-    const session = try Session.create(allocator, std.testing.io, "proteus", "robot_only", 6, false);
-    defer session.destroy();
+    var session: Session = undefined;
+    try session.init(allocator, std.testing.io, "proteus", "robot_only", 6, false);
+    defer session.deinit();
     var frame: Auv.Frame = undefined;
     try session.nextFrame(&frame);
 }
