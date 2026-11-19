@@ -5,7 +5,7 @@
 //! rotor state, contacts, previous velocities, tick, commands, embedded catalogs).
 //!
 //! **Keep types here** for:
-//! - Rich catalog authoring (`ColliderInput`, `HullInput`, `SensorInput`); stored rows are `abi.*`
+//! - Catalog authoring inputs (`ColliderInput`, `SensorInput`); hull rows use `abi.Hull` in `database_builder`
 //! - Scene policy (`Settings`, `Fault`, `Force`) — not in session snapshots
 //! - Mission/control buffers (`ThrusterCommands`, `ThrusterCommandInput`)
 //! - Recomputed after load (`Observation`, `SensorSample`, `Detection`, `Imu`)
@@ -48,17 +48,6 @@ pub const ColliderInput = struct {
 };
 
 pub const Motion = enum { static, dynamic, kinematic };
-
-pub const HullInput = struct {
-    body: BodyIndex = .robot,
-    pose: Pose,
-    positions: []const Vec3,
-    drag: Vec3,
-    skin: Vec3,
-    centroid: Vec3,
-    coefficient_frame: Quat,
-    volume: f64,
-};
 
 pub const SensorKind = enum(u32) { pose, imu, pressure, camera };
 pub const AxisMask = u3;

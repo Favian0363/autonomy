@@ -232,9 +232,6 @@ pub fn draw(self: *Self, font: rl.Font, bounds: rl.Rectangle, packet: *const IO.
         "serial_port",
         "sim_robot",
         "sim_scene",
-        "sim_scene_catalog",
-        "sim_blend",
-        "sim_blend_collection",
         "telemetry_addr",
         "telemetry_log_path",
     }, 0..) |name, i| {
@@ -243,9 +240,6 @@ pub fn draw(self: *Self, font: rl.Font, bounds: rl.Rectangle, packet: *const IO.
             "Serial port",
             "Robot",
             "Scene",
-            "Scene catalog",
-            "Blender file",
-            "Blend collection",
             "Telemetry address",
             "Log file",
         };

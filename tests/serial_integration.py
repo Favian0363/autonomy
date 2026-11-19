@@ -142,8 +142,7 @@ CONFIG_FIELDS = [
     ('telemetry_transport',1), ('telemetry_addr',66),
     ('telemetry_log_path',258), ('mission_id',1), ('mission_profile',1),
     ('sensor_source',1), ('sensor_library',258), ('serial_port',258),
-    ('sim_robot',66), ('sim_scene',66), ('sim_scene_catalog',258), ('sim_blend',258),
-    ('sim_blend_collection',66), ('sim_realtime',1), ('revision',8),
+    ('sim_robot',66), ('sim_scene',66), ('sim_realtime',1), ('revision',8),
 ]
 OFFSETS = {}
 CONFIG_SIZE = 0
@@ -184,7 +183,7 @@ class RuntimeClient:
     def receive(self):
         data = self.socket.recv(8192)
         assert data[:4] == b'ACS1' and len(data) == 40 + 2*CONFIG_SIZE + 258 + 8, (len(data), CONFIG_SIZE)
-        assert struct.unpack_from('<H', data, 44)[0] == 6, 'unexpected live config wire version'
+        assert struct.unpack_from('<H', data, 44)[0] == 7, 'unexpected live config wire version'
         state,result,revision,client,request,config_reply,config_rejected,active = struct.unpack_from('<BBQQQQBB', data, 4)
         error = data[40+2*CONFIG_SIZE:40+2*CONFIG_SIZE+258]
         run_id = struct.unpack_from('<Q',data,40+2*CONFIG_SIZE+258)[0]

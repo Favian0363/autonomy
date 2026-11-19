@@ -2,7 +2,8 @@
 //! record columns and stores its own intrusive-list links. Slots are u32 ids.
 //! Child rows point at their owner slot. Geometry is packed xyz floats and
 //! triangle indices. Links and generation stay in memory; the file stores the
-//! columns only, and load rebuilds the active list in entity order.
+//! columns only. Runtime loads frozen bytes via `load`; catalogs are built offline
+//! with `database_builder.zig` / `export_scene`.
 const std = @import("std");
 const types = @import("types.zig");
 const abi = @import("abi.zig");
@@ -24,8 +25,6 @@ pub const Sensor = abi.Sensor;
 pub const Name = abi.Name;
 const strides = abi.strides;
 const aligns = abi.aligns;
-
-pub const Ref = struct { id: u32, generation: u32 };
 
 pub const Membership = struct {
     db: *Database,
@@ -94,30 +93,6 @@ pub fn sensorKind(record: *const Sensor) types.SensorKind {
     };
 }
 
-pub const EntityInput = struct {
-    name: []const u8,
-    asset_file: []const u8 = "",
-    asset_hash: [32]u8 = @splat(0),
-    id: u32,
-    cls: u32 = 0,
-    motion_type: types.Motion = .static,
-    tracked: bool = false,
-    fuzz: bool = false,
-    mass: f64 = 0,
-    inertia: types.Vec3 = @splat(1),
-    center_of_mass: types.Pose = .{},
-    initial_pose: types.Pose = .{},
-    initial_velocity: types.Vec3 = @splat(0),
-    initial_angular_velocity: types.Vec3 = @splat(0),
-    dry_mass: f64 = 0,
-    volume: f64 = 0,
-    buoyancy_center: types.Vec3 = @splat(0),
-    colliders: []const types.ColliderInput = &.{},
-    thrusters: []const abi.Thruster = &.{},
-    hulls: []const types.HullInput = &.{},
-    sensors: []const types.SensorInput = &.{},
-};
-
 pub const IntrusiveList = struct {
     head: u32 = nil,
     tail: u32 = nil,
@@ -168,10 +143,6 @@ pub const Database = struct {
     names: std.ArrayList(Name) = .empty,
     active: IntrusiveList = .{},
 
-    pub fn init(allocator: std.mem.Allocator) Database {
-        return .{ .allocator = allocator };
-    }
-
     pub fn deinit(self: *Database) void {
         self.names.deinit(self.allocator);
         self.indices.deinit(self.allocator);
@@ -192,22 +163,6 @@ pub const Database = struct {
         return self.strings.items[offset..][0..len];
     }
 
-    pub fn ref(self: *const Database, id: u32) Ref {
-        return .{ .id = id, .generation = self.generation.items[id] };
-    }
-
-    pub fn live(self: *const Database, slot: Ref) ?u32 {
-        if (slot.id >= self.generation.items.len) return null;
-        if (self.generation.items[slot.id] != slot.generation) return null;
-        return slot.id;
-    }
-
-    pub fn release(self: *Database, id: u32) void {
-        self.active.unlink(self.prev.items, self.next.items, id);
-        self.generation.items[id] +%= 1;
-        if (self.generation.items[id] == 0) self.generation.items[id] = 1;
-    }
-
     pub fn spliceActive(self: *Database, slots: []const u32) !void {
         for (slots, 0..) |id, i| {
             if (id >= self.entities.items.len) return error.InvalidSlot;
@@ -215,139 +170,6 @@ pub const Database = struct {
         }
         self.active.clear(self.prev.items, self.next.items);
         for (slots) |id| self.active.append(self.prev.items, self.next.items, id);
-    }
-
-    pub fn addEntity(self: *Database, input: EntityInput) !u32 {
-        // New entity slot id equals current entity column length (append order).
-        const id = try asU32(self.entities.items.len);
-
-        // Copy display name and optional asset path into the shared string blob.
-        const name = try self.putString(input.name);
-        const asset = try self.putString(input.asset_file);
-
-        // Child rows reference `owner = id` and append to their respective SIMDB columns.
-        for (input.colliders) |collider| {
-            var row = std.mem.zeroes(Collider);
-            row.owner = id;
-            row.collisions = @intFromBool(collider.collisions);
-            row.pos = collider.pose.pos;
-            row.quat = collider.pose.quat;
-            row.size = collider.size;
-            row.drag = collider.drag;
-            row.skin = collider.skin;
-            row.friction = collider.friction;
-            row.restitution = collider.restitution;
-            switch (collider.shape) {
-                .box => row.shape = 0,
-                .sphere => row.shape = 1,
-                .cylinder => row.shape = 2,
-                .mesh => |mesh| {
-                    if (mesh.positions.len < 4 or mesh.triangles.len == 0) return error.InvalidDatabase;
-                    row.shape = 3;
-                    const mesh_vertices = try self.appendVertices(mesh.positions);
-                    const mesh_triangles = try self.appendTriangles(mesh.triangles);
-                    row.vertex_start = mesh_vertices.start;
-                    row.vertex_count = mesh_vertices.count;
-                    row.triangle_start = mesh_triangles.start;
-                    row.triangle_count = mesh_triangles.count;
-                },
-            }
-            try self.colliders.append(self.allocator, row);
-        }
-        for (input.thrusters) |thruster| {
-            var row = thruster;
-            row.owner = id;
-            try self.thrusters.append(self.allocator, row);
-        }
-        for (input.hulls) |hull| {
-            if (hull.positions.len == 0 or hull.positions.len % 3 != 0) return error.InvalidDatabase;
-            const hull_vertices = try self.appendVertices(hull.positions);
-            try self.hulls.append(self.allocator, .{
-                .owner = id,
-                .body = @intCast(@backingInt(hull.body)),
-                .pos = hull.pose.pos,
-                .quat = hull.pose.quat,
-                .drag = hull.drag,
-                .skin = hull.skin,
-                .centroid = hull.centroid,
-                .coefficient_frame = hull.coefficient_frame,
-                .volume = hull.volume,
-                .vertex_start = hull_vertices.start,
-                .vertex_count = hull_vertices.count,
-            });
-        }
-        for (input.sensors) |sensor| {
-            var row = std.mem.zeroes(Sensor);
-            row.owner = id;
-            row.body = @intCast(@backingInt(sensor.body));
-            row.id = sensor.id;
-            row.enabled = @intFromBool(sensor.enabled);
-            row.period_ticks = sensor.period_ticks;
-            row.pos = sensor.pose.pos;
-            row.quat = sensor.pose.quat;
-            switch (sensor.settings) {
-                .pose => |tracking| {
-                    row.kind = 0;
-                    row.position_axes = tracking.position_axes;
-                    row.attitude_axes = tracking.attitude_axes;
-                },
-                .imu => row.kind = 1,
-                .pressure => row.kind = 2,
-                .camera => |camera| {
-                    row.kind = 3;
-                    row.width = camera.width;
-                    row.height = camera.height;
-                    row.horizontal_fov = camera.horizontal_fov;
-                    row.near_range = camera.near_range;
-                    row.far_range = camera.far_range;
-                },
-            }
-            try self.sensors.append(self.allocator, row);
-        }
-
-        // Materialize the entity row (ABI layout) and register intrusive-list links.
-        var record = std.mem.zeroes(Entity);
-        record.name_offset = name.offset;
-        record.name_len = name.len;
-        record.asset_offset = asset.offset;
-        record.asset_len = asset.len;
-        record.asset_hash = input.asset_hash;
-        record.id = input.id;
-        record.cls = input.cls;
-        record.motion = switch (input.motion_type) {
-            .static => 0,
-            .dynamic => 1,
-            .kinematic => 2,
-        };
-        record.tracked = @intFromBool(input.tracked);
-        record.fuzz = @intFromBool(input.fuzz);
-        record.mass = input.mass;
-        record.inertia = input.inertia;
-        record.com_pos = input.center_of_mass.pos;
-        record.com_quat = input.center_of_mass.quat;
-        record.initial_pos = input.initial_pose.pos;
-        record.initial_quat = input.initial_pose.quat;
-        record.initial_velocity = input.initial_velocity;
-        record.initial_angular_velocity = input.initial_angular_velocity;
-        record.dry_mass = input.dry_mass;
-        record.volume = input.volume;
-        record.buoyancy = input.buoyancy_center;
-        try self.entities.append(self.allocator, record);
-        try self.prev.append(self.allocator, nil);
-        try self.next.append(self.allocator, nil);
-        try self.generation.append(self.allocator, 1);
-        self.active.append(self.prev.items, self.next.items, id);
-        return id;
-    }
-
-    pub fn appendName(self: *Database, name: []const u8, entity_start: u32, entity_count: u32) !void {
-        const stored = try self.putString(name);
-        try self.names.append(self.allocator, .{
-            .name_offset = stored.offset,
-            .name_len = stored.len,
-            .entity_start = entity_start,
-            .entity_count = entity_count,
-        });
     }
 
     pub fn save(self: *const Database, allocator: std.mem.Allocator) ![]u8 {
@@ -384,7 +206,7 @@ pub const Database = struct {
 
     pub fn load(allocator: std.mem.Allocator, bytes: []const u8) !Database {
         const entries = try readHeader(bytes);
-        var db = Database.init(allocator);
+        var db: Database = .{ .allocator = allocator };
         errdefer db.deinit();
         try copyColumn(u8, allocator, &db.strings, bytes, entries[table.strings]);
         try copyColumn(Entity, allocator, &db.entities, bytes, entries[table.entities]);
@@ -450,26 +272,6 @@ pub const Database = struct {
         }
     }
 
-    fn appendVertices(self: *Database, points: []const types.Vec3) !struct { start: u32, count: u32 } {
-        const start = try asU32(self.positions.items.len / 3);
-        for (points) |vertex| try self.positions.appendSlice(self.allocator, &vertex);
-        return .{ .start = start, .count = try asU32(points.len) };
-    }
-
-    fn appendTriangles(self: *Database, faces: []const types.Triangle) !struct { start: u32, count: u32 } {
-        const start = try asU32(self.indices.items.len / 3);
-        for (faces) |face| {
-            const indices = [_]u32{ face.a, face.b, face.c };
-            try self.indices.appendSlice(self.allocator, &indices);
-        }
-        return .{ .start = start, .count = try asU32(faces.len) };
-    }
-
-    fn putString(self: *Database, text: []const u8) !struct { offset: u32, len: u32 } {
-        const offset = try asU32(self.strings.items.len);
-        try self.strings.appendSlice(self.allocator, text);
-        return .{ .offset = offset, .len = try asU32(text.len) };
-    }
 };
 
 pub fn readHeader(bytes: []const u8) ![table_count]TableEntry {

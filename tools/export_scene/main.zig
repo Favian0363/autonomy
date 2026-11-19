@@ -8,7 +8,6 @@ pub fn main(init: std.process.Init) !void {
 
     const usage =
         \\Usage:
-        \\  export_scene --preset robosub
         \\  export_scene <file.blend> [--collection robosub_course]
         \\
         \\Custom properties on exported mesh objects:
@@ -17,7 +16,6 @@ pub fn main(init: std.process.Init) !void {
         \\
     ;
 
-    var preset: ?[]const u8 = null;
     var blend_path: ?[]const u8 = null;
     var collection: []const u8 = "robosub_course";
 
@@ -27,10 +25,6 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print("{s}", .{usage});
             return;
-        } else if (std.mem.eql(u8, arg, "--preset")) {
-            index += 1;
-            if (index >= arg_slice.len) return error.MissingPresetName;
-            preset = arg_slice[index];
         } else if (std.mem.eql(u8, arg, "--collection")) {
             index += 1;
             if (index >= arg_slice.len) return error.MissingCollectionName;
@@ -43,21 +37,17 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const objects: []catalog_emit.SourceObject = if (preset) |name| blk: {
-        if (!std.mem.eql(u8, name, "robosub")) return error.UnknownPreset;
-        break :blk try catalog_emit.metadataObjectsFromPresets(allocator);
-    } else if (blend_path) |path| blk: {
-        var file = try catalog_emit.BlendFile.load(allocator, io, path);
-        defer file.deinit();
-        break :blk try catalog_emit.sourcesFromBlend(allocator, &file, collection);
-    } else {
+    const path = blend_path orelse {
         std.debug.print("{s}", .{usage});
         return error.MissingInput;
     };
-    defer if (blend_path != null) catalog_emit.freeSources(allocator, objects, true) else allocator.free(objects);
 
-    const scene_name = if (preset != null) "robosub_course" else collection;
-    const catalog = try catalog_emit.writeCatalog(allocator, scene_name, objects);
+    var file = try catalog_emit.BlendFile.load(allocator, io, path);
+    defer file.deinit();
+    const objects = try catalog_emit.sourcesFromBlend(allocator, &file, collection);
+    defer catalog_emit.freeSources(allocator, objects, true);
+
+    const catalog = try catalog_emit.writeCatalog(allocator, collection, objects);
     defer allocator.free(catalog);
 
     const dir = std.Io.Dir.cwd();

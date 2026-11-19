@@ -68,12 +68,18 @@ pub const Video = struct {
     status: Status = .disabled,
 };
 
+pub const SceneDraw = struct {
+    ctx: *const anyopaque,
+    draw: *const fn (ctx: *const anyopaque) void,
+};
+
 pub const Input = struct {
     status: ?MissionIO.RuntimeStatus = null,
     frame: ?*const MissionIO.TelemetryFrame = null,
     telemetry_status: Status = .connecting,
     video: Video = .{},
     send_error: bool = false,
+    scene_draw: ?SceneDraw = null,
 };
 
 pub const Actions = struct {
@@ -440,6 +446,7 @@ pub fn tick(self: *Self, input: Input) !Actions {
     rl.clearBackground(.{ .r = 12, .g = 18, .b = 28, .a = 255 });
     rl.beginMode3D(camera);
     drawFollowingGrid(sub);
+    if (input.scene_draw) |hook| hook.draw(hook.ctx);
     rl.drawLine3D(sub, .{ .x = sub.x, .y = 0, .z = sub.z }, rl.fade(rl.Color.sky_blue, 0.45));
     drawBox(telemetry.camera_pose.pos, telemetry.camera_pose.quat, .{ 0.35, 0.8, 0.22 }, rl.Color.sky_blue);
 
@@ -458,13 +465,17 @@ pub fn tick(self: *Self, input: Input) !Actions {
     if (math.dot3f(force_error, force_error) > 1e-6)
         drawArrow(telemetry.camera_pose.pos, force_error, 0.03, rl.Color.yellow);
 
-    for (telemetry.objects[0..telemetry.objects_len], 0..) |object, i| {
+    if (input.scene_draw == null) {
+        for (telemetry.objects[0..telemetry.objects_len], 0..) |object, i| {
+            if (i == 0) rl.drawLine3D(sub, toRay(object.pose.pos), rl.fade(rl.Color.ray_white, 0.45));
+            var size = object.size;
+            for (&size) |*axis| if (axis.* < 0.05) {
+                axis.* = 0.3;
+            };
+            drawBox(object.pose.pos, object.pose.quat, size, objectColor(object.cls));
+        }
+    } else for (telemetry.objects[0..telemetry.objects_len], 0..) |object, i| {
         if (i == 0) rl.drawLine3D(sub, toRay(object.pose.pos), rl.fade(rl.Color.ray_white, 0.45));
-        var size = object.size;
-        for (&size) |*axis| if (axis.* < 0.05) {
-            axis.* = 0.3;
-        };
-        drawBox(object.pose.pos, object.pose.quat, size, objectColor(object.cls));
     }
     for (telemetry.goals[0..telemetry.goals_len], 0..) |goal, i| {
         const at = toRay(goal.position);

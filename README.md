@@ -27,20 +27,11 @@ zig build run -Dsimulator
 zig build run -Dsimulator -- --headless
 ```
 
-Scene geometry is loaded from a SIMDB scene catalog. Resolution order (first match wins):
-
-| Priority | `MissionConfig` | Source |
-|----------|-----------------|--------|
-| 1 | `sim_scene_catalog` set | SIMDB file on disk |
-| 2 | `sim_blend` set | Blender collection → in-memory catalog (`sim_blend_collection`, default `robosub_course`) |
-| 3 | (default) | Embedded `src/simulator/scenes.bin` |
-
-`sim_scene` is the preset **name** inside that catalog (`robot_only`, `robosub_course`, etc.). Robots always come from embedded `robots.bin`. Refresh the committed default catalog with:
+Scene geometry comes from the embedded catalog `src/simulator/scenes.bin`. `sim_scene` selects a preset **name** inside that catalog (`robot_only`, `robosub_course`, etc.). Robots always come from embedded `robots.bin`. Refresh the committed catalog from Blender:
 
 ```sh
 zig build export-scene
-zig build export-scene -- --preset robosub
-zig build export-scene -- path/to/course.blend --collection robosub_course
+./zig-out/bin/export_scene path/to/course.blend --collection robosub_course
 ```
 
 ## ZED sensor plugin

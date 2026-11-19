@@ -41,24 +41,8 @@ tam_len: usize,
 failed: bool = false,
 started: std.Io.Clock.Timestamp,
 
-fn loadSceneCatalog(allocator: std.mem.Allocator, io: std.Io, config: *const MissionConfig.MissionConfig) !SceneCatalog {
-    const catalog_path = try config.sim_scene_catalog.slice();
-    const blend_path = try config.sim_blend.slice();
-    const collection = try config.sim_blend_collection.slice();
-    const scene_name = try config.sim_scene.slice();
-    if (catalog_path.len > 0) {
-        return SceneCatalog.initResolved(allocator, io, .{ .file_path = catalog_path });
-    }
-    if (blend_path.len > 0) {
-        const collection_name = if (collection.len > 0) collection else "robosub_course";
-        const catalog_name = if (collection.len > 0) collection else scene_name;
-        return SceneCatalog.initResolved(allocator, io, .{ .blend = .{
-            .path = blend_path,
-            .collection = collection_name,
-            .catalog_name = catalog_name,
-        } });
-    }
-    return SceneCatalog.initResolved(allocator, io, .embedded);
+fn loadSceneCatalog(allocator: std.mem.Allocator, _: std.Io, _: *const MissionConfig.MissionConfig) !SceneCatalog {
+    return SceneCatalog.init(allocator);
 }
 
 pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *const MissionConfig.MissionConfig, tam_len: usize, realtime: bool) !void {
@@ -301,6 +285,10 @@ pub fn refreshSensors(self: *Session) void {
 /// The detection slice is valid until the next step, reset, or deinit.
 pub fn observation(self: *const Session) types.Observation {
     return self.sensors.observation;
+}
+
+pub fn bodyStates(self: *const Session) []const abi.BodyState {
+    return self.backend.states;
 }
 
 /// Hash of serialized dynamics (excludes MuJoCo integration buffer in `backend.hash()`).

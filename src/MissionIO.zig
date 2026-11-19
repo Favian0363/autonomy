@@ -236,14 +236,11 @@ pub const LiveConfigPacket = struct {
     serial_port: MissionConfig.FixedText(MissionConfig.path_max),
     sim_robot: MissionConfig.FixedText(MissionConfig.name_max),
     sim_scene: MissionConfig.FixedText(MissionConfig.name_max),
-    sim_scene_catalog: MissionConfig.FixedText(MissionConfig.path_max),
-    sim_blend: MissionConfig.FixedText(MissionConfig.path_max),
-    sim_blend_collection: MissionConfig.FixedText(MissionConfig.name_max),
     sim_realtime: bool,
 
     revision: u64 = 0,
 
-    const wire_version_value: u16 = 6;
+    const wire_version_value: u16 = 7;
     const magic_value: [4]u8 = "MCF1".*;
 
     const DecodeError = error{
@@ -349,9 +346,6 @@ pub const LiveConfigPacket = struct {
             .serial_port = config.serial_port,
             .sim_robot = config.sim_robot,
             .sim_scene = config.sim_scene,
-            .sim_scene_catalog = config.sim_scene_catalog,
-            .sim_blend = config.sim_blend,
-            .sim_blend_collection = config.sim_blend_collection,
             .sim_realtime = config.sim_realtime,
             .camera_forward = config.camera_forward,
             .rotation_limit = config.rotation_limit,
@@ -381,9 +375,6 @@ pub const LiveConfigPacket = struct {
         dst.serial_port = packet.serial_port;
         dst.sim_robot = packet.sim_robot;
         dst.sim_scene = packet.sim_scene;
-        dst.sim_scene_catalog = packet.sim_scene_catalog;
-        dst.sim_blend = packet.sim_blend;
-        dst.sim_blend_collection = packet.sim_blend_collection;
         dst.sim_realtime = packet.sim_realtime;
         dst.camera_forward = packet.camera_forward;
         dst.rotation_limit = packet.rotation_limit;
@@ -502,7 +493,7 @@ comptime {
     // LiveConfigPacket is serialized field-by-field by SerialBinary. Keep
     // these anchors in order when changing the control wire schema.
     const live_fields = @typeInfo(LiveConfigPacket).@"struct".field_names;
-    if (live_fields.len != 29 or
+    if (live_fields.len != 26 or
         !std.mem.eql(u8, live_fields[2], "camera_forward") or
         !std.mem.eql(u8, live_fields[14], "telemetry_transport") or
         !std.mem.eql(u8, live_fields[16], "telemetry_log_path"))

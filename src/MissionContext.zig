@@ -26,8 +26,14 @@ const SimSession = if (simulator_enabled) @import("simulator/Session.zig").Sessi
 
 const MissionContext = @This();
 const Visualizer = if (simulator_enabled) @import("Visualizer.zig") else void;
+const SceneMeshCache = if (simulator_enabled) @import("simulator/scene_meshes.zig").SceneMeshCache else void;
+const SceneMeshDraw = if (simulator_enabled) @import("simulator/scene_meshes.zig").DrawContext else void;
+const drawSceneMeshes = if (simulator_enabled) @import("simulator/scene_meshes.zig").drawEmbedded else void;
 const EmbeddedView = if (simulator_enabled) struct {
     viewer: Visualizer,
+    scene_meshes: SceneMeshCache = undefined,
+    has_scene_meshes: bool = false,
+    mesh_draw: SceneMeshDraw = .{ .cache = undefined, .bodies = &.{} },
     last_idle_draw: ?Io.Clock.Timestamp = null,
     config_reply_revision: u64 = 0,
     config_rejected: bool = false,
@@ -111,7 +117,10 @@ pub fn initProcess(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, w
 
 pub fn deinitProcess(ctx: *MissionContext) void {
     if (comptime simulator_enabled) {
-        if (ctx.visualizer) |embedded| embedded.viewer.deinit();
+        if (ctx.visualizer) |embedded| {
+            if (embedded.has_scene_meshes) embedded.scene_meshes.deinit();
+            embedded.viewer.deinit();
+        }
     }
     ctx.telemetry.deinit(ctx.io);
 }
@@ -137,10 +146,18 @@ fn present(ctx: *MissionContext, frame: ?*const MissionIO.TelemetryFrame) !void 
         embedded.last_idle_draw = null;
     }
 
+    var scene_draw: ?Visualizer.SceneDraw = null;
+    if (embedded.has_scene_meshes) {
+        if (ctx.simulator) |session| {
+            embedded.mesh_draw.bodies = session.bodyStates();
+            scene_draw = .{ .ctx = &embedded.mesh_draw, .draw = drawSceneMeshes };
+        }
+    }
     const actions = try embedded.viewer.tick(.{
         .status = ctx.telemetry.status(&ctx.config, embedded.config_reply_revision, embedded.config_rejected),
         .frame = frame,
         .telemetry_status = if (frame != null) .live else if (ctx.telemetry.state == .starting) .connecting else .disabled,
+        .scene_draw = scene_draw,
     });
     embedded.config_reply_revision = 0;
     embedded.config_rejected = false;
@@ -240,6 +257,11 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         errdefer if (ctx.simulator) |*session| session.deinit();
         try ctx.simulator.?.init(allocator, io, &ctx.config, tam_len, realtime);
         ctx.simulator.?.rebaseClock();
+        if (ctx.visualizer) |embedded| {
+            embedded.scene_meshes = try SceneMeshCache.init(allocator, &ctx.simulator.?.scene);
+            embedded.has_scene_meshes = true;
+            embedded.mesh_draw = .{ .cache = &embedded.scene_meshes, .bodies = &.{} };
+        }
     }
 }
 
@@ -247,7 +269,15 @@ pub fn deinit(ctx: *MissionContext) void {
     if (ctx.serial) |*port| port.deinit();
     if (ctx.auv) |auv| auv.deinit();
     if (ctx.mission_diyn_loader) |*loader| loader.dynlib.close();
-    if (comptime simulator_enabled) if (ctx.simulator) |*session| session.deinit();
+    if (comptime simulator_enabled) {
+        if (ctx.visualizer) |embedded| {
+            if (embedded.has_scene_meshes) {
+                embedded.scene_meshes.deinit();
+                embedded.has_scene_meshes = false;
+            }
+        }
+        if (ctx.simulator) |*session| session.deinit();
+    }
 }
 
 pub fn reset(ctx: *MissionContext) void {

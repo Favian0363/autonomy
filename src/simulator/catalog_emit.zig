@@ -1,8 +1,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 const database = @import("database.zig");
+const builder = @import("database_builder.zig");
 const blend = @import("blend_catalog.zig");
-const presets = @import("scene_presets.zig");
 
 pub const BlendFile = blend.BlendFile;
 
@@ -21,29 +21,8 @@ pub const SourceObject = struct {
     triangles: []const types.Triangle,
 };
 
-pub fn metadataObjectsFromPresets(allocator: std.mem.Allocator) ![]SourceObject {
-    var out = try allocator.alloc(SourceObject, presets.robosub_course.len);
-    for (presets.robosub_course, 0..) |entry, i| {
-        out[i] = .{
-            .name = entry.label,
-            .id = entry.id,
-            .cls = entry.cls,
-            .tracked = entry.tracked,
-            .collisions = entry.collisions,
-            .fuzz = entry.id == 3,
-            .pose = .{ .pos = .{ entry.x, entry.y, entry.z } },
-            .hx = entry.hx,
-            .hy = entry.hy,
-            .hz = entry.hz,
-            .positions = &.{},
-            .triangles = &.{},
-        };
-    }
-    return out;
-}
-
 pub fn writeCatalog(allocator: std.mem.Allocator, scene_name: []const u8, objects: []const SourceObject) ![]u8 {
-    var db = database.Database.init(allocator);
+    var db = builder.open(allocator);
     defer db.deinit();
     const start: u32 = @intCast(db.entities.items.len);
     for (objects) |object| {
@@ -55,7 +34,7 @@ pub fn writeCatalog(allocator: std.mem.Allocator, scene_name: []const u8, object
             .collisions = object.collisions,
             .size = .{ object.hx, object.hy, object.hz },
         };
-        _ = try db.addEntity(.{
+        _ = try builder.addEntity(&db, .{
             .name = object.name,
             .id = object.id,
             .cls = object.cls,
@@ -65,7 +44,7 @@ pub fn writeCatalog(allocator: std.mem.Allocator, scene_name: []const u8, object
             .colliders = (&collider)[0..1],
         });
     }
-    try db.appendName(scene_name, start, @intCast(objects.len));
+    try builder.appendName(&db, scene_name, start, @intCast(objects.len));
     return db.save(allocator);
 }
 
@@ -93,20 +72,6 @@ pub fn sourcesFromBlend(allocator: std.mem.Allocator, file: *blend.BlendFile, co
         };
     }
     return out;
-}
-
-pub fn sceneCatalogBytesFromBlend(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    blend_path: []const u8,
-    collection: []const u8,
-    catalog_name: []const u8,
-) ![]u8 {
-    var file = try blend.BlendFile.load(allocator, io, blend_path);
-    defer file.deinit();
-    const objects = try sourcesFromBlend(allocator, &file, collection);
-    defer freeSources(allocator, objects, true);
-    return try writeCatalog(allocator, catalog_name, objects);
 }
 
 fn ext(positions: []const types.Vec3, axis: usize) f32 {

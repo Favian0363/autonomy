@@ -18,11 +18,9 @@ pub fn build(b: *std.Build) !void {
             },
         }),
     });
-    const run_export_scene = b.addRunArtifact(export_scene);
-    run_export_scene.addArg("--preset");
-    run_export_scene.addArg("robosub");
-    run_export_scene.setCwd(b.path("."));
-    b.step("export-scene", "Regenerate scenes.bin").dependOn(&run_export_scene.step);
+    const install_export_scene = b.addInstallArtifact(export_scene, .{});
+    const export_scene_step = b.step("export-scene", "Build export_scene (run with a .blend file to refresh scenes.bin)");
+    export_scene_step.dependOn(&install_export_scene.step);
 
     const optimize = b.standardOptimizeOption(.{});
     const cxx = b.option([]const u8, "cxx", "System C++ compiler") orelse "g++";

@@ -94,9 +94,6 @@ pub const MissionConfig = struct {
     serial_port: FixedText(path_max) = .{},
     sim_robot: FixedText(name_max) = .fromLiteral("hydrus"),
     sim_scene: FixedText(name_max) = .fromLiteral("robosub_course"),
-    sim_scene_catalog: FixedText(path_max) = .{},
-    sim_blend: FixedText(path_max) = .{},
-    sim_blend_collection: FixedText(name_max) = .fromLiteral("robosub_course"),
     sim_realtime: bool = false,
 
     // Startup/control connection. These values must match between the runtime
@@ -126,9 +123,7 @@ pub const MissionConfig = struct {
         return a.mission_id == b.mission_id and a.mission_profile == b.mission_profile and
             a.sensor_source == b.sensor_source and textEqual(a.sensor_library, b.sensor_library) and
             textEqual(a.serial_port, b.serial_port) and textEqual(a.sim_robot, b.sim_robot) and
-            textEqual(a.sim_scene, b.sim_scene) and textEqual(a.sim_scene_catalog, b.sim_scene_catalog) and
-            textEqual(a.sim_blend, b.sim_blend) and textEqual(a.sim_blend_collection, b.sim_blend_collection) and
-            a.sim_realtime == b.sim_realtime;
+            textEqual(a.sim_scene, b.sim_scene) and a.sim_realtime == b.sim_realtime;
     }
 
     pub fn telemetryAddr(self: *const MissionConfig) error{InvalidTextLength}![]const u8 {
@@ -158,13 +153,8 @@ pub const MissionConfig = struct {
         const serial = try self.serial_port.slice();
         const robot = try self.sim_robot.slice();
         const scene = try self.sim_scene.slice();
-        const scene_catalog = try self.sim_scene_catalog.slice();
-        const sim_blend = try self.sim_blend.slice();
-        const blend_collection = try self.sim_blend_collection.slice();
         if (std.mem.indexOfScalar(u8, library, 0) != null or std.mem.indexOfScalar(u8, serial, 0) != null or
-            std.mem.indexOfScalar(u8, robot, 0) != null or std.mem.indexOfScalar(u8, scene, 0) != null or
-            std.mem.indexOfScalar(u8, scene_catalog, 0) != null or std.mem.indexOfScalar(u8, sim_blend, 0) != null or
-            std.mem.indexOfScalar(u8, blend_collection, 0) != null) return error.InvalidPath;
+            std.mem.indexOfScalar(u8, robot, 0) != null or std.mem.indexOfScalar(u8, scene, 0) != null) return error.InvalidPath;
         if (self.sensor_source == .plugin and library.len == 0) return error.InvalidPath;
         if (robot.len == 0 or scene.len == 0) return error.InvalidPath;
         if (serial.len != 0 and self.mission_profile != .proteus_hwd) return error.InvalidProfile;
