@@ -29,7 +29,7 @@ pub const Collider = struct {
 };
 
 pub const Motion = enum { static, dynamic, kinematic };
-pub const Body = struct {
+pub const RealtimeUnderwaterBody = struct {
     id: u32,
     name: []const u8,
     cls: u32 = 0,
@@ -47,7 +47,7 @@ pub const Body = struct {
     buoyancy_center: Vec3 = @splat(0),
 };
 
-pub const Object = struct { body: Body, colliders: []const Collider };
+pub const Object = struct { body: RealtimeUnderwaterBody, colliders: []const Collider };
 pub const RotorSpec = struct {
     max_rpm: f64,
     diameter: f64,
@@ -119,7 +119,7 @@ pub const Robot = struct {
     name: []const u8,
     asset_file: []const u8,
     asset_hash: [32]u8,
-    body: Body,
+    body: RealtimeUnderwaterBody,
     colliders: []const Collider,
     thrusters: []const Thruster,
     hulls: []const Hull,

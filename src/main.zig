@@ -1,6 +1,5 @@
 const std = @import("std");
-const MissionConfig = @import("MissionConfig.zig");
-const MissionIO = @import("MissionIO.zig");
+const Simulator = @import("Simulator.zig");
 const MissionContext = @import("MissionContext.zig");
 
 test {
@@ -13,19 +12,20 @@ test {
 
 pub fn main(init: std.process.Init) !void {
     const process_allocator = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(process_allocator);
+    var windowed = Simulator.enabled;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--headless") and Simulator.enabled) {
+            windowed = false;
+        } else {
+            std.log.err("unknown argument: {s}", .{arg});
+            return error.UnknownArgument;
+        }
+    }
     var context: MissionContext = undefined;
-    context.config = MissionConfig.startup_config;
-    context.config.sensor_source = if (@import("Simulator.zig").enabled) .simulated else .plugin;
-    // Keep the listener available even if a configured telemetry output fails.
-    var bootstrap = context.config;
-    bootstrap.telemetry_transport = .stdout;
-    bootstrap.telemetry_log_path = .{};
-    var telemetry: MissionIO.Telemetry = try .init(process_allocator, init.io, bootstrap);
-    defer telemetry.deinit(init.io);
-    telemetry.reconfigure(init.io, context.config) catch |err| {
-        telemetry.report(err);
-        telemetry.telemetry_error = telemetry.last_error;
-    };
+    try context.initProcess(process_allocator, init.io, windowed);
+    defer context.deinitProcess();
+    const telemetry = context.telemetry;
 
     // Reuse mission storage across restarts without resetting the process arena.
     var mission_arena = std.heap.ArenaAllocator.init(process_allocator);
@@ -35,7 +35,8 @@ pub fn main(init: std.process.Init) !void {
         if (run_mission) {
             run_mission = false;
             defer _ = mission_arena.reset(.retain_capacity);
-            runMission(mission_arena.allocator(), init.io, &telemetry, &context) catch |err| switch (err) {
+            runMission(mission_arena.allocator(), &context) catch |err| switch (@as(anyerror, err)) {
+                error.WindowClosed => return,
                 error.MissionRestart => run_mission = true,
                 error.MissionStopped => telemetry.result = .stopped,
                 else => {
@@ -44,27 +45,31 @@ pub fn main(init: std.process.Init) !void {
                 },
             };
         } else {
-            telemetry.pollControl(init.io, &context.config) catch |err| switch (err) {
+            context.serviceWithoutFrame() catch |err| switch (@as(anyerror, err)) {
+                error.WindowClosed => return,
                 error.MissionRestart => run_mission = true,
                 error.MissionStopped => telemetry.result = .stopped,
+                else => return err,
             };
             if (!run_mission) try std.Io.sleep(init.io, .fromMilliseconds(10), .awake);
         }
     }
 }
 
-fn runMission(allocator: std.mem.Allocator, io: std.Io, telemetry: *MissionIO.Telemetry, context: *MissionContext) !void {
-    std.Io.random(io, std.mem.asBytes(&telemetry.run_id));
+fn runMission(allocator: std.mem.Allocator, context: *MissionContext) !void {
+    const telemetry = context.telemetry;
+    std.Io.random(context.io, std.mem.asBytes(&telemetry.run_id));
     telemetry.run_id |= 1;
     telemetry.state = .starting;
     telemetry.result = .none;
     telemetry.last_error = .{};
     telemetry.clearCommands();
     defer {
+        context.telemetry_frame = std.mem.zeroes(@TypeOf(context.telemetry_frame));
         telemetry.state = .idle;
         telemetry.clearCommands();
     }
-    try context.init(allocator, io, telemetry);
+    try context.init(allocator);
     defer context.deinit();
 
     try context.yieldUntilNextFrameAndUpdate();

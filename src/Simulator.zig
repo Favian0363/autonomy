@@ -1,9 +1,24 @@
 //! Native simulator selection; hardware-only binaries never import MuJoCo.
-pub const enabled = @import("build_options").simulator;
-pub const Session = if (enabled) @import("simulator/Session.zig").Session else @import("simulator/disabled.zig").Session;
-
 const std = @import("std");
 const Auv = @import("Auv.zig");
+
+pub const enabled = @import("build_options").simulator;
+pub const Session = if (enabled) @import("simulator/Session.zig").Session else struct {
+    pub fn create(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8, _: usize, _: bool) !*@This() {
+        return error.SimulatorNotBuilt;
+    }
+    pub fn destroy(_: *@This()) void {}
+    pub fn setThrusters(_: *@This(), _: *const [8]f32) !void {
+        return error.SimulatorNotBuilt;
+    }
+    pub fn checkHealth(_: *@This()) !void {
+        return error.SimulatorNotBuilt;
+    }
+    pub fn nextFrame(_: *@This(), _: *Auv.Frame) !void {
+        return error.SimulatorNotBuilt;
+    }
+    pub fn rebaseClock(_: *@This()) void {}
+};
 
 test "native presets share command state with deterministic sensor frames" {
     if (!enabled) return error.SkipZigTest;
@@ -86,8 +101,8 @@ fn presetTrace(session: *Session) !u64 {
             hash.vec(wrench.force);
             hash.vec(wrench.torque);
         }
-        hash.scalar(usize, r.world.contacts.items.len);
-        for (r.world.contacts.items) |contact| {
+        hash.scalar(usize, r.backend.contacts.items.len);
+        for (r.backend.contacts.items) |contact| {
             hash.scalar(u32, contact.a);
             hash.scalar(u32, contact.b);
             hash.vec(contact.position);
@@ -104,7 +119,15 @@ test "native runtime validates inputs before stepping and applies faults on sche
     const Runtime = @import("simulator/Runtime.zig");
     const types = @import("simulator/types.zig");
     const math = @import("simulator/support.zig");
-    const robot = @import("simulator/robots.zig").find("proteus").?;
+    const RobotCatalog = @import("simulator/robots.zig").RobotCatalog;
+    const database = @import("simulator/database.zig");
+    var catalog = try RobotCatalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    const robot_index = catalog.index("proteus").?;
+    const robot = &catalog.robots[robot_index];
+    const membership = [_]database.Membership{
+        .{ .db = &catalog.db, .slots = catalog.slots[robot_index..][0..1] },
+    };
     // The sparse IDs are independent of both Zig slice positions and MuJoCo body IDs.
     const objects = [_]types.Object{
         .{ .body = .{ .id = 100, .name = "contact box", .initial_pose = .{ .pos = .{ 0, 0, 2 } } }, .colliders = &.{.{}} },
@@ -114,17 +137,17 @@ test "native runtime validates inputs before stepping and applies faults on sche
         .{ .start = 1, .end = 6, .effect = .{ .gyro_bias = .{ .sensor = @fromBackingInt(@intCast(1)), .bias = 0.5 } } },
         .{ .start = 1, .end = 7, .effect = .{ .disable_sensor = @fromBackingInt(@intCast(2)) } },
     };
-    var scene = try Scene.init(std.testing.allocator, robot, .{ .pos = .{ 0, 0, 2 } }, &objects, .{}, &faults);
+    var scene = try Scene.init(std.testing.allocator, robot, .{ .pos = .{ 0, 0, 2 } }, &objects, .{}, &faults, &membership);
     defer scene.deinit();
     var runtime = try Runtime.init(&scene);
     defer runtime.deinit();
     const initial = runtime.hash();
     try std.testing.expectError(error.InvalidThrusterCount, runtime.step(&.{0}));
     try std.testing.expectError(error.InvalidThrust, runtime.step(&.{ 0, 0, 0, 0, 0, std.math.nan(f64) }));
-    try std.testing.expectError(error.InvalidReset, runtime.reset(runtime.world.states[0..1]));
+    try std.testing.expectError(error.InvalidReset, runtime.reset(runtime.backend.states[0..1]));
     try std.testing.expectEqual(initial, runtime.hash());
-    try std.testing.expect(runtime.world.contacts.items.len > 0);
-    for (runtime.world.contacts.items) |contact| {
+    try std.testing.expect(runtime.backend.contacts.items.len > 0);
+    for (runtime.backend.contacts.items) |contact| {
         try std.testing.expect((contact.a == 1 and contact.b == 100) or (contact.a == 100 and contact.b == 1));
     }
 
@@ -135,7 +158,7 @@ test "native runtime validates inputs before stepping and applies faults on sche
     const imu = runtime.sensors.samples[1].value.?.imu;
     const expected_gyro = math.rotate(
         math.conjugate(imu.orientation),
-        runtime.world.states[0].angular_velocity,
+        runtime.backend.states[0].angular_velocity,
     );
     try std.testing.expectApproxEqAbs(expected_gyro[0] + 0.5, imu.gyro[0], 1e-5);
     try runtime.step(&commands);

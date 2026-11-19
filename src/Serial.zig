@@ -3,17 +3,11 @@ const std = @import("std");
 const Io = std.Io;
 const linux = std.os.linux;
 const Protocol = @import("Protocol.zig");
-const MissionIO = @import("MissionIO.zig");
-const MissionConfig = @import("MissionConfig.zig");
 const Serial = @This();
-
-const ready_poll_interval_ms: u64 = 10;
-const ready_max_retries: usize = 1000;
 
 io: Io,
 file: Io.File,
 
-/// An empty path disables serial output; other paths must open and configure.
 pub fn init(io: Io, path: [:0]const u8) !?Serial {
     if (path.len == 0) return null;
     if (std.mem.indexOfScalar(u8, path, 0) != null) {
@@ -64,18 +58,6 @@ pub fn init(io: Io, path: [:0]const u8) !?Serial {
     if (set.device_io_control < 0) return error.SerialConfigureFailed;
 
     return Serial{ .io = io, .file = file };
-}
-
-/// Wait for a complete READY reply while processing runtime control messages.
-pub fn waitForReady(self: *Serial, parser: *Protocol.Parser, telemetry: *MissionIO.Telemetry, config: *MissionConfig.MissionConfig) !void {
-    var retries: usize = 0;
-    while (true) {
-        try telemetry.pollControl(self.io, config);
-        if (try self.readReplies(parser)) return;
-        if (retries == ready_max_retries) return error.SerialReadyTimeout;
-        retries += 1;
-        try Io.sleep(self.io, .fromMilliseconds(ready_poll_interval_ms), .awake);
-    }
 }
 
 /// Read one bounded batch so reply traffic cannot starve control messages.

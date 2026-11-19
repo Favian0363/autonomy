@@ -1,23 +1,13 @@
 const std = @import("std");
 const types = @import("types.zig");
-const Scene = @import("Scene.zig");
 const S = @import("support.zig");
-pub const Context = struct {
-    scene: *const Scene,
-    bodies: []const types.BodyState,
-    commands: []const f64,
-    tick: u64,
-    dt: f64,
-    rotors: []types.RotorState,
-    fluid_cache: []types.Wrench,
-    scratch: std.mem.Allocator,
-};
+const Runtime = @import("Runtime.zig");
 
-pub fn evaluate(force: types.Force, context: *const Context, wrenches: []types.Wrench) !void {
+pub fn evaluate(force: types.Force, runtime: *Runtime) !void {
     switch (force) {
-        .gravity => gravity(context, wrenches),
-        .hydrodynamics => try hydro(context, wrenches),
-        .thrusters => thrusters(context, wrenches),
+        .gravity => gravity(runtime),
+        .hydrodynamics => try hydro(runtime),
+        .thrusters => thrusters(runtime),
     }
 }
 
@@ -29,29 +19,32 @@ fn coefficients(force: types.Vec3, basis: types.Quat, cd: types.Vec3, scale: f64
     return S.scale(force, factor);
 }
 
-fn gravity(context: *const Context, w: []types.Wrench) void {
+fn gravity(runtime: *Runtime) void {
     @setFloatMode(.strict);
-    for (w, 0..) |*wrench, i| {
-        const body = context.scene.objects[i].body;
+    for (runtime.wrenches, 0..) |*wrench, i| {
+        const body = runtime.scene.objects[i].body;
         if (body.motion_type == .dynamic)
-            wrench.force = S.add(wrench.force, S.scale(context.scene.settings.gravity, body.dry_mass - body.mass));
+            wrench.force = S.add(wrench.force, S.scale(runtime.scene.settings.gravity, body.dry_mass - body.mass));
     }
 }
 
-fn hydro(context: *const Context, w: []types.Wrench) !void {
+fn hydro(runtime: *Runtime) !void {
     @setFloatMode(.strict);
-    const model = context.scene;
-    if (context.tick % model.settings.hydro_period == 0) {
-        @memset(context.fluid_cache, .{});
-        const minz = try context.scratch.alloc(f64, w.len);
-        const maxz = try context.scratch.alloc(f64, w.len);
+    const model = runtime.scene;
+    const bodies = runtime.backend.states;
+    const w = runtime.wrenches;
+    if (runtime.tick % model.settings.hydro_period == 0) {
+        @memset(runtime.fluid, .{});
+        var scratch = std.heap.FixedBufferAllocator.init(runtime.scratch);
+        const minz = try scratch.allocator().alloc(f64, w.len);
+        const maxz = try scratch.allocator().alloc(f64, w.len);
         @memset(minz, std.math.inf(f64));
         @memset(maxz, -std.math.inf(f64));
         const Wet = struct { lo: f64 = std.math.inf(f64), hi: f64 = -std.math.inf(f64) };
         var wet: [types.max_hulls]Wet = @splat(.{});
         for (model.hulls, wet[0..model.hulls.len]) |h, *extent| {
             const index = @backingInt(h.body);
-            const transform = S.compose(context.bodies[index].pose, h.pose);
+            const transform = S.compose(bodies[index].pose, h.pose);
             for (h.positions) |position| {
                 const z = S.point(transform, position)[2];
                 extent.lo = @min(extent.lo, z);
@@ -62,14 +55,14 @@ fn hydro(context: *const Context, w: []types.Wrench) !void {
         }
         for (w, 0..) |_, index| if (minz[index] > 0 and std.math.isFinite(minz[index])) {
             const body = model.objects[index].body;
-            S.addForce(&context.fluid_cache[index], S.scale(model.settings.gravity, -model.settings.water_density * body.volume), S.point(context.bodies[index].pose, body.buoyancy_center), context.bodies[index].center_of_mass);
+            S.addForce(&runtime.fluid[index], S.scale(model.settings.gravity, -model.settings.water_density * body.volume), S.point(bodies[index].pose, body.buoyancy_center), bodies[index].center_of_mass);
         };
         for (model.hulls, wet[0..model.hulls.len]) |h, extent| {
             const index = @backingInt(h.body);
-            const body = context.bodies[index];
+            const body = bodies[index];
             if (maxz[index] <= 0) continue;
             const transform = S.compose(body.pose, h.pose);
-            const out = &context.fluid_cache[index];
+            const out = &runtime.fluid[index];
             if (minz[index] <= 0 and extent.hi > 0) {
                 const fraction = if (extent.lo > 0) 1 else extent.hi / (extent.hi - extent.lo);
                 S.addForce(out, S.scale(model.settings.gravity, -fraction * h.volume * model.settings.water_density), S.point(transform, h.centroid), body.center_of_mass);
@@ -111,24 +104,27 @@ fn hydro(context: *const Context, w: []types.Wrench) !void {
         }
     }
     for (w, 0..) |*wrench, index| {
-        wrench.force = S.add(wrench.force, context.fluid_cache[index].force);
-        wrench.torque = S.add(wrench.torque, context.fluid_cache[index].torque);
+        wrench.force = S.add(wrench.force, runtime.fluid[index].force);
+        wrench.torque = S.add(wrench.torque, runtime.fluid[index].torque);
     }
 }
 
-fn thrusters(context: *const Context, w: []types.Wrench) void {
+fn thrusters(runtime: *Runtime) void {
     @setFloatMode(.strict);
-    const model = context.scene;
-    for (model.thrusters, context.rotors, context.commands) |thruster, *rotor, command| {
+    const model = runtime.scene;
+    const bodies = runtime.backend.states;
+    const dt = model.settings.timestep();
+    const count = model.thrusters.len;
+    for (model.thrusters, runtime.rotors[0..count], runtime.commands[0..count]) |thruster, *rotor, command| {
         const index = @backingInt(thruster.body);
-        const body = context.bodies[index];
+        const body = bodies[index];
         const spec = thruster.spec;
         const max = spec.max_rpm / 60 * 2 * std.math.pi;
         const target = spec.command_sign * std.math.clamp(command, -1, 1) * max;
         const error_omega = target - rotor.omega;
         const damping = if (rotor.omega > 0) @abs(rotor.torque) else -@abs(rotor.torque);
-        rotor.omega = std.math.clamp((spec.inertia * rotor.omega + context.dt * (spec.kp * target + spec.ki * rotor.integral - damping)) / (spec.inertia + context.dt * spec.kp), -2 * max, 2 * max);
-        rotor.integral = std.math.clamp(rotor.integral + error_omega * context.dt, -5, 5);
+        rotor.omega = std.math.clamp((spec.inertia * rotor.omega + dt * (spec.kp * target + spec.ki * rotor.integral - damping)) / (spec.inertia + dt * spec.kp), -2 * max, 2 * max);
+        rotor.integral = std.math.clamp(rotor.integral + error_omega * dt, -5, 5);
         const p = S.point(body.pose, thruster.position);
         const axis = S.rotate(body.pose.quat, thruster.direction);
         rotor.thrust = 0;
@@ -142,7 +138,7 @@ fn thrusters(context: *const Context, w: []types.Wrench) void {
         const rho = model.settings.water_density;
         rotor.thrust = rho * d * d * d * @abs(n) * (d * spec.thrust * n - spec.thrust * inflow);
         rotor.torque = -rho * d * d * d * d * @abs(n) * (d * spec.torque * n - spec.torque * inflow);
-        const wrench = &w[index];
+        const wrench = &runtime.wrenches[index];
         S.addForce(wrench, S.scale(axis, rotor.thrust), p, body.center_of_mass);
         wrench.torque = S.add(wrench.torque, S.scale(axis, rotor.torque));
     }

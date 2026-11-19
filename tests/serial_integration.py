@@ -139,7 +139,7 @@ CONFIG_FIELDS = [
     ('tam',192), ('tam_len',1), ('odometry',76), ('ibvs',204),
     ('goal_dist_threshold',4), ('thrustor_saturate',4), ('log_freq_div',2),
     ('queue_capacity',2), ('print_stuff',1), ('clear_print_stuff',1),
-    ('telemetry_transport',1), ('telemetry_addr',66), ('telemetry_shm_name',66),
+    ('telemetry_transport',1), ('telemetry_addr',66),
     ('telemetry_log_path',258), ('mission_id',1), ('mission_profile',1),
     ('sensor_source',1), ('sensor_library',258), ('serial_port',258),
     ('sim_robot',66), ('sim_scene',66), ('sim_realtime',1), ('revision',8),
@@ -183,6 +183,7 @@ class RuntimeClient:
     def receive(self):
         data = self.socket.recv(8192)
         assert data[:4] == b'ACS1' and len(data) == 40 + 2*CONFIG_SIZE + 258 + 8, (len(data), CONFIG_SIZE)
+        assert struct.unpack_from('<H', data, 44)[0] == 5, 'unexpected live config wire version'
         state,result,revision,client,request,config_reply,config_rejected,active = struct.unpack_from('<BBQQQQBB', data, 4)
         error = data[40+2*CONFIG_SIZE:40+2*CONFIG_SIZE+258]
         run_id = struct.unpack_from('<Q',data,40+2*CONFIG_SIZE+258)[0]
@@ -542,7 +543,7 @@ def runtime_cases():
 
 
 def simulated_sensor_cases():
-    process=subprocess.Popen([RUNTIME],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+    process=subprocess.Popen([RUNTIME, '--headless'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     client=RuntimeClient()
     try:
         for _ in range(20):

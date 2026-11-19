@@ -1,8 +1,8 @@
 const std = @import("std");
 const rl = @import("raylib");
-const IO = @import("MissionIO");
+const IO = @import("../MissionIO.zig");
 
-pub const Workspace = enum { operation, mission, tuning, runtime };
+pub const Workspace = enum { runtime, settings };
 pub const Status = enum { disabled, connecting, live, ready, stale, unavailable };
 pub const Rect = rl.Rectangle;
 const bg = color(3, 5, 4, 255);
@@ -20,8 +20,9 @@ const axis_names = [_][:0]const u8{ "X", "Y", "Z", "ROLL", "PITCH", "YAW" };
 const groups = [_][:0]const u8{ "P", "I", "D" };
 const gain_max = [_]f32{ 10, 2, 10 };
 pub const min_font_percent: u8 = 80;
+pub const default_font_percent: u8 = 175;
 pub const max_font_percent: u8 = 200;
-var font_scale: f32 = 1.0;
+var font_scale: f32 = @as(f32, @floatFromInt(default_font_percent)) / 100.0;
 
 pub fn adjustFontPercent(current: u8, delta: i16) u8 {
     return @intCast(std.math.clamp(@as(i16, current) + delta, min_font_percent, max_font_percent));
@@ -162,7 +163,7 @@ pub const Layout = struct {
     }
     pub fn navRect(self: Layout, i: usize) Rect {
         _ = self;
-        return rect(215 + @as(f32, @floatFromInt(i)) * 85, 14, 80, 28);
+        return rect(215 + @as(f32, @floatFromInt(i)) * 100, 14, 90, 28);
     }
     pub fn fontButton(self: Layout, increase: bool) Rect {
         return rect(self.top.width - (if (increase) @as(f32, 34) else 104), 15, 25, 27);
@@ -173,7 +174,25 @@ pub const Layout = struct {
     pub fn sendButton(self: Layout) Rect {
         return rect(self.editor.x + 12, self.editor.y + self.editor.height - 42, 150, 28);
     }
+    pub fn directThrusterSliderRect(self: Layout, index: usize, count: usize) Rect {
+        const p = self.controls;
+        const label_w: f32 = 30;
+        const value_w: f32 = 48;
+        const track_x = p.x + 12 + label_w;
+        const track_w = @max(40, p.width - 24 - label_w - value_w);
+        const top = p.y + 112;
+        const row_h = @min(@as(f32, 30), (p.height - 150) / @as(f32, @floatFromInt(@max(count, 1))));
+        return rect(track_x, top + @as(f32, @floatFromInt(index)) * row_h + 8, track_w, 14);
+    }
+    pub fn directThrusterZeroRect(self: Layout) Rect {
+        return rect(self.controls.x + 12, self.controls.y + self.controls.height - 38, 108, 26);
+    }
 };
+
+pub fn thrusterSliderValue(mouse_x: f32, track: Rect) f32 {
+    const ratio = std.math.clamp((mouse_x - track.x) / track.width, 0, 1);
+    return ratio * 2 - 1;
+}
 
 pub const Data = struct {
     font: rl.Font,
@@ -192,7 +211,7 @@ pub const Data = struct {
     active_mission: ?IO.CompiledConfig.MissionId,
     dropdown_open: bool,
     runtime_switch_pending: bool,
-    socket_ok: bool,
+    control_ready: bool,
     send_error: bool,
     translation: [3]f32,
     orientation: [4]f32,
@@ -208,6 +227,10 @@ pub const Data = struct {
     tune_sent: bool,
     object_scroll: usize,
     goal_scroll: usize,
+    direct_thrusters: bool,
+    direct_thruster_count: usize,
+    direct_thruster_values: []const f32,
+    direct_thruster_drag: ?usize,
 };
 fn gain(d: Data, i: usize) f32 {
     return switch (i / 6) {
@@ -328,21 +351,56 @@ fn statePanel(d: Data, p: Rect) void {
     text(d.font, rl.textFormat("%.1f  %.1f  %.1f", .{ @as(f64, angles[0]), @as(f64, angles[1]), @as(f64, angles[2]) }), p.x + 10, p.y + 173, 11, white);
     if (p.height > 215) text(d.font, if (d.frame.position_ok.x and d.frame.position_ok.y and d.frame.position_ok.z and d.frame.attitude_ok.x and d.frame.attitude_ok.y and d.frame.attitude_ok.z) "Pose valid" else "Pose validity incomplete", p.x + 10, p.y + 198, 10, teal);
 }
-fn dashboard(d: Data) void {
+fn drawDirectThrusterSliders(d: Data, p: Rect) void {
+    const count = d.direct_thruster_count;
+    if (count == 0) {
+        text(d.font, "No thrusters configured", p.x + 12, p.y + 120, 11, muted);
+        return;
+    }
+    text(d.font, "Drag sliders (-1 to 1)", p.x + 12, p.y + 116, 10, muted);
+    for (0..count) |i| {
+        const track = d.layout.directThrusterSliderRect(i, count);
+        const value = if (i < d.direct_thruster_values.len) d.direct_thruster_values[i] else 0;
+        const label_y = track.y - 2;
+        text(d.font, rl.textFormat("T%d", .{@as(c_int, @intCast(i + 1))}), p.x + 12, label_y, 11, muted);
+        box(track, surface);
+        rl.drawRectangleLinesEx(track, 1, if (d.direct_thruster_drag == i) teal else border);
+        const mid = track.x + track.width / 2;
+        box(rect(mid - 0.5, track.y - 1, 1, track.height + 2), muted);
+        const half = track.width / 2;
+        const fill = @min(half, @abs(value) * half);
+        if (fill > 0.5) {
+            box(rect(if (value < 0) mid - fill else mid, track.y + 2, fill, track.height - 4), teal);
+        }
+        const knob_x = mid + value * half - 4;
+        rl.drawCircleV(.{ .x = knob_x, .y = track.y + track.height / 2 }, 5, if (d.direct_thruster_drag == i) white else teal);
+        const value_x = track.x + track.width + 6;
+        text(d.font, rl.textFormat("%+.2f", .{@as(f64, value)}), value_x, label_y, 10, white);
+        if (d.telemetry_status == .live and i < d.frame.thrusters_len) {
+            text(d.font, rl.textFormat("O%+.2f", .{@as(f64, d.frame.thrusters[i])}), value_x, label_y + 14, 9, muted);
+        }
+    }
+    button(d.font, d.layout.directThrusterZeroRect(), "All zero", d.telemetry_status == .live);
+}
+fn topbar(d: Data) void {
     const l = d.layout;
     box(l.top, sidebar);
     text(d.font, "A", 16, 13, 20, teal);
     text(d.font, "AUTONOMY VIEWER", 42, 14, 15, white);
-    const names = [_][:0]const u8{ "Operation", "Mission", "Tuning", "Runtime" };
+    const names = [_][:0]const u8{ "Runtime", "Settings" };
     for (names, 0..) |name, i| button(d.font, l.navRect(i), name, @backingInt(d.workspace) == i);
     const sx = @max(@as(f32, 545), l.top.width - 470);
     pill(d.font, rect(sx, 14, 108, 28), "TLM", d.telemetry_status);
     pill(d.font, rect(sx + 113, 14, 120, 28), "VIDEO", d.video_status);
-    pill(d.font, rect(sx + 238, 14, 112, 28), "SEND", if (!d.socket_ok or d.send_error) .unavailable else .ready);
+    pill(d.font, rect(sx + 238, 14, 112, 28), "SEND", if (!d.control_ready or d.send_error) .unavailable else .ready);
     button(d.font, l.fontButton(false), "-", false);
     button(d.font, l.fontButton(true), "+", false);
     text(d.font, rl.textFormat("%d%%", .{@as(c_int, d.font_percent)}), l.top.width - 75, 22, 10, white);
-    scenePanel(d, l.sceneContent(.operation));
+}
+
+fn dashboard(d: Data) void {
+    const l = d.layout;
+    scenePanel(d, l.sceneContent(.runtime));
     videoPanel(d, l.video);
     statePanel(d, l.state);
     thrusterPanel(d, l.thrusters);
@@ -361,6 +419,12 @@ fn dashboard(d: Data) void {
         text(d.font, if (d.mission_kind == .point) "WASD / RF target  |  Arrows look" else "Q / E class  |  M / B / C maneuver", p.x + 12, p.y + 166, 10, muted);
         button(d.font, l.sendButton(), "Send command", false);
         text(d.font, if (d.mission_sent) "Sent locally; receipt unconfirmed" else "Enter to send; receipt unconfirmed", p.x + 168, p.y + p.height - 34, 10, muted);
+    } else if (d.direct_thrusters) {
+        if (d.telemetry_status != .live) {
+            text(d.font, "Direct thrusters need live telemetry", p.x + 12, p.y + 116, 11, amber);
+        } else {
+            drawDirectThrusterSliders(d, p);
+        }
     } else if ((d.active_mission orelse d.config.mission_id) == .teleop) {
         text(d.font, "TELEOPERATION", p.x + 12, p.y + 116, 11, teal);
         text(d.font, "W / S forward / back     A / D left / right", p.x + 12, p.y + 137, 11, white);
@@ -405,18 +469,14 @@ fn dashboard(d: Data) void {
 pub fn draw(d: Data) void {
     font_scale = @as(f32, @floatFromInt(d.font_percent)) / 100.0;
     rl.clearBackground(bg);
-    if (d.workspace == .runtime) {
-        box(d.layout.top, sidebar);
-        text(d.font, "AUTONOMY VIEWER", 16, 14, 15, white);
-        const names = [_][:0]const u8{ "Operation", "Mission", "Tuning", "Runtime" };
-        for (names, 0..) |name, i| button(d.font, d.layout.navRect(i), name, i == 3);
-    } else dashboard(d);
+    topbar(d);
+    if (d.workspace == .runtime) dashboard(d);
 }
 
 test "workspace layouts stay within supported window sizes" {
     for ([_][2]f32{ .{ 1000, 700 }, .{ 1280, 1000 }, .{ 1920, 1080 } }) |size| {
         const l = Layout.init(size[0], size[1], true);
-        const panels = [_]Rect{ l.video, l.scene, l.state, l.thrusters, l.controls, l.objects, l.goals, l.editor, l.gains, l.observed, l.update, l.sceneContent(.mission) };
+        const panels = [_]Rect{ l.video, l.scene, l.state, l.thrusters, l.controls, l.objects, l.goals, l.editor, l.gains, l.observed, l.update, l.sceneContent(.runtime) };
         for (panels) |p| {
             try std.testing.expect(p.width > 0 and p.height > 0);
             try std.testing.expect(p.x >= 0 and p.y >= 0);

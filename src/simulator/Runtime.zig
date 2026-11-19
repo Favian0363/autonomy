@@ -4,12 +4,12 @@ const std = @import("std");
 const types = @import("types.zig");
 const S = @import("support.zig");
 const Scene = @import("Scene.zig");
-const World = @import("mujoco.zig").World;
+const MujocoBackend = @import("mujoco.zig").MujocoBackend;
 const forces = @import("forces.zig");
 const Sensors = @import("sensors.zig");
 
 scene: *const Scene,
-world: World,
+backend: MujocoBackend,
 sensors: Sensors,
 wrenches: []types.Wrench,
 fluid: []types.Wrench,
@@ -22,8 +22,8 @@ tick: u64 = 0,
 
 pub fn init(scene: *const Scene) !Runtime {
     const allocator = scene.allocator;
-    var world = try World.init(allocator, scene);
-    errdefer world.deinit();
+    var backend = try MujocoBackend.init(allocator, scene);
+    errdefer backend.deinit();
     var sensors = try Sensors.init(allocator, scene);
     errdefer sensors.deinit(allocator);
     const count = scene.objects.len;
@@ -41,7 +41,7 @@ pub fn init(scene: *const Scene) !Runtime {
 
     var self: Runtime = .{
         .scene = scene,
-        .world = world,
+        .backend = backend,
         .sensors = sensors,
         .wrenches = wrenches,
         .fluid = fluid,
@@ -55,7 +55,7 @@ pub fn init(scene: *const Scene) !Runtime {
 
 pub fn deinit(self: *Runtime) void {
     const allocator = self.scene.allocator;
-    self.world.deinit();
+    self.backend.deinit();
     self.sensors.deinit(allocator);
     allocator.free(self.scratch);
     allocator.free(self.previous_angular);
@@ -66,7 +66,7 @@ pub fn deinit(self: *Runtime) void {
 }
 
 pub fn reset(self: *Runtime, states: ?[]const types.BodyState) !void {
-    try self.world.reset(states);
+    try self.backend.reset(states);
     try self.initializeTick();
 }
 
@@ -99,25 +99,13 @@ pub fn step(self: *Runtime, commands: []const f64) !void {
     }
     for (self.wrenches, self.scene.objects) |*wrench, object| wrench.* = .{ .id = object.body.id };
     self.saveVelocities();
+    for (self.scene.forces) |force| try forces.evaluate(force, self);
 
-    var scratch = std.heap.FixedBufferAllocator.init(self.scratch);
-    const context: forces.Context = .{
-        .scene = self.scene,
-        .bodies = self.world.states,
-        .commands = effective,
-        .tick = self.tick,
-        .dt = self.scene.settings.timestep(),
-        .rotors = self.rotors[0..commands.len],
-        .fluid_cache = self.fluid,
-        .scratch = scratch.allocator(),
-    };
-    for (self.scene.forces) |force| try forces.evaluate(force, &context, self.wrenches);
-
-    try self.world.step(self.wrenches);
+    try self.backend.step(self.wrenches);
     self.tick += 1;
     try self.validateReadback();
     const bounds = self.scene.settings.bounds;
-    for (self.world.states) |body| {
+    for (self.backend.states) |body| {
         if (S.norm(body.pose.pos) > bounds.position or S.norm(body.linear_velocity) > bounds.speed or
             S.norm(body.angular_velocity) > bounds.angular_speed) return error.SimulationBoundsExceeded;
     }
@@ -125,26 +113,26 @@ pub fn step(self: *Runtime, commands: []const f64) !void {
 }
 
 fn validateReadback(self: *const Runtime) !void {
-    for (self.world.states, self.scene.objects) |body, object| {
+    for (self.backend.states, self.scene.objects) |body, object| {
         if (body.id != object.body.id or !S.finite3(body.linear_velocity) or !S.finite3(body.angular_velocity) or
             !S.finite3(body.center_of_mass)) return error.InvalidBodyState;
         try S.validPose(body.pose);
     }
-    for (self.world.contacts.items) |contact| {
+    for (self.backend.contacts.items) |contact| {
         if (!S.finite3(contact.position) or !S.finite3(contact.normal) or
             !std.math.isFinite(contact.normal_force)) return error.InvalidContact;
     }
 }
 
 fn saveVelocities(self: *Runtime) void {
-    for (self.world.states, self.previous_linear, self.previous_angular) |body, *linear, *angular| {
+    for (self.backend.states, self.previous_linear, self.previous_angular) |body, *linear, *angular| {
         linear.* = body.linear_velocity;
         angular.* = body.angular_velocity;
     }
 }
 
 fn sample(self: *Runtime) void {
-    self.sensors.sample(self.scene, self.world.states, self.previous_linear, self.previous_angular, self.tick);
+    Sensors.sample(self);
 }
 
 /// The detection slice is valid until the next step, reset, or deinit.
@@ -155,8 +143,8 @@ pub fn observation(self: *const Runtime) types.Observation {
 pub fn hash(self: *const Runtime) u64 {
     var h: S.Hash = .{};
     h.scalar(u64, self.tick);
-    h.scalar(u64, self.world.hash());
-    for (self.world.states) |body| h.state(body);
+    h.scalar(u64, self.backend.hash());
+    for (self.backend.states) |body| h.state(body);
     for (self.rotors[0..self.scene.thrusters.len], self.commands[0..self.scene.thrusters.len]) |rotor, command| {
         h.scalar(f64, rotor.omega);
         h.scalar(f64, rotor.integral);
@@ -170,6 +158,6 @@ pub fn hash(self: *const Runtime) u64 {
     }
     for (self.previous_linear) |value| h.vec(value);
     for (self.previous_angular) |value| h.vec(value);
-    self.sensors.hashSamples(self.scene, &h);
+    Sensors.hashSamples(self, &h);
     return h.value;
 }

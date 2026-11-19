@@ -23,7 +23,9 @@ zig build run
 git submodule update --init vendor/mujoco
 zig build -Dsimulator
 zig build test -Dsimulator
+zig build test-simulator-geometry
 zig build run -Dsimulator
+zig build run -Dsimulator -- --headless
 ```
 
 ## ZED sensor plugin
@@ -35,7 +37,7 @@ zig build -Dzed \
 zig build run -Dzed
 ```
 
-## Viewer
+## Standalone viewer for hardware or headless simulation
 
 ```sh
 zig build viewer

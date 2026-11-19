@@ -1,8 +1,9 @@
 const std = @import("std");
 const rl = @import("raylib");
-const IO = @import("MissionIO");
+const IO = @import("../MissionIO.zig");
 const Config = IO.CompiledConfig;
 const Self = @This();
+const config_field_count = 6;
 
 status: ?IO.RuntimeStatus = null,
 draft: IO.LiveConfigPacket = IO.LiveConfigPacket.fromRuntimeConfig(&Config.startup_config),
@@ -14,9 +15,8 @@ request_id: u64 = 0,
 pending_request: ?IO.RuntimeRequest = null,
 pending_config: ?IO.LiveConfigPacket = null,
 applying_draft: bool = false,
-last_send: f64 = -1,
 last_status: f64 = -1,
-direct_fields: [Config.thruster_count]Config.FixedText(16) = @splat(.fromLiteral("0")),
+direct_values: [Config.thruster_count]f32 = @splat(0),
 direct_command: ?IO.ThrusterCommand = null,
 direct_sequence: u64 = 0,
 direct_run_id: u64 = 0,
@@ -24,13 +24,6 @@ error_text: Config.FixedText(256) = .{},
 
 pub fn synchronized(self: *const Self) bool {
     return self.status != null and rl.getTime() - self.last_status < 2;
-}
-
-fn send(io: std.Io, socket: *std.Io.net.Socket, dest: *const std.Io.net.IpAddress, value: anytype) !void {
-    var buffer: [4096]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    try IO.SerialBinary.write(&writer, value);
-    try socket.send(io, dest, writer.buffered());
 }
 
 pub fn queueConfig(self: *Self, packet: IO.LiveConfigPacket) void {
@@ -43,68 +36,40 @@ fn request(self: *Self, action: IO.RuntimeAction) void {
     self.pending_request = .{ .client_id = self.client_id, .request_id = self.request_id, .action = action };
 }
 
-/// Returns true when an authoritative configuration changed.
-pub fn update(self: *Self, io: std.Io, socket: *std.Io.net.Socket, dest: *const std.Io.net.IpAddress, packet: *IO.LiveConfigPacket) bool {
-    if (self.client_id == 0) {
-        std.Io.random(io, std.mem.asBytes(&self.client_id));
-        self.client_id |= 1;
+pub fn acceptStatus(self: *Self, status: IO.RuntimeStatus, packet: *IO.LiveConfigPacket) void {
+    const first = self.status == null;
+    const old_revision = packet.revision;
+    self.status = status;
+    self.last_status = rl.getTime();
+    if (status.run_id != self.direct_run_id or status.state != .running or
+        !status.active or status.active_config.mission_id != .thruster_control)
+    {
+        self.direct_command = null;
+        if (status.run_id != self.direct_run_id) {
+            self.direct_run_id = status.run_id;
+            self.direct_sequence = 0;
+            self.direct_values = @splat(0);
+        }
     }
-    var changed = false;
-    var buffer: [8192]u8 = undefined;
-    const timeout: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(0) } };
-    for (0..32) |_| {
-        const message = socket.receiveTimeout(io, &buffer, timeout) catch break;
-        const parsed = IO.SerialBinary.readFromBuffer(IO.RuntimeStatus, message.data) catch continue;
-        if (parsed.consumed != message.data.len or !std.mem.eql(u8, &parsed.value.magic, "ACS1")) continue;
-        const status = parsed.value;
-        status.desired.validate() catch continue;
-        const first = self.status == null;
-        changed = changed or first or status.revision != packet.revision;
-        const old_revision = packet.revision;
-        self.status = status;
-        self.last_status = rl.getTime();
-        if (status.run_id != self.direct_run_id or status.state != .running or
-            !status.active or status.active_config.mission_id != .thruster_control)
-        {
-            self.direct_command = null;
-            if (status.run_id != self.direct_run_id) {
-                self.direct_run_id = status.run_id;
-                self.direct_sequence = 0;
-                self.direct_fields = @splat(.fromLiteral("0"));
-                if (self.editing != null and self.editing.? >= 7) self.editing = null;
+    packet.* = status.desired;
+    if (self.pending_request) |pending| {
+        if (status.accepted_client_id == self.client_id and status.accepted_request_id >= pending.request_id) self.pending_request = null;
+    }
+    if (self.pending_config) |pending| {
+        if (status.config_reply_revision == pending.revision) {
+            self.pending_config = null;
+            if (status.config_rejected) {
+                self.error_text = status.last_error;
+            } else {
+                if (self.applying_draft) self.dirty = false;
+                self.error_text = .{};
             }
-        }
-        packet.* = status.desired;
-        if (self.pending_request) |pending| {
-            if (status.accepted_client_id == self.client_id and status.accepted_request_id >= pending.request_id) self.pending_request = null;
-        }
-        if (self.pending_config) |pending| {
-            if (status.config_reply_revision == pending.revision) {
-                self.pending_config = null;
-                if (status.config_rejected) {
-                    self.error_text = status.last_error;
-                } else {
-                    if (self.applying_draft) self.dirty = false;
-                    self.error_text = .{};
-                }
-                self.applying_draft = false;
-            }
-        }
-        if (first or !self.dirty) self.draft = status.desired else if (old_revision != status.revision) {
-            IO.setText(&self.error_text, "Configuration changed; Revert to refresh the draft before applying.");
+            self.applying_draft = false;
         }
     }
-    const now = rl.getTime();
-    if (now - self.last_send >= 0.25) {
-        self.last_send = now;
-        if (self.pending_config) |pending| send(io, socket, dest, pending) catch {};
-        if (self.synchronized()) {
-            if (self.direct_command) |command| send(io, socket, dest, command) catch {};
-        }
-        const query: IO.RuntimeRequest = self.pending_request orelse .{ .client_id = self.client_id, .request_id = 0, .action = .query };
-        send(io, socket, dest, query) catch {};
+    if (first or !self.dirty) self.draft = status.desired else if (old_revision != status.revision) {
+        IO.setText(&self.error_text, "Configuration changed; Revert to refresh the draft before applying.");
     }
-    return changed;
 }
 
 fn text(font: rl.Font, value: []const u8, x: f32, y: f32, tint: rl.Color) void {
@@ -141,7 +106,7 @@ fn editText(self: *Self, font: rl.Font, label: []const u8, value: anytype, index
                 }
                 value.bytes[value.len] = @intCast(code);
                 value.len += 1;
-                if (index < 7) self.dirty = true;
+                if (index < config_field_count) self.dirty = true;
             }
         }
         if (rl.isKeyPressed(.backspace) and value.len > 0) {
@@ -152,7 +117,7 @@ fn editText(self: *Self, font: rl.Font, label: []const u8, value: anytype, index
                 value.len -= 1;
                 value.bytes[value.len] = 0;
             }
-            if (index < 7) self.dirty = true;
+            if (index < config_field_count) self.dirty = true;
         }
         if (rl.isKeyPressed(.enter) or rl.isKeyPressed(.escape)) self.editing = null;
     }
@@ -161,29 +126,31 @@ fn editText(self: *Self, font: rl.Font, label: []const u8, value: anytype, index
     rl.endScissorMode();
 }
 
-fn submitThrusters(self: *Self, status: IO.RuntimeStatus, zero: bool) void {
+pub fn zeroThrusters(self: *Self) void {
+    self.direct_values = @splat(0);
+}
+
+pub fn publishThrusters(self: *Self, status: IO.RuntimeStatus) void {
+    if (status.state != .running or !status.active or status.active_config.mission_id != .thruster_control) return;
+    const count = status.active_config.tam_len;
     var values: [Config.thruster_count]f32 = @splat(0);
-    if (!zero) {
-        for (0..status.active_config.tam_len) |i| {
-            const value = std.fmt.parseFloat(f32, self.direct_fields[i].slice() catch "") catch {
-                IO.setText(&self.error_text, "Enter a number between -1 and 1 for every thruster.");
-                return;
-            };
-            if (!std.math.isFinite(value) or value < -1 or value > 1) {
-                IO.setText(&self.error_text, "Enter a number between -1 and 1 for every thruster.");
-                return;
-            }
-            values[i] = value;
-        }
-    } else self.direct_fields = @splat(.fromLiteral("0"));
+    for (0..count) |i| {
+        const value = self.direct_values[i];
+        if (!std.math.isFinite(value) or value < -1 or value > 1) return;
+        values[i] = value;
+    }
     self.direct_sequence += 1;
-    self.direct_command = .{ .run_id = status.run_id, .client_id = self.client_id, .sequence = self.direct_sequence, .count = status.active_config.tam_len, .values = values };
-    self.last_send = -1;
-    self.editing = null;
+    self.direct_command = .{
+        .run_id = status.run_id,
+        .client_id = self.client_id,
+        .sequence = self.direct_sequence,
+        .count = count,
+        .values = values,
+    };
     self.error_text = .{};
 }
 
-pub fn draw(self: *Self, font: rl.Font, bounds: rl.Rectangle, packet: *const IO.LiveConfigPacket, frame: *const IO.TelemetryFrame, telemetry_live: bool) void {
+pub fn draw(self: *Self, font: rl.Font, bounds: rl.Rectangle, packet: *const IO.LiveConfigPacket, frame: *const IO.TelemetryFrame, telemetry_live: bool, embedded: bool) void {
     const x = bounds.x;
     const w = bounds.width;
     const ready = self.synchronized();
@@ -195,7 +162,7 @@ pub fn draw(self: *Self, font: rl.Font, bounds: rl.Rectangle, packet: *const IO.
         text(font, rl.textFormat("Desired: %s / %s  |  Active: %s / %s", .{ @tagName(status.desired.mission_id).ptr, @tagName(status.desired.mission_profile).ptr, if (status.active) @tagName(status.active_config.mission_id).ptr else "none", if (status.active) @tagName(status.active_config.mission_profile).ptr else "none" }), x, y, rl.Color.ray_white);
         y += 26;
         text(font, status.last_error.slice() catch "", x, y, rl.Color.orange);
-    } else text(font, "Connecting to runtime control (independent of sensors)...", x, y, rl.Color.orange);
+    } else text(font, "Connecting to runtime control...", x, y, rl.Color.orange);
     y += 36;
     for ([_][]const u8{ "Apply", "Revert", "Start", "Stop", "Restart" }, 0..) |label, i| {
         if (button(font, label, .{ .x = x + @as(f32, @floatFromInt(i)) * 112, .y = y, .width = 104, .height = 30 }, ready)) switch (i) {
@@ -246,48 +213,31 @@ pub fn draw(self: *Self, font: rl.Font, bounds: rl.Rectangle, packet: *const IO.
     y += 36;
     if (self.status) |status| {
         if (status.active and status.active_config.mission_id == .thruster_control) {
-            text(font, "Direct thrusters (-1 to 1): S submitted, O output", x, y, rl.Color.ray_white);
-            y += 26;
-            const count: usize = status.active_config.tam_len;
-            for (0..count) |i| {
-                const col: f32 = @floatFromInt(i % 2);
-                const row: f32 = @floatFromInt(i / 2);
-                const label = if (self.direct_command) |command|
-                    if (telemetry_live and i < frame.thrusters_len)
-                        rl.textFormat("T%d S%.2f O%.2f", .{ i + 1, command.values[i], frame.thrusters[i] })
-                    else
-                        rl.textFormat("T%d sent %.2f", .{ i + 1, command.values[i] })
-                else
-                    rl.textFormat("Thruster %d", .{i + 1});
-                self.editText(font, label, &self.direct_fields[i], i + 7, .{ .x = x + col * w * 0.5, .y = y + row * 30, .width = w * 0.48, .height = 26 });
-            }
-            y += @as(f32, @floatFromInt((count + 1) / 2)) * 30 + 4;
-            const can_send = ready and status.state == .running;
-            if (button(font, "Send", .{ .x = x, .y = y, .width = 100, .height = 30 }, can_send)) self.submitThrusters(status, false);
-            if (button(font, "All zero", .{ .x = x + 110, .y = y, .width = 120, .height = 30 }, can_send)) self.submitThrusters(status, true);
-            if (self.direct_command) |command| {
-                text(font, rl.textFormat("Holding command %llu; Stop ends output", .{command.sequence}), x + 245, y + 5, rl.Color.lime);
-            } else text(font, "Waiting for Send", x + 245, y + 5, rl.Color.gray);
-            y += 36;
-            text(font, self.error_text.slice() catch "", x, y, rl.Color.orange);
-            y += 24;
+            _ = frame;
+            _ = telemetry_live;
             text(font, "Stop the mission to edit sensor and transport settings.", x, y, rl.Color.gray);
             return;
         }
     }
     text(font, rl.textFormat("Sensor source: %s (compiled)", .{@tagName(self.draft.sensor_source).ptr}), x, y + 5, rl.Color.gray);
-    if (button(font, if (self.draft.sim_realtime) "Simulator pacing: wall clock" else "Simulator pacing: accelerated", .{ .x = x + w * 0.5, .y = y, .width = w * 0.5, .height = 28 }, ready)) {
+    if (embedded) {
+        text(font, "Simulator pacing: wall clock", x + w * 0.5, y + 5, rl.Color.gray);
+    } else if (button(font, if (self.draft.sim_realtime) "Simulator pacing: wall clock" else "Simulator pacing: accelerated", .{ .x = x + w * 0.5, .y = y, .width = w * 0.5, .height = 28 }, ready)) {
         self.draft.sim_realtime = !self.draft.sim_realtime;
         self.dirty = true;
     }
     y += 36;
-    inline for (.{ "sensor_library", "serial_port", "sim_robot", "sim_scene", "telemetry_addr", "telemetry_shm_name", "telemetry_log_path" }, 0..) |name, i| {
-        const labels = [_][]const u8{ "Sensor library", "Serial port", "Robot", "Scene", "Telemetry address", "Shared memory name", "Log file" };
+    inline for (.{ "sensor_library", "serial_port", "sim_robot", "sim_scene", "telemetry_addr", "telemetry_log_path" }, 0..) |name, i| {
+        const labels = [_][]const u8{ "Sensor library", "Serial port", "Robot", "Scene", "Telemetry address", "Log file" };
         self.editText(font, labels[i], &@field(self.draft, name), i, .{ .x = x, .y = y, .width = w, .height = 26 });
         y += 30;
     }
     if (button(font, rl.textFormat("Telemetry transport: %s", .{@tagName(self.draft.telemetry_transport).ptr}), .{ .x = x, .y = y, .width = w, .height = 28 }, ready)) {
-        self.draft.telemetry_transport = @fromBackingInt(@intCast((@backingInt(self.draft.telemetry_transport) + 1) % 3));
+        self.draft.telemetry_transport = switch (self.draft.telemetry_transport) {
+            .disabled => .udp,
+            .udp => .stdout,
+            .stdout => .disabled,
+        };
         self.dirty = true;
     }
 }

@@ -1,11 +1,11 @@
-//! MuJoCo engine adapter. World owns the engine handles and borrows its scene.
+//! MuJoCo backend owns the engine handles and borrows its scene.
 const std = @import("std");
 const mj = @import("mujoco_c");
 const types = @import("types.zig");
 const Scene = @import("Scene.zig");
 const S = @import("support.zig");
 
-pub const World = struct {
+pub const MujocoBackend = struct {
     source: *const Scene,
     allocator: std.mem.Allocator,
     model: ?*mj.mjModel = null,
@@ -15,7 +15,7 @@ pub const World = struct {
     contacts: std.ArrayList(types.Contact) = .empty,
     hash_state: []mj.mjtNum = &.{},
 
-    pub fn deinit(w: *World) void {
+    pub fn deinit(w: *MujocoBackend) void {
         if (w.data) |data| mj.mj_deleteData(data);
         if (w.model) |model| mj.mj_deleteModel(model);
         w.allocator.free(w.hash_state);
@@ -25,14 +25,14 @@ pub const World = struct {
         w.* = undefined;
     }
 
-    fn externalId(w: *const World, engine_id: c_int) u32 {
+    fn externalId(w: *const MujocoBackend, engine_id: c_int) u32 {
         for (w.body_ids, w.source.objects) |id, object| {
             if (id == engine_id) return object.body.id;
         }
         return std.math.maxInt(u32);
     }
 
-    fn refresh(w: *World) !void {
+    fn refresh(w: *MujocoBackend) !void {
         const m = w.model.?;
         const d = w.data.?;
         mj.mj_forward(m, d);
@@ -69,7 +69,7 @@ pub const World = struct {
         }
     }
 
-    pub fn reset(w: *World, input: ?[]const types.BodyState) !void {
+    pub fn reset(w: *MujocoBackend, input: ?[]const types.BodyState) !void {
         if (input) |states| if (states.len != w.source.objects.len) return error.InvalidReset;
         // Validate every entry before resetting or mutating engine state.
         if (input) |states| for (states, w.source.objects) |*state, *object| {
@@ -112,7 +112,7 @@ pub const World = struct {
     }
 
     /// Input is one world-frame wrench per body in scene order.
-    pub fn step(w: *World, input: []const types.Wrench) !void {
+    pub fn step(w: *MujocoBackend, input: []const types.Wrench) !void {
         if (input.len != w.source.objects.len) return error.InvalidWrenchCount;
         for (input, w.source.objects) |wrench, object| {
             if (wrench.id != object.body.id or !S.finite3(wrench.force) or !S.finite3(wrench.torque))
@@ -130,15 +130,15 @@ pub const World = struct {
         try w.refresh();
     }
 
-    pub fn hash(w: *const World) u64 {
+    pub fn hash(w: *const MujocoBackend) u64 {
         mj.mj_getState(w.model, w.data, w.hash_state.ptr, mj.mjSTATE_INTEGRATION);
         var h: S.Hash = .{};
         for (w.hash_state) |n| h.scalar(f64, n);
         return h.value;
     }
 
-    pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !World {
-        var w: World = .{ .source = scene, .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !MujocoBackend {
+        var w: MujocoBackend = .{ .source = scene, .allocator = allocator };
         errdefer w.deinit();
         w.body_ids = try allocator.alloc(c_int, scene.objects.len);
         w.states = try allocator.alloc(types.BodyState, scene.objects.len);

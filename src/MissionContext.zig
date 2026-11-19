@@ -12,6 +12,13 @@ const MissionIO = @import("MissionIO.zig");
 
 const MissionContext = @This();
 const SimSession = Simulator.Session;
+const Visualizer = if (Simulator.enabled) @import("Visualizer.zig") else void;
+const EmbeddedView = if (Simulator.enabled) struct {
+    viewer: Visualizer,
+    last_idle_draw: ?Io.Clock.Timestamp = null,
+    config_reply_revision: u64 = 0,
+    config_rejected: bool = false,
+} else void;
 
 const Goal = MissionIO.Goal;
 
@@ -41,6 +48,7 @@ pid_prev_timestamp_ns: ?u64,
 step: []const u8,
 telemetry_frame: MissionIO.TelemetryFrame = std.mem.zeroes(MissionIO.TelemetryFrame),
 telemetry: *MissionIO.Telemetry,
+visualizer: ?*EmbeddedView,
 
 seen_objects2d: [Auv.Frame.max_objects]Auv.Object2d = undefined,
 seen_objects2d_len: u8 = 0,
@@ -55,8 +63,101 @@ hardware_frame_time: ?Io.Clock.Timestamp = null,
 /// Live configuration, retained across mission attempts and while idle.
 config: MissionConfig.MissionConfig,
 
-pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, telemetry: *MissionIO.Telemetry) !void {
-    try telemetry.pollControl(io, &ctx.config);
+pub fn initProcess(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, windowed: bool) !void {
+    ctx.io = io;
+    ctx.config = MissionConfig.startup_config;
+    ctx.config.sensor_source = if (Simulator.enabled) .simulated else .plugin;
+    ctx.visualizer = null;
+    if (windowed) ctx.config.telemetry_transport = .disabled;
+
+    // Keep the control path available even if the configured export fails.
+    var bootstrap = ctx.config;
+    bootstrap.telemetry_transport = .disabled;
+    bootstrap.telemetry_log_path = .{};
+    ctx.telemetry = try allocator.create(MissionIO.Telemetry);
+    ctx.telemetry.* = try .init(io, bootstrap, !windowed);
+    errdefer ctx.telemetry.deinit(io);
+    ctx.telemetry.reconfigure(io, ctx.config) catch |err| {
+        ctx.telemetry.report(err);
+        ctx.telemetry.telemetry_error = ctx.telemetry.last_error;
+    };
+
+    if (comptime Simulator.enabled) {
+        if (windowed) {
+            const embedded = try allocator.create(EmbeddedView);
+            embedded.* = .{
+                .viewer = Visualizer.init(&ctx.config, 1, ctx.config.mission_id == .mission_control, true) catch |err| {
+                    std.log.err("could not open the simulator visualizer ({s}); use --headless to run without a display", .{@errorName(err)});
+                    return err;
+                },
+            };
+            ctx.visualizer = embedded;
+        }
+    }
+}
+
+pub fn deinitProcess(ctx: *MissionContext) void {
+    if (comptime Simulator.enabled) {
+        if (ctx.visualizer) |embedded| embedded.viewer.deinit();
+    }
+    ctx.telemetry.deinit(ctx.io);
+}
+
+pub fn serviceWithoutFrame(ctx: *MissionContext) !void {
+    try ctx.present(null);
+    try ctx.telemetry.pollControl(ctx.io, &ctx.config);
+}
+
+fn present(ctx: *MissionContext, frame: ?*const MissionIO.TelemetryFrame) !void {
+    if (comptime !Simulator.enabled) return;
+    const embedded = ctx.visualizer orelse return;
+    if (Visualizer.shouldClose()) return error.WindowClosed;
+
+    // The simulation clock paces active frames. Pace drawing here only during
+    // idle or serial startup, where there is no simulation clock.
+    if (frame == null) {
+        if (embedded.last_idle_draw) |last| {
+            if (last.untilNow(ctx.io).raw.toNanoseconds() < 16_666_667) return;
+        }
+        embedded.last_idle_draw = .now(ctx.io, .awake);
+    } else {
+        embedded.last_idle_draw = null;
+    }
+
+    const actions = try embedded.viewer.tick(.{
+        .status = ctx.telemetry.status(&ctx.config, embedded.config_reply_revision, embedded.config_rejected),
+        .frame = frame,
+        .telemetry_status = if (frame != null) .live else if (ctx.telemetry.state == .starting) .connecting else .disabled,
+    });
+    embedded.config_reply_revision = 0;
+    embedded.config_rejected = false;
+    if (actions.config) |packet| {
+        embedded.config_reply_revision = packet.revision;
+        ctx.telemetry.applyConfig(ctx.io, &ctx.config, packet) catch |err| {
+            ctx.telemetry.report(err);
+            embedded.config_rejected = true;
+        };
+    }
+    if (actions.lifecycle) |request| ctx.telemetry.acceptRequest(request);
+    if (actions.thrusters) |command| ctx.telemetry.acceptThrusters(ctx.io, &ctx.config, command);
+    if (actions.teleop) |command| ctx.telemetry.acceptTeleop(command);
+    if (actions.mission) |command| ctx.telemetry.acceptMission(command) catch |err| ctx.telemetry.report(err);
+}
+
+fn waitForReady(ctx: *MissionContext, port: *Serial, parser: *Protocol.Parser) !void {
+    const max_retries = 1000;
+    for (0..max_retries + 1) |attempt| {
+        try ctx.serviceWithoutFrame();
+        if (try port.readReplies(parser)) return;
+        if (attempt < max_retries) try Io.sleep(ctx.io, .fromMilliseconds(10), .awake);
+    }
+    return error.SerialReadyTimeout;
+}
+
+pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
+    try ctx.serviceWithoutFrame();
+    const io = ctx.io;
+    const telemetry = ctx.telemetry;
     const config = ctx.config;
     try config.validate();
     if (!Simulator.enabled and config.serial_port.len == 0) return error.MissingOutput;
@@ -69,7 +170,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, telemetr
         .stonefish_sim => return error.InvalidThrusterCount,
     };
     const simulator: ?*SimSession = if (comptime Simulator.enabled)
-        try SimSession.create(allocator, io, try config.sim_robot.slice(), try config.sim_scene.slice(), tam_len, config.sim_realtime or config.serial_port.len != 0)
+        try SimSession.create(allocator, io, try config.sim_robot.slice(), try config.sim_scene.slice(), tam_len, ctx.visualizer != null or config.sim_realtime or config.serial_port.len != 0)
     else
         null;
     errdefer if (simulator) |session| session.destroy();
@@ -94,7 +195,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, telemetr
     errdefer if (serial) |*port| port.deinit();
     var parser: Protocol.Parser = .{};
     if (serial) |*port| {
-        try port.waitForReady(&parser, telemetry, &ctx.config);
+        try ctx.waitForReady(port, &parser);
         std.log.info("READY on {s} at 115200 baud", .{try config.serial_port.slice()});
     }
     if (simulator) |session| session.rebaseClock();
@@ -112,6 +213,7 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, telemetr
 
         .step = "",
         .telemetry = telemetry,
+        .visualizer = ctx.visualizer,
 
         .auv = auv,
         .serial = serial,
@@ -288,6 +390,12 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
         dest.* = .{ .position = source.position, .look_at = source.look_at };
     }
     ctx.telemetry.publishTelemetry(ctx.io, telemetry_frame);
+    if (comptime Simulator.enabled) {
+        if (ctx.visualizer != null) {
+            try ctx.present(telemetry_frame);
+            try ctx.telemetry.pollControl(ctx.io, &ctx.config);
+        }
+    }
 }
 
 pub fn resetOdometryPid(ctx: *MissionContext) void {

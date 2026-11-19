@@ -3,15 +3,19 @@ const std = @import("std");
 const Auv = @import("../Auv.zig");
 const Scene = @import("Scene.zig");
 const Runtime = @import("Runtime.zig");
-const robots = @import("robots.zig");
-const presets = @import("presets.zig");
-const self_capacity = @import("types.zig").max_thrusters;
+const RobotCatalog = @import("robots.zig").RobotCatalog;
+const SceneCatalog = @import("scenes.zig").SceneCatalog;
+const database = @import("database.zig");
+const types = @import("types.zig");
+const self_capacity = types.max_thrusters;
 
 pub const Session = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     io: std.Io,
+    catalog: RobotCatalog,
+    scene_catalog: SceneCatalog,
     scene: Scene,
     runtime: Runtime,
     commands: [self_capacity]f64 = @splat(0),
@@ -23,15 +27,37 @@ pub const Session = struct {
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, robot_name: []const u8, scene: []const u8, tam_len: usize, realtime: bool) !*Self {
         if (tam_len == 0 or tam_len > self_capacity) return error.InvalidThrusterCount;
-        const robot = robots.find(robot_name) orelse return error.UnknownSimRobot;
-        if (robot.thrusters.len != tam_len) return error.InvalidThrusterCount;
-
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
+        var catalog = try RobotCatalog.init(allocator);
+        errdefer catalog.deinit();
+        var scene_catalog = try SceneCatalog.init(allocator);
+        errdefer scene_catalog.deinit();
+        const robot_index = catalog.index(robot_name) orelse return error.UnknownSimRobot;
+        const robot = &catalog.robots[robot_index];
+        if (robot.thrusters.len != tam_len) return error.InvalidThrusterCount;
+        const robot_slots = catalog.slots[robot_index..][0..1];
+
+        const robot_membership = [_]database.Membership{
+            .{ .db = &catalog.db, .slots = robot_slots },
+        };
+        const selected_scene = if (std.mem.eql(u8, scene, "robot_only"))
+            try Scene.init(allocator, robot, null, &.{}, .{}, &.{}, &robot_membership)
+        else if (std.mem.eql(u8, scene, "robosub_course")) blk: {
+            const start: types.Pose = .{ .pos = .{ 0, 2, 2 }, .quat = .{ 0, 0, 1, 0 } };
+            const preset = scene_catalog.find("robosub_course") orelse return error.UnknownSimScene;
+            const membership = [_]database.Membership{
+                .{ .db = &catalog.db, .slots = robot_slots },
+                .{ .db = &scene_catalog.db, .slots = preset.slots },
+            };
+            break :blk try Scene.init(allocator, robot, start, preset.objects, .{}, &.{}, &membership);
+        } else return error.UnknownSimScene;
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .scene = try presets.create(allocator, scene, robot),
+            .catalog = catalog,
+            .scene_catalog = scene_catalog,
+            .scene = selected_scene,
             .runtime = undefined,
             .realtime = realtime,
             .tam_len = tam_len,
@@ -46,6 +72,8 @@ pub const Session = struct {
     pub fn destroy(self: *Self) void {
         self.runtime.deinit();
         self.scene.deinit();
+        self.scene_catalog.deinit();
+        self.catalog.deinit();
         self.allocator.destroy(self);
     }
 

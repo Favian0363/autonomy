@@ -1,8 +1,9 @@
-//! Validated scene records. The runtime and world borrow this scene.
+//! Validated scene records. The runtime and MuJoCo backend borrow this scene.
 const Scene = @This();
 const std = @import("std");
 const types = @import("types.zig");
 const math = @import("support.zig");
+const database = @import("database.zig");
 
 allocator: std.mem.Allocator,
 settings: types.Settings,
@@ -15,7 +16,8 @@ faults: []const types.Fault,
 forces: []const types.Force = &.{ .gravity, .hydrodynamics, .thrusters },
 
 /// Robot and additional collider definitions borrow immutable preset assets.
-/// The scene owns its object and fault arrays.
+/// The scene owns its object and fault arrays. Membership replaces each
+/// database active list with the slots that share this simulation.
 pub fn init(
     allocator: std.mem.Allocator,
     robot: *const types.Robot,
@@ -23,6 +25,7 @@ pub fn init(
     additional: []const types.Object,
     settings: types.Settings,
     faults: []const types.Fault,
+    membership: []const database.Membership,
 ) !Scene {
     if (additional.len >= 4096 or robot.thrusters.len > types.max_thrusters or
         robot.hulls.len > types.max_hulls or robot.sensors.len > 64) return error.SceneCapacity;
@@ -45,6 +48,7 @@ pub fn init(
         .faults = owned_faults,
     };
     try scene.validate();
+    for (membership) |group| try group.db.spliceActive(group.slots);
     return scene;
 }
 

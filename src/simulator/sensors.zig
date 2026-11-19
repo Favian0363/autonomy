@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const S = @import("support.zig");
 const Scene = @import("Scene.zig");
+const Runtime = @import("Runtime.zig");
 const State = @This();
 
 fn extend(lo: *types.Vec3, hi: *types.Vec3, p: types.Vec3) void {
@@ -194,15 +195,14 @@ fn assemble(self: *State, scene: *const Scene) void {
     self.observation = out;
 }
 
-pub fn sample(
-    self: *State,
-    scene: *const Scene,
-    bodies: []const types.BodyState,
-    previous_linear: []const types.Vec3,
-    previous_angular: []const types.Vec3,
-    tick: u64,
-) void {
+pub fn sample(runtime: *Runtime) void {
     @setFloatMode(.strict);
+    const self = &runtime.sensors;
+    const scene = runtime.scene;
+    const bodies = runtime.backend.states;
+    const previous_linear = runtime.previous_linear;
+    const previous_angular = runtime.previous_angular;
+    const tick = runtime.tick;
     const dt = scene.settings.timestep();
     for (scene.sensors, self.samples, 0..) |sensor, *reading, index| {
         if (tick != 0 and tick % sensor.period_ticks != 0) continue;
@@ -251,8 +251,9 @@ pub fn sample(
     self.assemble(scene);
 }
 
-pub fn hashSamples(self: *const State, scene: *const Scene, h: *S.Hash) void {
-    for (scene.sensors, self.samples) |sensor, reading| {
+pub fn hashSamples(runtime: *const Runtime, h: *S.Hash) void {
+    const self = &runtime.sensors;
+    for (runtime.scene.sensors, self.samples) |sensor, reading| {
         h.scalar(u32, sensor.id);
         h.scalar(u32, @backingInt(sensor.kind()));
         h.scalar(u64, reading.tick);

@@ -10,13 +10,12 @@ pub const tam_cols = 6;
 pub const max_ibvs_error_cols = 8;
 pub const telemetry_addr_max = 64;
 pub const telemetry_log_path_max = 256;
-pub const telemetry_shm_name_max = 64;
 pub const queue_capacity_max = 64;
 
 pub const TelemetryTransport = enum(u8) {
-    udp,
-    shared_memory,
-    stdout,
+    udp = 0,
+    stdout = 2,
+    disabled = 3,
 };
 
 pub fn FixedText(comptime capacity: usize) type {
@@ -102,7 +101,6 @@ pub const MissionConfig = struct {
     teleop_port: u16,
     telemetry_transport: TelemetryTransport,
     telemetry_addr: FixedText(telemetry_addr_max),
-    telemetry_shm_name: FixedText(telemetry_shm_name_max),
     telemetry_log_path: FixedText(telemetry_log_path_max),
 
     // Control tuning copied into mutable runtime state and optionally updated
@@ -140,12 +138,6 @@ pub const MissionConfig = struct {
         return text;
     }
 
-    pub fn telemetryShmName(self: *const MissionConfig) error{InvalidTextLength}![]const u8 {
-        const text = try self.telemetry_shm_name.slice();
-        if (text.len == 0) return error.InvalidTextLength;
-        return text;
-    }
-
     pub const ValidateError = error{
         InvalidTamLen,
         InvalidProfile,
@@ -172,8 +164,7 @@ pub const MissionConfig = struct {
         if (self.ibvs.interaction_cols == 0 or self.ibvs.interaction_cols > max_ibvs_error_cols) return error.InvalidInteractionCols;
         switch (self.telemetry_transport) {
             .udp => _ = try self.telemetryAddr(),
-            .shared_memory => _ = try self.telemetryShmName(),
-            .stdout => {},
+            .stdout, .disabled => {},
         }
         _ = try self.telemetryLogPath();
     }
@@ -216,7 +207,6 @@ fn presetBaseline() MissionConfig {
         .clear_print_stuff = true,
         .telemetry_transport = .udp,
         .telemetry_addr = FixedText(telemetry_addr_max).fromLiteral("127.0.0.1:5600"),
-        .telemetry_shm_name = FixedText(telemetry_shm_name_max).fromLiteral("autonomy_telemetry"),
         .telemetry_log_path = FixedText(telemetry_log_path_max).fromLiteral(""),
     };
 }
@@ -225,7 +215,6 @@ fn presetStonefishSim() MissionConfig {
     var config = presetBaseline();
     config.mission_profile = .stonefish_sim;
     config.rotation_limit = .{ 0, 0, 100 };
-    config.telemetry_transport = .shared_memory;
     config.odometry = .{
         .rotation_gate = 0.292699081688714,
         .kp = .{ 1.0, 0.7, 1.1, 3.0, 6.0, 8.0 },
@@ -260,7 +249,6 @@ fn presetProteusHwd() MissionConfig {
     config.sim_robot = .fromLiteral("proteus");
     config.rotation_limit = .{ 0.3, 0, 100 };
     config.ibvs.target_height = 0.35;
-    config.telemetry_transport = .shared_memory;
     config.odometry = .{
         .rotation_gate = 0.392699081688714,
         .kp = .{ 1.0, 1.0, 2.2, 2.4, 2.4, 2.0 },

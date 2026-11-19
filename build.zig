@@ -3,6 +3,39 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
 
+    const robot_catalog_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/simulator/robot_geometry_test.zig"),
+        .target = b.graph.host,
+    }) }));
+    b.step("test-simulator-geometry", "Validate the embedded simulator geometry catalog").dependOn(&robot_catalog_tests.step);
+
+    const scene_catalog_tests = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/simulator/scene_geometry_test.zig"),
+        .target = b.graph.host,
+    }) }));
+    b.step("test-simulator-scene-geometry", "Validate the embedded simulator scene catalog").dependOn(&scene_catalog_tests.step);
+
+    const export_scene_sim = b.createModule(.{
+        .root_source_file = b.path("src/simulator/geometry_pkg.zig"),
+        .target = b.graph.host,
+    });
+    const export_scene = b.addExecutable(.{
+        .name = "export_scene",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/export_scene/main.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "sim", .module = export_scene_sim },
+            },
+        }),
+    });
+    const run_export_scene = b.addRunArtifact(export_scene);
+    run_export_scene.addArg("--preset");
+    run_export_scene.addArg("robosub");
+    run_export_scene.setCwd(b.path("."));
+    b.step("export-scene", "Regenerate scenes.bin").dependOn(&run_export_scene.step);
+
     const optimize = b.standardOptimizeOption(.{});
     const cxx = b.option([]const u8, "cxx", "System C++ compiler") orelse "g++";
     const zed_prefix = b.option([]const u8, "zed-prefix", "ZED SDK install prefix") orelse "/usr/local/zed";
@@ -89,28 +122,30 @@ pub fn build(b: *std.Build) !void {
     const teleop_sender_step = b.step("teleop-sender", "Build the optional SDL2 keyboard teleop sender");
     teleop_sender_step.dependOn(&install_teleop_sender.step);
 
-    const mission_io = b.createModule(.{
-        .root_source_file = b.path("src/MissionIO.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    mission_io.addIncludePath(b.path("include"));
-
     const raylib_dep = b.dependency("raylib_zig", .{
         .target = target,
         .optimize = optimize,
     });
+    const raylib = raylib_dep.module("raylib");
+    if (simulator) exe.root_module.addImport("raylib", raylib);
+    const visualizer = b.createModule(.{
+        .root_source_file = b.path("src/Visualizer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "raylib", .module = raylib }},
+    });
+    visualizer.addIncludePath(b.path("include"));
     const viewer_mod = b.createModule(.{
         .root_source_file = b.path("tools/viewer/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "raylib", .module = raylib_dep.module("raylib") },
-            .{ .name = "MissionIO", .module = mission_io },
+            .{ .name = "raylib", .module = raylib },
+            .{ .name = "Visualizer", .module = visualizer },
         },
     });
-    viewer_mod.linkLibrary(raylib_dep.artifact("raylib"));
     const viewer = b.addExecutable(.{
         .name = "viewer",
         .root_module = viewer_mod,
@@ -212,18 +247,7 @@ pub fn build(b: *std.Build) !void {
     const run_firmware_tests = b.addRunArtifact(firmware_tests);
     test_step.dependOn(&run_firmware_tests.step);
 
-    const viewer_ui_test_mod = b.createModule(.{
-        .root_source_file = b.path("tools/viewer/ui.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "raylib", .module = raylib_dep.module("raylib") },
-            .{ .name = "MissionIO", .module = mission_io },
-        },
-    });
-    viewer_ui_test_mod.linkLibrary(raylib_dep.artifact("raylib"));
-    const viewer_ui_tests = b.addTest(.{ .root_module = viewer_ui_test_mod });
+    const viewer_ui_tests = b.addTest(.{ .root_module = visualizer });
     const run_viewer_ui_tests = b.addRunArtifact(viewer_ui_tests);
     test_step.dependOn(&run_viewer_ui_tests.step);
 
