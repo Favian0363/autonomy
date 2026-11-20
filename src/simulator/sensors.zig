@@ -17,8 +17,8 @@ fn extend(lo: *types.Vec3, hi: *types.Vec3, p: types.Vec3) void {
 
 fn objectBounds(slot: database.BodySlot, lo: *types.Vec3, hi: *types.Vec3) void {
     @setFloatMode(.strict);
-    lo.* = S.v(std.math.inf(f64), std.math.inf(f64), std.math.inf(f64));
-    hi.* = S.v(-std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64));
+    lo.* = @splat(std.math.inf(f64));
+    hi.* = @splat(-std.math.inf(f64));
     const count = database.ownedCount(slot.db.colliders, slot.slot);
     for (0..count) |ki| {
         const c = database.colliderAt(slot.db, slot.slot, ki);
@@ -26,19 +26,19 @@ fn objectBounds(slot: database.BodySlot, lo: *types.Vec3, hi: *types.Vec3) void 
         const shape = database.shapeFrom(slot.db, c);
         switch (shape) {
             .mesh => |mesh| {
-                for (mesh.positions) |position| extend(lo, hi, S.point(pose, position));
+                for (mesh.positions) |position| extend(lo, hi, S.point(pose, S.fromAbi3(position)));
             },
             else => {
-                var size = c.size;
-                if (shape == .sphere) size = S.v(size[0], size[0], size[0]);
+                var size = S.fromAbi3(c.size);
+                if (shape == .sphere) size = .{ size[0], size[0], size[0] };
                 if (shape == .cylinder) size[1] = size[0];
                 var k: u32 = 0;
                 while (k < 8) : (k += 1) {
-                    extend(lo, hi, S.point(pose, S.v(
+                    extend(lo, hi, S.point(pose, .{
                         if (k & 1 != 0) size[0] else -size[0],
                         if (k & 2 != 0) size[1] else -size[1],
                         if (k & 4 != 0) size[2] else -size[2],
-                    )));
+                    }));
                 }
             },
         }
@@ -136,11 +136,11 @@ fn cameraSample(
         var corners: [8]types.Vec3 = undefined;
         var k: u32 = 0;
         while (k < 8) : (k += 1) {
-            corners[k] = S.rotate(inverse, S.sub(S.point(S.bodyPose(body), S.v(
+            corners[k] = S.rotate(inverse, S.sub(S.point(S.bodyPose(body), .{
                 if (k & 1 != 0) hi[0] else lo[0],
                 if (k & 2 != 0) hi[1] else lo[1],
                 if (k & 4 != 0) hi[2] else lo[2],
-            )), mount.pos));
+            }), mount.pos));
         }
         if (project(camera, corners, &observation)) {
             objects[count] = observation;
@@ -251,12 +251,12 @@ pub fn sample(runtime: *Session) void {
                 .axes = .{ .position_axes = @intCast(record.position_axes), .attitude_axes = @intCast(record.attitude_axes) },
             } },
             .imu => blk: {
-                const arm = S.sub(mount.pos, body.com);
-                const alpha = S.scale(S.sub(body.angular_vel, previous_angular[body_index]), 1 / dt);
-                const acceleration = S.add(S.add(S.scale(S.sub(body.linear_vel, previous_linear[body_index]), 1 / dt), S.cross(alpha, arm)), S.cross(body.angular_vel, S.cross(body.angular_vel, arm)));
+                const arm = S.sub(mount.pos, S.fromAbi3(body.com));
+                const alpha = S.scale(S.sub(S.fromAbi3(body.angular_vel), S.fromAbi3(previous_angular[body_index])), 1 / dt);
+                const acceleration = S.add(S.add(S.scale(S.sub(S.fromAbi3(body.linear_vel), S.fromAbi3(previous_linear[body_index])), 1 / dt), S.cross(alpha, arm)), S.cross(S.fromAbi3(body.angular_vel), S.cross(S.fromAbi3(body.angular_vel), arm)));
                 break :blk .{ .imu = .{
                     .orientation = mount.quat,
-                    .gyro = S.rotate(S.conjugate(mount.quat), body.angular_vel),
+                    .gyro = S.rotate(S.conjugate(mount.quat), S.fromAbi3(body.angular_vel)),
                     .accel = S.rotate(S.conjugate(mount.quat), S.sub(acceleration, scene.settings.gravity)),
                 } };
             },

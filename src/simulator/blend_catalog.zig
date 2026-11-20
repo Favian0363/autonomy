@@ -114,7 +114,9 @@ pub const BlendFile = struct {
             }
             if (mesh.positions.len == 0 and props.hx != null and props.hy != null and props.hz != null) {
                 const box = database.boxMesh(props.hx.?, props.hy.?, props.hz.?);
-                mesh.positions = try self.allocator.dupe(types.Vec3, &box.positions);
+                var box_positions: [8]types.Vec3 = undefined;
+                for (box.positions, &box_positions) |p, *out| out.* = .{ p[0], p[1], p[2] };
+                mesh.positions = try self.allocator.dupe(types.Vec3, &box_positions);
                 mesh.triangles = try self.allocator.dupe(types.Triangle, &box.triangles);
             }
             try out.append(self.allocator, .{

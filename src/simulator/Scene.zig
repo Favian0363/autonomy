@@ -26,7 +26,6 @@ pub fn init(
     additional: []const database.BodySlot,
     settings: types.Settings,
     faults: []const types.Fault,
-    membership: []const database.Membership,
 ) !Scene {
     if (additional.len >= 4096) return error.SceneCapacity;
     const thruster_count = database.ownedCount(robot_slot.db.thrusters, robot_slot.slot);
@@ -52,8 +51,13 @@ pub fn init(
         .routing = .initFill(null),
         .faults = owned_faults,
     };
+    for (objects, 0..) |body, i| {
+        if (body.slot >= body.db.entities.len) return error.InvalidSlot;
+        for (objects[i + 1 ..]) |other| {
+            if (body.db == other.db and body.slot == other.slot) return error.InvalidSlot;
+        }
+    }
     try scene.validate();
-    for (membership) |group| try group.db.spliceActive(group.slots);
     return scene;
 }
 
@@ -85,8 +89,8 @@ fn validate(self: *Scene) !void {
         const e = database.entity(object);
         const name = database.entityName(object.db, object.slot);
         if (e.id == std.math.maxInt(u32) or name.len >= 64 or
-            !math.finite3(e.initial_velocity) or !math.finite3(e.initial_angular_velocity) or
-            !math.finite3(e.inertia) or !math.finite3(e.buoyancy) or
+            !math.finite3(math.fromAbi3(e.initial_velocity)) or !math.finite3(math.fromAbi3(e.initial_angular_velocity)) or
+            !math.finite3(math.fromAbi3(e.inertia)) or !math.finite3(math.fromAbi3(e.buoyancy)) or
             !nonnegative(e.mass) or !nonnegative(e.dry_mass) or !nonnegative(e.volume))
             return error.InvalidBody;
         const motion = database.motionFrom(e.motion);
@@ -103,8 +107,8 @@ fn validate(self: *Scene) !void {
     const robot_slot = self.robot();
     for (0..self.thruster_len) |index| {
         const t = database.thrusterAt(robot_slot.db, robot_slot.slot, index);
-        if (t.body >= self.objects.len or !math.finite3(t.position) or !math.finite3(t.direction) or
-            @abs(math.norm(t.direction) - 1) >= 1e-4 or !positive(t.max_rpm) or !positive(t.diameter) or !positive(t.inertia) or
+        if (t.body >= self.objects.len or !math.finite3(math.fromAbi3(t.position)) or !math.finite3(math.fromAbi3(t.direction)) or
+            @abs(math.norm(math.fromAbi3(t.direction)) - 1) >= 1e-4 or !positive(t.max_rpm) or !positive(t.diameter) or !positive(t.inertia) or
             !std.math.isFinite(t.thrust) or !std.math.isFinite(t.torque) or !nonnegative(t.kp) or !nonnegative(t.ki) or
             (t.command_sign != 1 and t.command_sign != -1)) return error.InvalidThruster;
     }
@@ -112,12 +116,12 @@ fn validate(self: *Scene) !void {
     for (0..hull_count) |index| {
         const h = database.hullAt(robot_slot.db, robot_slot.slot, index);
         if (h.body >= self.objects.len or h.vertex_count == 0 or h.vertex_count % 3 != 0 or
-            !math.finite3(h.drag) or !math.finite3(h.skin) or !math.finite3(h.centroid) or !nonnegative(h.volume))
+            !math.finite3(math.fromAbi3(h.drag)) or !math.finite3(math.fromAbi3(h.skin)) or !math.finite3(math.fromAbi3(h.centroid)) or !nonnegative(h.volume))
             return error.InvalidHull;
         try math.validPose(database.poseOf(h.pos, h.quat));
-        try math.validPose(.{ .quat = h.coefficient_frame });
+        try math.validPose(.{ .quat = math.fromAbi4(h.coefficient_frame) });
         const positions = database.vertexSlice(robot_slot.db, h.vertex_start, h.vertex_count);
-        for (positions) |position| if (!math.finite3(position)) return error.InvalidHull;
+        for (positions) |position| if (!math.finite3(math.fromAbi3(position))) return error.InvalidHull;
     }
     for (0..self.sensor_len) |index| {
         const sensor = database.sensorAt(robot_slot.db, robot_slot.slot, index);
@@ -160,7 +164,7 @@ fn sensorIs(self: *const Scene, ref: types.SensorIndex, kind: types.SensorKind) 
 fn validateCollider(db: *const database.Database, c: *const database.Collider) !void {
     const pose = database.poseOf(c.pos, c.quat);
     try math.validPose(pose);
-    if (!math.finite3(c.size) or !math.finite3(c.drag) or !math.finite3(c.skin) or
+    if (!math.finite3(math.fromAbi3(c.size)) or !math.finite3(math.fromAbi3(c.drag)) or !math.finite3(math.fromAbi3(c.skin)) or
         !nonnegative(c.friction) or !nonnegative(c.restitution) or c.restitution > 1)
         return error.InvalidCollider;
     const shape = database.shapeFrom(db, c);
@@ -168,7 +172,7 @@ fn validateCollider(db: *const database.Database, c: *const database.Collider) !
         .mesh => |mesh| {
             if (mesh.positions.len < 4 or mesh.positions.len > 1000000 or
                 mesh.triangles.len == 0 or mesh.triangles.len > 2000000) return error.InvalidMesh;
-            for (mesh.positions) |v| if (!math.finite3(v)) return error.InvalidMesh;
+            for (mesh.positions) |v| if (!math.finite3(math.fromAbi3(v))) return error.InvalidMesh;
             for (mesh.triangles) |f| if (f.a >= mesh.positions.len or f.b >= mesh.positions.len or
                 f.c >= mesh.positions.len) return error.InvalidMesh;
         },

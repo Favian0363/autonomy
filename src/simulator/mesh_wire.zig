@@ -13,7 +13,14 @@ pub fn encode(allocator: std.mem.Allocator, positions: []const types.Vec3, trian
     @memcpy(out[0..4], &mesh_magic);
     std.mem.writeInt(u32, out[4..8], vert_count, .little);
     std.mem.writeInt(u32, out[8..12], tri_count, .little);
-    @memcpy(out[12 .. 12 + vert_bytes], std.mem.sliceAsBytes(positions));
+    var f32_verts = try allocator.alloc(f32, positions.len * 3);
+    defer allocator.free(f32_verts);
+    for (positions, 0..) |p, i| {
+        f32_verts[i * 3] = @floatCast(p[0]);
+        f32_verts[i * 3 + 1] = @floatCast(p[1]);
+        f32_verts[i * 3 + 2] = @floatCast(p[2]);
+    }
+    @memcpy(out[12 .. 12 + vert_bytes], std.mem.sliceAsBytes(f32_verts));
     const tri_offset = 12 + vert_bytes;
     const indices = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(triangles));
     @memcpy(out[tri_offset .. tri_offset + tri_bytes], std.mem.sliceAsBytes(indices));

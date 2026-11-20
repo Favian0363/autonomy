@@ -90,7 +90,7 @@ pub const SerialBinary = struct {
                 std.mem.writeInt(T, &buf, value, .little);
                 try w.writeAll(&buf);
             },
-            .float => try write(w, @as(u32, @bitCast(value))),
+            .float => try write(w, @as(u32, @bitCast(@as(f32, @floatCast(value))))),
             .bool => try write(w, @as(u8, @intFromBool(value))),
             .@"enum" => |info| try write(w, @as(info.tag_type, @backingInt(value))),
             .array => |info| {
@@ -128,7 +128,13 @@ pub const SerialBinary = struct {
                 try r.readSliceAll(&buf);
                 return std.mem.readInt(T, &buf, .little);
             },
-            .float => return @bitCast(try read(r, u32)),
+            .float => {
+                const bits = try read(r, u32);
+                const narrow = @as(f32, @bitCast(bits));
+                if (T == f32) return narrow;
+                if (T == f64) return @as(f64, narrow);
+                @compileError("unsupported float type " ++ @typeName(T));
+            },
             .bool => return try read(r, u8) != 0,
             .@"enum" => |info| {
                 const raw = try read(r, info.tag_type);
@@ -209,6 +215,89 @@ pub const MissionDiynLoader = struct {
     }
 };
 
+/// f32 control fields on the live-config wire; runtime `MissionConfig` stores f64.
+pub const OdometryPidWire = struct {
+    rotation_gate: f32,
+    kp: [6]f32,
+    ki: [6]f32,
+    kd: [6]f32,
+};
+
+pub const IbvsWire = struct {
+    center_deadband: f32,
+    target_height: f32,
+    interaction_cols: u8,
+    _pad: [3]u8 = .{ 0, 0, 0 },
+    interaction: [math.interaction_output_len][MissionConfig.max_ibvs_error_cols]f32,
+};
+
+fn widen3(v: [3]f32) math.Vector3f {
+    return .{ v[0], v[1], v[2] };
+}
+
+fn narrow3(v: math.Vector3f) [3]f32 {
+    return .{ @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]) };
+}
+
+fn widen6(v: [6]f32) math.Vector6f {
+    return .{ v[0], v[1], v[2], v[3], v[4], v[5] };
+}
+
+fn narrow6(v: math.Vector6f) [6]f32 {
+    return .{
+        @floatCast(v[0]),
+        @floatCast(v[1]),
+        @floatCast(v[2]),
+        @floatCast(v[3]),
+        @floatCast(v[4]),
+        @floatCast(v[5]),
+    };
+}
+
+fn odometryFromWire(wire: OdometryPidWire) MissionConfig.OdometryPid {
+    return .{
+        .rotation_gate = wire.rotation_gate,
+        .kp = widen6(wire.kp),
+        .ki = widen6(wire.ki),
+        .kd = widen6(wire.kd),
+    };
+}
+
+fn odometryToWire(odometry: MissionConfig.OdometryPid) OdometryPidWire {
+    return .{
+        .rotation_gate = @floatCast(odometry.rotation_gate),
+        .kp = narrow6(odometry.kp),
+        .ki = narrow6(odometry.ki),
+        .kd = narrow6(odometry.kd),
+    };
+}
+
+fn ibvsFromWire(wire: IbvsWire) MissionConfig.Ibvs {
+    var interaction: [math.interaction_output_len][MissionConfig.max_ibvs_error_cols]f64 = @splat(@splat(0));
+    for (&interaction, &wire.interaction) |*row, source| {
+        inline for (0..MissionConfig.max_ibvs_error_cols) |i| row[i] = source[i];
+    }
+    return .{
+        .center_deadband = wire.center_deadband,
+        .target_height = wire.target_height,
+        .interaction_cols = wire.interaction_cols,
+        .interaction = interaction,
+    };
+}
+
+fn ibvsToWire(ibvs: MissionConfig.Ibvs) IbvsWire {
+    var interaction: [math.interaction_output_len][MissionConfig.max_ibvs_error_cols]f32 = @splat(@splat(0));
+    for (&interaction, &ibvs.interaction) |*row, source| {
+        inline for (0..MissionConfig.max_ibvs_error_cols) |i| row[i] = @floatCast(source[i]);
+    }
+    return .{
+        .center_deadband = @floatCast(ibvs.center_deadband),
+        .target_height = @floatCast(ibvs.target_height),
+        .interaction_cols = ibvs.interaction_cols,
+        .interaction = interaction,
+    };
+}
+
 /// Editable runtime configuration used by the viewer and the control protocol.
 pub const LiveConfigPacket = struct {
     magic: [4]u8 = magic_value,
@@ -217,8 +306,8 @@ pub const LiveConfigPacket = struct {
     rotation_limit: [3]f32,
     tam: [MissionConfig.thruster_count][MissionConfig.tam_cols]f32,
     tam_len: u8,
-    odometry: MissionConfig.OdometryPid,
-    ibvs: MissionConfig.Ibvs,
+    odometry: OdometryPidWire,
+    ibvs: IbvsWire,
     goal_dist_threshold: f32,
     thrustor_saturate: f32,
     log_freq_div: u16,
@@ -286,14 +375,14 @@ pub const LiveConfigPacket = struct {
         }
     }
 
-    fn validateOdometry(odometry: *const MissionConfig.OdometryPid) ValidateError!void {
+    fn validateOdometry(odometry: *const OdometryPidWire) ValidateError!void {
         try requireFinite(odometry.rotation_gate);
         for (odometry.kp) |v| try requireFinite(v);
         for (odometry.ki) |v| try requireFinite(v);
         for (odometry.kd) |v| try requireFinite(v);
     }
 
-    fn validateIbvs(ibvs: *const MissionConfig.Ibvs) ValidateError!void {
+    fn validateIbvs(ibvs: *const IbvsWire) ValidateError!void {
         if (ibvs.interaction_cols == 0 or ibvs.interaction_cols > MissionConfig.max_ibvs_error_cols)
             return error.InvalidInteractionCols;
         try requireFinite(ibvs.center_deadband);
@@ -336,6 +425,10 @@ pub const LiveConfigPacket = struct {
     }
 
     pub fn fromRuntimeConfig(config: *const MissionConfig.MissionConfig) LiveConfigPacket {
+        var tam_wire: [MissionConfig.thruster_count][MissionConfig.tam_cols]f32 = @splat(@splat(0));
+        for (0..config.tam_len) |i| {
+            inline for (0..MissionConfig.tam_cols) |j| tam_wire[i][j] = @floatCast(config.tam[i][j]);
+        }
         return .{
             .magic = magic_value,
             .wire_version = wire_version_value,
@@ -347,14 +440,14 @@ pub const LiveConfigPacket = struct {
             .sim_robot = config.sim_robot,
             .sim_scene = config.sim_scene,
             .sim_realtime = config.sim_realtime,
-            .camera_forward = config.camera_forward,
-            .rotation_limit = config.rotation_limit,
-            .tam = config.tam,
+            .camera_forward = narrow3(config.camera_forward),
+            .rotation_limit = narrow3(config.rotation_limit),
+            .tam = tam_wire,
             .tam_len = config.tam_len,
-            .odometry = config.odometry,
-            .ibvs = config.ibvs,
-            .goal_dist_threshold = config.goal_dist_threshold,
-            .thrustor_saturate = config.thrustor_saturate,
+            .odometry = odometryToWire(config.odometry),
+            .ibvs = ibvsToWire(config.ibvs),
+            .goal_dist_threshold = @floatCast(config.goal_dist_threshold),
+            .thrustor_saturate = @floatCast(config.thrustor_saturate),
             .log_freq_div = config.log_freq_div,
             .queue_capacity = config.queue_capacity,
             .print_stuff = config.print_stuff,
@@ -376,12 +469,16 @@ pub const LiveConfigPacket = struct {
         dst.sim_robot = packet.sim_robot;
         dst.sim_scene = packet.sim_scene;
         dst.sim_realtime = packet.sim_realtime;
-        dst.camera_forward = packet.camera_forward;
-        dst.rotation_limit = packet.rotation_limit;
-        dst.tam = packet.tam;
+        dst.camera_forward = widen3(packet.camera_forward);
+        dst.rotation_limit = widen3(packet.rotation_limit);
+        var tam: [MissionConfig.thruster_count]math.Vector6f = @splat(@splat(0));
+        for (0..packet.tam_len) |i| {
+            inline for (0..MissionConfig.tam_cols) |j| tam[i][j] = packet.tam[i][j];
+        }
+        dst.tam = tam;
         dst.tam_len = packet.tam_len;
-        dst.odometry = packet.odometry;
-        dst.ibvs = packet.ibvs;
+        dst.odometry = odometryFromWire(packet.odometry);
+        dst.ibvs = ibvsFromWire(packet.ibvs);
         dst.goal_dist_threshold = packet.goal_dist_threshold;
         dst.thrustor_saturate = packet.thrustor_saturate;
         dst.log_freq_div = packet.log_freq_div;
@@ -417,6 +514,29 @@ pub const TelemetryObject = extern struct {
     cls: u8,
     _pad: [3]u8,
 };
+
+pub fn telemetryVec3(v: math.Vector3f) [3]f32 {
+    return .{ @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]) };
+}
+
+pub fn telemetryQuat(v: math.Quaternionf) [4]f32 {
+    return .{ @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]), @floatCast(v[3]) };
+}
+
+pub fn telemetryPose(p: math.Pose) TelemetryPose {
+    return .{ .pos = telemetryVec3(p.pos), .quat = telemetryQuat(p.quat) };
+}
+
+pub fn telemetryVec6(v: math.Vector6f) [6]f32 {
+    return .{
+        @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]),
+        @floatCast(v[3]), @floatCast(v[4]), @floatCast(v[5]),
+    };
+}
+
+pub fn telemetryFloat(v: f64) f32 {
+    return @floatCast(v);
+}
 
 pub const TelemetryPoint2u = extern struct {
     x: u32,
@@ -829,6 +949,30 @@ pub const MissionCommandKind = enum(u8) {
     point,
     object,
 };
+pub fn teleopCommand(translation: math.Vector3f, orientation: math.Quaternionf) TeleopCommand {
+    return .{
+        .translation = .{
+            @floatCast(translation[0]),
+            @floatCast(translation[1]),
+            @floatCast(translation[2]),
+        },
+        .orientation = .{
+            @floatCast(orientation[0]),
+            @floatCast(orientation[1]),
+            @floatCast(orientation[2]),
+            @floatCast(orientation[3]),
+        },
+    };
+}
+
+pub fn teleopTranslation(command: TeleopCommand) math.Vector3f {
+    return .{ command.translation[0], command.translation[1], command.translation[2] };
+}
+
+pub fn teleopOrientation(command: TeleopCommand) math.Quaternionf {
+    return .{ command.orientation[0], command.orientation[1], command.orientation[2], command.orientation[3] };
+}
+
 
 pub const MissionManeuver = enum(u8) {
     move,

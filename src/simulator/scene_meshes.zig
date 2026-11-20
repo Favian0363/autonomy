@@ -116,7 +116,7 @@ fn makeEntry(
 }
 
 fn uploadTriangleMesh(
-    positions: []const types.Vec3,
+    positions: []const abi.Vec3,
     triangles: []const types.Triangle,
 ) !rl.Mesh {
     if (positions.len > max_index_vertices) return error.MeshTooLarge;
@@ -151,7 +151,7 @@ fn entityColor(body_index: usize, cls: u8) rl.Color {
 }
 
 fn toRay(v: types.Vec3) rl.Vector3 {
-    return .{ .x = v[0], .y = -v[2], .z = -v[1] };
+    return .{ .x = @floatCast(v[0]), .y = @floatCast(-v[2]), .z = @floatCast(-v[1]) };
 }
 
 fn poseMatrix(pose: types.Pose) rl.Matrix {

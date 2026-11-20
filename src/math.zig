@@ -1,9 +1,9 @@
 const std = @import("std");
 
-pub const Vector2f = @Vector(2, f32);
-pub const Vector3f = @Vector(3, f32);
-pub const Vector6f = @Vector(6, f32);
-pub const Quaternionf = @Vector(4, f32);
+pub const Vector2f = @Vector(2, f64);
+pub const Vector3f = @Vector(3, f64);
+pub const Vector6f = @Vector(6, f64);
+pub const Quaternionf = @Vector(4, f64);
 
 pub const Pose = struct {
     pos: Vector3f,
@@ -19,11 +19,11 @@ pub inline fn xy(v: Vector3f) Vector2f {
     return .{ v[0], v[1] };
 }
 
-pub inline fn dot2f(a: Vector2f, b: Vector2f) f32 {
+pub inline fn dot2f(a: Vector2f, b: Vector2f) f64 {
     return @reduce(.Add, a * b);
 }
 
-pub inline fn length2f(v: Vector2f) f32 {
+pub inline fn length2f(v: Vector2f) f64 {
     return @sqrt(dot2f(v, v));
 }
 
@@ -32,7 +32,7 @@ pub inline fn normalize2f(v: Vector2f) Vector2f {
     return v / @as(Vector2f, @splat(len));
 }
 
-pub inline fn dot3f(a: Vector3f, b: Vector3f) f32 {
+pub inline fn dot3f(a: Vector3f, b: Vector3f) f64 {
     return @reduce(.Add, a * b);
 }
 
@@ -45,47 +45,44 @@ pub const InteractionMapError = error{
 };
 
 /// Each interaction row is dotted with `error_vector`. Row count must be [`interaction_output_len`]; every row length must match `error_vector.len`.
-pub fn mapInteraction(interaction: []const []const f32, error_vector: []const f32) InteractionMapError![interaction_output_len]f32 {
+pub fn mapInteraction(
+    interaction: []const []const f64,
+    error_vector: []const f64,
+) InteractionMapError![interaction_output_len]f64 {
     if (interaction.len != interaction_output_len)
         return error.InteractionRowCountMismatch;
-    var mapped: [interaction_output_len]f32 = undefined;
+    var mapped: [interaction_output_len]f64 = undefined;
     for (interaction, &mapped) |row, *out| {
         if (row.len != error_vector.len)
             return error.InteractionColumnCountMismatch;
-        var sum: f32 = 0;
+        var sum: f64 = 0;
         for (row, error_vector) |gain, err| sum += gain * err;
         out.* = sum;
     }
     return mapped;
 }
 
-pub fn add4(a: [4]f32, b: [4]f32) [4]f32 {
-    var out: [4]f32 = undefined;
-    for (&out, a, b) |*slot, left, right| slot.* = left + right;
-    return out;
-}
-
 /// Per axis: position when `position_available`, otherwise visual, otherwise zero.
 /// A null visual vector means vision is unavailable on every axis.
 pub fn greedy6(
-    position: [interaction_output_len]f32,
-    visual: ?[interaction_output_len]f32,
+    position: Vector6f,
+    visual: ?Vector6f,
     position_available: [interaction_output_len]bool,
-) [interaction_output_len]f32 {
-    var out: [interaction_output_len]f32 = undefined;
-    for (&out, position, position_available, 0..) |*slot, pos, available, i| {
-        if (available) {
-            slot.* = pos;
+) Vector6f {
+    var out: Vector6f = undefined;
+    inline for (0..interaction_output_len) |i| {
+        if (position_available[i]) {
+            out[i] = position[i];
         } else if (visual) |vis| {
-            slot.* = vis[i];
+            out[i] = vis[i];
         } else {
-            slot.* = 0;
+            out[i] = 0;
         }
     }
     return out;
 }
 
-pub inline fn length3f(v: Vector3f) f32 {
+pub inline fn length3f(v: Vector3f) f64 {
     return @sqrt(dot3f(v, v));
 }
 
@@ -95,10 +92,10 @@ pub inline fn normalize3f(v: Vector3f) Vector3f {
 }
 
 pub inline fn cross3f(a: Vector3f, b: Vector3f) Vector3f {
-    const a_yzx = @shuffle(f32, a, undefined, Vector3f{ 1, 2, 0 });
-    const a_zxy = @shuffle(f32, a, undefined, Vector3f{ 2, 0, 1 });
-    const b_yzx = @shuffle(f32, b, undefined, Vector3f{ 1, 2, 0 });
-    const b_zxy = @shuffle(f32, b, undefined, Vector3f{ 2, 0, 1 });
+    const a_yzx = @shuffle(f64, a, undefined, Vector3f{ 1, 2, 0 });
+    const a_zxy = @shuffle(f64, a, undefined, Vector3f{ 2, 0, 1 });
+    const b_yzx = @shuffle(f64, b, undefined, Vector3f{ 1, 2, 0 });
+    const b_zxy = @shuffle(f64, b, undefined, Vector3f{ 2, 0, 1 });
 
     return a_yzx * b_zxy - a_zxy * b_yzx;
 }
@@ -136,19 +133,19 @@ pub inline fn quaternionRotate(q: Quaternionf, v: Vector3f) Vector3f {
 pub inline fn quaternionToEuler(q: Quaternionf) Vector3f {
     const x, const y, const z, const w = q;
 
-    const sinr_cosp: f32 = 2.0 * (w * x + y * z);
-    const cosr_cosp: f32 = 1.0 - 2.0 * (x * x + y * y);
-    const roll: f32 = std.math.atan2(sinr_cosp, cosr_cosp);
+    const sinr_cosp: f64 = 2.0 * (w * x + y * z);
+    const cosr_cosp: f64 = 1.0 - 2.0 * (x * x + y * y);
+    const roll: f64 = std.math.atan2(sinr_cosp, cosr_cosp);
 
-    const sinp: f32 = 2.0 * (w * y - z * x);
-    const pitch: f32 = if (@abs(sinp) >= 1.0)
+    const sinp: f64 = 2.0 * (w * y - z * x);
+    const pitch: f64 = if (@abs(sinp) >= 1.0)
         if (sinp < 0.0) -std.math.pi / 2.0 else std.math.pi / 2.0
     else
         std.math.asin(sinp);
 
-    const siny_cosp: f32 = 2.0 * (w * z + x * y);
-    const cosy_cosp: f32 = 1.0 - 2.0 * (y * y + z * z);
-    const yaw: f32 = std.math.atan2(siny_cosp, cosy_cosp);
+    const siny_cosp: f64 = 2.0 * (w * z + x * y);
+    const cosy_cosp: f64 = 1.0 - 2.0 * (y * y + z * z);
+    const yaw: f64 = std.math.atan2(siny_cosp, cosy_cosp);
 
     return .{ roll, pitch, yaw };
 }
@@ -173,19 +170,19 @@ pub fn eulerToQuaternion(euler: Vector3f) Quaternionf {
     };
 }
 
-pub inline fn wrapAngle(angle: f32) f32 {
+pub inline fn wrapAngle(angle: f64) f64 {
     return @mod(angle + std.math.pi, 2.0 * std.math.pi) - std.math.pi;
 }
 
-pub fn withinDeadband(err: f32, deadband: f32) f32 {
+pub fn withinDeadband(err: f64, deadband: f64) f64 {
     if (@abs(err) <= deadband) return 0;
     return err;
 }
 
 pub const BoxMetrics2d = struct {
-    cx: f32,
-    cy: f32,
-    height: f32,
+    cx: f64,
+    cy: f64,
+    height: f64,
 };
 
 /// Normalized image errors: cx/cy in roughly [-1, 1] from image center; height in [0, 1].
@@ -196,13 +193,13 @@ pub fn boxMetrics(
     top_left: [2]u32,
     bottom_right: [2]u32,
 ) BoxMetrics2d {
-    const w = @as(f32, @floatFromInt(image_width));
-    const h = @as(f32, @floatFromInt(image_height));
-    const center_x = (@as(f32, @floatFromInt(top_left[0])) + @as(f32, @floatFromInt(bottom_right[0]))) * 0.5;
-    const center_y = (@as(f32, @floatFromInt(top_left[1])) + @as(f32, @floatFromInt(bottom_right[1]))) * 0.5;
+    const w = @as(f64, @floatFromInt(image_width));
+    const h = @as(f64, @floatFromInt(image_height));
+    const center_x = (@as(f64, @floatFromInt(top_left[0])) + @as(f64, @floatFromInt(bottom_right[0]))) * 0.5;
+    const center_y = (@as(f64, @floatFromInt(top_left[1])) + @as(f64, @floatFromInt(bottom_right[1]))) * 0.5;
     const cx = (center_x / w - 0.5) * 2.0;
     const cy = (center_y / h - 0.5) * 2.0;
-    const height = @as(f32, @floatFromInt(bottom_right[1] - top_left[1])) / h;
+    const height = @as(f64, @floatFromInt(bottom_right[1] - top_left[1])) / h;
     return .{ .cx = cx, .cy = cy, .height = height };
 }
 
@@ -238,7 +235,7 @@ pub inline fn poseTo6f(pose: Pose) Vector6f {
     return .{ x, y, z, roll, pitch, yaw };
 }
 
-pub fn tamMul(tam: []const Vector6f, v: Vector6f, out: []f32) []f32 {
+pub fn tamMul(tam: []const Vector6f, v: Vector6f, out: []f64) []f64 {
     const result = out[0..tam.len];
 
     for (tam, result) |row, *r| {
@@ -253,13 +250,14 @@ pub const max_thrusters = 8;
 /// Linear map from 6-DOF command to per-thruster values: t_i = dot(tam[i], input).
 /// Clamps to ±`thrustor_saturate`, then divides by 5 (backend scale in MissionContext).
 /// `out` must be at least `tam.len` elements; returns `out[0..tam.len]`.
+/// Mixed thruster commands; narrow to f32 only at the hardware / telemetry boundary.
 pub fn tamToThrusters(
     tam: []const Vector6f,
     input: Vector6f,
-    thrustor_saturate: f32,
-    output_scale: f32,
-    out: []f32,
-) []f32 {
+    thrustor_saturate: f64,
+    output_scale: f64,
+    out: []f64,
+) []f64 {
     std.debug.assert(out.len >= tam.len);
     std.debug.assert(output_scale > 0);
     const thruster_values = tamMul(tam, input, out);
@@ -287,8 +285,8 @@ pub fn tamToThrusters(
 pub fn wrenchToThrusterInput(
     wrench: Vector6f,
     orientation: Quaternionf,
-    yaw_error: f32,
-    close_enough_yaw_gate: f32,
+    yaw_error: f64,
+    close_enough_yaw_gate: f64,
 ) Vector6f {
     const rot = normalize4f(orientation);
     const world_force: Vector3f = .{ wrench[0], wrench[1], wrench[2] };

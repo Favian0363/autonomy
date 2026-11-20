@@ -49,18 +49,18 @@ pub fn FixedText(comptime capacity: usize) type {
 }
 
 pub const OdometryPid = struct {
-    rotation_gate: f32,
-    kp: [6]f32,
-    ki: [6]f32,
-    kd: [6]f32,
+    rotation_gate: f64,
+    kp: math.Vector6f,
+    ki: math.Vector6f,
+    kd: math.Vector6f,
 };
 
 pub const Ibvs = struct {
-    center_deadband: f32,
-    target_height: f32,
+    center_deadband: f64,
+    target_height: f64,
     interaction_cols: u8,
     _pad: [3]u8 = .{ 0, 0, 0 },
-    interaction: [math.interaction_output_len][max_ibvs_error_cols]f32,
+    interaction: [math.interaction_output_len][max_ibvs_error_cols]f64,
 };
 
 pub const MissionProfileId = enum(u8) {
@@ -115,15 +115,15 @@ pub const MissionConfig = struct {
 
     // Control tuning copied into mutable runtime state and optionally updated
     // by a validated live-control packet.
-    camera_forward: [3]f32,
-    rotation_limit: [3]f32,
-    tam: [thruster_count][tam_cols]f32,
+    camera_forward: math.Vector3f,
+    rotation_limit: math.Vector3f,
+    tam: [thruster_count]math.Vector6f,
     tam_len: u8,
     _pad1: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
     odometry: OdometryPid,
     ibvs: Ibvs,
-    goal_dist_threshold: f32,
-    thrustor_saturate: f32,
+    goal_dist_threshold: f64,
+    thrustor_saturate: f64,
     log_freq_div: u16,
     queue_capacity: u16,
     print_stuff: bool,
@@ -187,19 +187,19 @@ pub const MissionConfig = struct {
 
 // --- Presets (edit here; rebuild the main executable to apply compile-time checks) ---
 
-fn presetZeroTam() [thruster_count][tam_cols]f32 {
-    return std.mem.zeroes([thruster_count][tam_cols]f32);
+fn presetZeroTam() [thruster_count]math.Vector6f {
+    return @splat(@splat(0));
 }
 
-fn presetZeroInteraction() [math.interaction_output_len][max_ibvs_error_cols]f32 {
-    return std.mem.zeroes([math.interaction_output_len][max_ibvs_error_cols]f32);
+fn presetZeroInteraction() [math.interaction_output_len][max_ibvs_error_cols]f64 {
+    return @splat(@splat(0));
 }
 
 fn presetBaseline() MissionConfig {
     return .{
         .teleop_port = control_port,
         .camera_forward = .{ 0, 1, 0 },
-        .rotation_limit = .{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) },
+        .rotation_limit = .{ std.math.inf(f64), std.math.inf(f64), std.math.inf(f64) },
         .tam = presetZeroTam(),
         .tam_len = 0,
         .odometry = .{
@@ -305,8 +305,8 @@ pub fn compiledProfile(profile: MissionProfileId) *const MissionConfig {
     };
 }
 
-fn rowIsZero(row: [tam_cols]f32) bool {
-    for (row) |gain| if (gain != 0) return false;
+fn rowIsZero(row: math.Vector6f) bool {
+    inline for (0..tam_cols) |i| if (row[i] != 0) return false;
     return true;
 }
 
@@ -325,8 +325,8 @@ fn assertPreset(comptime name: []const u8, comptime config: MissionConfig) void 
 
     var last_nonzero: usize = 0;
     for (config.tam, 0..) |row, index| {
-        for (row) |gain| {
-            if (!std.math.isFinite(gain)) @compileError(name ++ ": TAM gain is not finite");
+        inline for (0..tam_cols) |i| {
+            if (!std.math.isFinite(row[i])) @compileError(name ++ ": TAM gain is not finite");
         }
         if (!rowIsZero(row)) last_nonzero = index + 1;
     }
@@ -334,10 +334,9 @@ fn assertPreset(comptime name: []const u8, comptime config: MissionConfig) void 
         @compileError(name ++ ": tam_len does not match the last nonzero TAM row");
     }
 
-    const pid = .{ config.odometry.kp, config.odometry.ki, config.odometry.kd };
-    inline for (pid) |gains| {
-        for (gains) |gain| {
-            if (!std.math.isFinite(gain)) @compileError(name ++ ": odometry gain is not finite");
+    inline for (.{ config.odometry.kp, config.odometry.ki, config.odometry.kd }) |gains| {
+        inline for (0..6) |i| {
+            if (!std.math.isFinite(gains[i])) @compileError(name ++ ": odometry gain is not finite");
         }
     }
     if (!std.math.isFinite(config.odometry.rotation_gate)) {
@@ -349,18 +348,11 @@ fn assertPreset(comptime name: []const u8, comptime config: MissionConfig) void 
         }
     }
 
-    const forward: math.Vector3f = .{
-        config.camera_forward[0],
-        config.camera_forward[1],
-        config.camera_forward[2],
-    };
-    if (!(math.length3f(forward) > 1e-4)) {
+    if (!(math.length3f(config.camera_forward) > 1e-4)) {
         @compileError(name ++ ": camera_forward has zero length");
     }
 
-    var tam_rows: [thruster_count]math.Vector6f = undefined;
-    for (0..config.tam_len) |i| tam_rows[i] = config.tam[i];
-    const active = tam_rows[0..config.tam_len];
+    const active = config.tam[0..config.tam_len];
     const forces = bc.ThrustDirections.fromTamLinearForces(active) catch {
         @compileError(name ++ ": TAM forces are not finite");
     };
@@ -379,11 +371,7 @@ fn assertPreset(comptime name: []const u8, comptime config: MissionConfig) void 
         .{ 0, 0, 1 },
     };
     const axis_names = [_][]const u8{ "X", "Y", "Z" };
-    const limits: math.Vector3f = .{
-        config.rotation_limit[0],
-        config.rotation_limit[1],
-        config.rotation_limit[2],
-    };
+    const limits = config.rotation_limit;
     // `coverForce` only swings a thruster that already carries force, so a missing axis is
     // probed as `axis + thrust`, not as a pure unit command on the missing axis.
     inline for (axes, axis_names, 0..) |axis, axis_name, i| {
@@ -391,7 +379,7 @@ fn assertPreset(comptime name: []const u8, comptime config: MissionConfig) void 
         if (@abs(direct[i]) > 1e-3) continue;
         var recovered = false;
         for (forces.basis[0..forces.rank]) |thrust| {
-            const covered = bc.coverForce(forces, moments, axis + thrust, limits, forward);
+            const covered = bc.coverForce(forces, moments, axis + thrust, limits, config.camera_forward);
             if (@abs(covered.force[i]) > 1e-3) recovered = true;
         }
         if (!recovered) {

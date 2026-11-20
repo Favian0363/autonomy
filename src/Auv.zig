@@ -70,10 +70,22 @@ pub const Frame = struct {
     objects2d_len: u8,
     image_width: u32,
     image_height: u32,
-    pressure_depth: f32,
+    pressure_depth: f64,
     pressure_depth_ok: bool,
     frame_error: FrameError = .{},
 };
+
+fn widen3(v: [3]f32) math.Vector3f {
+    return .{ v[0], v[1], v[2] };
+}
+
+fn widen4(v: [4]f32) math.Quaternionf {
+    return .{ v[0], v[1], v[2], v[3] };
+}
+
+fn widenPose(p: AbiPose) math.Pose {
+    return .{ .pos = widen3(p.pos.buf), .quat = widen4(p.quat.buf) };
+}
 
 pub const InitFunc = fn () callconv(.c) void;
 var diagnostic: [256]u8 = @splat(0);
@@ -153,21 +165,21 @@ pub fn yieldUntilNextFrame(self: Auv, frame: *Frame) !void {
     for (raw.objects[0..objects_len], frame.objects[0..objects_len]) |source, *dest| {
         dest.* = .{
             .bbox = .{
-                .pose = .{ .pos = source.bbox.pose.pos.buf, .quat = source.bbox.pose.quat.buf },
-                .size = source.bbox.size.buf,
+                .pose = widenPose(source.bbox.pose),
+                .size = widen3(source.bbox.size.buf),
             },
             .id = source.id,
             .cls = source.cls,
         };
     }
     frame.objects_len = @intCast(objects_len);
-    frame.camera_pose = .{ .pos = raw.camera_pose.pos.buf, .quat = raw.camera_pose.quat.buf };
+    frame.camera_pose = widenPose(raw.camera_pose);
     frame.timestamp = raw.timestamp;
     frame.position_ok = raw.position_ok;
     frame.attitude_ok = raw.attitude_ok;
-    frame.accel = raw.accel.buf;
-    frame.gyro = raw.gyro.buf;
-    frame.imu_quat = raw.imu_quat.buf;
+    frame.accel = widen3(raw.accel.buf);
+    frame.gyro = widen3(raw.gyro.buf);
+    frame.imu_quat = widen4(raw.imu_quat.buf);
     const objects2d_len = @min(@as(usize, raw.objects2d_len), frame.objects2d.len);
     @memcpy(frame.objects2d[0..objects2d_len], raw.objects2d[0..objects2d_len]);
     frame.objects2d_len = @intCast(objects2d_len);
@@ -213,7 +225,7 @@ test "successful yield clears a previous frame error" {
     try auv.yieldUntilNextFrame(&frame);
     try std.testing.expectEqual(FrameError.none, frame.frame_error.code);
     try std.testing.expectEqual(@as(u64, 123), frame.timestamp);
-    try std.testing.expectEqual(@as(f32, 1), frame.camera_pose.quat[3]);
+    try std.testing.expectEqual(@as(f64, 1), frame.camera_pose.quat[3]);
     try std.testing.expectEqualStrings("", lastError());
 }
 

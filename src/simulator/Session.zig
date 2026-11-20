@@ -1,6 +1,7 @@
 //! In-process simulation session: scene ownership, physics, and mission frames.
 const std = @import("std");
 const Auv = @import("../Auv.zig");
+const math = @import("../math.zig");
 const Scene = @import("Scene.zig");
 const database = @import("database.zig");
 const types = @import("types.zig");
@@ -13,7 +14,7 @@ const abi = @import("abi.zig");
 
 pub const Session = @This();
 
-const frame_ticks = 20;
+const frame_ticks = 8;
 
 io: std.Io,
 catalogs_owned: bool,
@@ -92,13 +93,8 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *c
     const robot_slot = self.robot_slots[robot_index];
     const robot = database.BodySlot{ .db = &self.robot_db, .slot = robot_slot };
     if (database.ownedCount(robot.db.thrusters, robot.slot) != tam_len) return error.InvalidThrusterCount;
-    const robot_slots = self.robot_slots[robot_index..][0..1];
-
-    const robot_membership = [_]database.Membership{
-        .{ .db = &self.robot_db, .slots = robot_slots },
-    };
     const selected_scene = if (std.mem.eql(u8, scene_name, "robot_only"))
-        try Scene.init(allocator, robot, null, &.{}, .{}, &.{}, &robot_membership)
+        try Scene.init(allocator, robot, null, &.{}, .{}, &.{})
     else blk: {
         const preset: *const database.ScenePreset = find_preset: {
             for (self.scene_presets) |*p| if (std.mem.eql(u8, scene_name, p.name)) break :find_preset p;
@@ -108,13 +104,10 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *c
             .{ .pos = .{ 0, 2, 2 }, .quat = .{ 0, 0, 1, 0 } }
         else
             null;
-        const membership = [_]database.Membership{
-            .{ .db = &self.robot_db, .slots = robot_slots },
-            .{ .db = &self.scene_db, .slots = preset.slots },
-        };
+        try database.validateEntitySlots(&self.scene_db, preset.slots);
         const extras = try allocator.alloc(database.BodySlot, preset.slots.len);
         for (preset.slots, extras) |slot, *body| body.* = .{ .db = &self.scene_db, .slot = slot };
-        break :blk try Scene.init(allocator, robot, start, extras, .{}, &.{}, &membership);
+        break :blk try Scene.init(allocator, robot, start, extras, .{}, &.{});
     };
     self.scene = selected_scene;
     if (tam_len != self.scene.thruster_len) return error.InvalidThrusterCount;
@@ -169,6 +162,10 @@ pub fn reset(self: *Session, states: ?[]const abi.BodyState) !void {
     try self.initializeTick();
 }
 
+fn framePose(p: types.Pose) math.Pose {
+    return .{ .pos = p.pos, .quat = p.quat };
+}
+
 fn initializeTick(self: *Session) !void {
     self.tick = 0;
     self.rotors = @splat(abi.RotorState{ .omega = 0, .integral = 0, .torque = 0, .thrust = 0 });
@@ -183,12 +180,12 @@ fn initializeTick(self: *Session) !void {
 
 fn validateReadback(self: *const Session) !void {
     for (self.backend.states, self.scene.objects) |body, object| {
-        if (body.id != database.entity(object).id or !S.finite3(body.linear_vel) or !S.finite3(body.angular_vel) or
-            !S.finite3(body.com)) return error.InvalidBodyState;
+        if (body.id != database.entity(object).id or !S.finite3(S.fromAbi3(body.linear_vel)) or !S.finite3(S.fromAbi3(body.angular_vel)) or
+            !S.finite3(S.fromAbi3(body.com))) return error.InvalidBodyState;
         try S.validPose(S.bodyPose(body));
     }
     for (self.backend.contacts.items) |contact| {
-        if (!S.finite3(contact.position) or !S.finite3(contact.normal) or
+        if (!S.finite3(S.fromAbi3(contact.position)) or !S.finite3(S.fromAbi3(contact.normal)) or
             !std.math.isFinite(contact.normal_force)) return error.InvalidContact;
     }
 }
@@ -251,8 +248,9 @@ pub fn nextFrame(self: *Session, out: *Auv.Frame) !void {
         };
         const bounds = self.scene.settings.bounds;
         for (self.backend.states) |body| {
-            if (S.norm(body.pose_pos) > bounds.position or S.norm(body.linear_vel) > bounds.speed or
-                S.norm(body.angular_vel) > bounds.angular_speed)
+            if (S.norm(S.fromAbi3(body.pose_pos)) > bounds.position or
+                S.norm(S.fromAbi3(body.linear_vel)) > bounds.speed or
+                S.norm(S.fromAbi3(body.angular_vel)) > bounds.angular_speed)
             {
                 std.log.warn("simulator step failed: {s}", .{@errorName(error.SimulationBoundsExceeded)});
                 self.failed = true;
@@ -269,7 +267,7 @@ pub fn nextFrame(self: *Session, out: *Auv.Frame) !void {
     const obs = self.observation();
     out.* = std.mem.zeroes(Auv.Frame);
     out.timestamp = self.timestamp();
-    out.camera_pose = .{ .pos = obs.body.pos, .quat = obs.body.quat };
+    out.camera_pose = framePose(obs.body);
     out.position_ok = .{ .x = obs.position_axes & 1 != 0, .y = obs.position_axes & 2 != 0, .z = obs.position_axes & 4 != 0 };
     out.attitude_ok = .{ .x = obs.attitude_axes & 1 != 0, .y = obs.attitude_axes & 2 != 0, .z = obs.attitude_axes & 4 != 0 };
     out.imu_quat = obs.imu;
@@ -281,7 +279,7 @@ pub fn nextFrame(self: *Session, out: *Auv.Frame) !void {
     out.image_height = obs.image_height;
     for (obs.objects[0..@min(obs.objects.len, Auv.Frame.max_objects)], 0..) |object, i| {
         if (object.cls > 255) return error.InvalidObjectClass;
-        out.objects[i] = .{ .bbox = .{ .pose = .{ .pos = object.pose.pos, .quat = object.pose.quat }, .size = object.size }, .id = object.id, .cls = @intCast(object.cls) };
+        out.objects[i] = .{ .bbox = .{ .pose = framePose(object.pose), .size = object.size }, .id = object.id, .cls = @intCast(object.cls) };
         out.objects2d[i] = .{ .top_left = .{ .x = object.x0, .y = object.y0 }, .bottom_right = .{ .x = object.x1, .y = object.y1 }, .id = object.id, .cls = @intCast(object.cls) };
         out.objects_len += 1;
         out.objects2d_len += 1;
@@ -494,8 +492,9 @@ test "session snapshot round trip restores tick" {
         try session.validateReadback();
         const bounds = session.scene.settings.bounds;
         for (session.backend.states) |body| {
-            if (S.norm(body.pose_pos) > bounds.position or S.norm(body.linear_vel) > bounds.speed or
-                S.norm(body.angular_vel) > bounds.angular_speed) return error.SimulationBoundsExceeded;
+            if (S.norm(S.fromAbi3(body.pose_pos)) > bounds.position or
+                S.norm(S.fromAbi3(body.linear_vel)) > bounds.speed or
+                S.norm(S.fromAbi3(body.angular_vel)) > bounds.angular_speed) return error.SimulationBoundsExceeded;
         }
         session.refreshSensors();
     }

@@ -10,10 +10,12 @@
 //! - Mission/control buffers (`ThrusterCommands`, `ThrusterCommandInput`)
 //! - Recomputed after load (`Observation`, `SensorSample`, `Detection`, `Imu`)
 //!
-//! Shared primitives (`Vec3`, `Quat`, `Pose`) are layout-compatible with `abi.Vec3` / `abi.Quat`.
+//! Runtime vectors use `f64`; SIMDB rows stay `f32` in `abi.zig` and convert through `support.zig`.
 //! Simulator data uses XYZW quaternions and world-frame velocities at the center of mass.
-pub const Vec3 = [3]f32;
-pub const Quat = [4]f32;
+const abi = @import("abi.zig");
+
+pub const Vec3 = [3]f64;
+pub const Quat = [4]f64;
 pub const Pose = struct {
     pos: Vec3 = @splat(0),
     quat: Quat = .{ 0, 0, 0, 1 },
@@ -32,7 +34,8 @@ pub const ThrusterCommandInput = [thruster_count]f32;
 
 pub const Triangle = struct { a: u32, b: u32, c: u32 };
 pub const Mesh = struct {
-    positions: []const Vec3,
+    /// Vertex rows in SIMDB layout; widen with `support.fromAbi3` for force/sensor math.
+    positions: []const abi.Vec3,
     triangles: []const Triangle,
 };
 pub const Shape = union(enum) { box, sphere, cylinder, mesh: Mesh };

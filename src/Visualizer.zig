@@ -7,7 +7,7 @@ const MissionConfig = MissionIO.CompiledConfig;
 const math = MissionIO.Math;
 const Self = @This();
 
-const teleop_step: f32 = 0.05;
+const teleop_step: f64 = 0.05;
 const teleop_period: f64 = 0.05;
 const mission_target_step: f32 = 0.25;
 const mission_look_step: f32 = 0.1;
@@ -32,8 +32,8 @@ scene: rl.RenderTexture2D,
 orbit_yaw: f32 = 0.8,
 orbit_pitch: f32 = 0.55,
 orbit_dist: f32 = 8,
-translation: [3]f32 = @splat(0),
-orientation: [4]f32 = .{ 0, 0, 0, 1 },
+translation: math.Vector3f = @splat(0),
+orientation: math.Quaternionf = .{ 0, 0, 0, 1 },
 last_teleop: f64 = -1,
 mission_target_initialized: bool = false,
 mission_kind: MissionIO.MissionCommandKind = .point,
@@ -151,7 +151,7 @@ pub fn runtimeStatus(self: *const Self) ?MissionIO.RuntimeStatus {
 
 pub fn neutral(self: *const Self) ?MissionIO.TeleopCommand {
     if (self.mission_control) return null;
-    return .{ .translation = @splat(0), .orientation = self.orientation };
+    return MissionIO.teleopCommand(@splat(0), self.orientation);
 }
 
 pub fn tick(self: *Self, input: Input) !Actions {
@@ -230,7 +230,7 @@ pub fn tick(self: *Self, input: Input) !Actions {
     if (self.workspace == .runtime and rl.isKeyPressed(.t)) {
         // Release any held teleoperation translation before leaving teleop mode.
         if (!self.mission_control) {
-            actions.teleop = .{ .translation = @splat(0), .orientation = self.orientation };
+            actions.teleop = MissionIO.teleopCommand(@splat(0), self.orientation);
             self.translation = @splat(0);
         }
         self.mission_control = !self.mission_control;
@@ -252,7 +252,7 @@ pub fn tick(self: *Self, input: Input) !Actions {
     }
 
     if (self.mission_control and !self.mission_target_initialized and telemetry_live) {
-        self.mission_position = telemetry.camera_pose.pos + @as(math.Vector3f, .{ 0, 2, 0 });
+        self.mission_position = widen3(telemetry.camera_pose.pos) + @as(math.Vector3f, .{ 0, 2, 0 });
         self.mission_target_initialized = true;
     }
 
@@ -322,7 +322,7 @@ pub fn tick(self: *Self, input: Input) !Actions {
         if (focused and rl.isKeyDown(.k)) self.orientation = math.quaternionMul(self.orientation, axisAngle(.{ 0, 1, 0 }, -teleop_step));
         normalizeQuaternion(&self.orientation);
 
-        actions.teleop = .{ .translation = self.translation, .orientation = self.orientation };
+        actions.teleop = MissionIO.teleopCommand(self.translation, self.orientation);
     }
 
     if (!self.mission_control and focused) {
@@ -450,20 +450,20 @@ pub fn tick(self: *Self, input: Input) !Actions {
     rl.drawLine3D(sub, .{ .x = sub.x, .y = 0, .z = sub.z }, rl.fade(rl.Color.sky_blue, 0.45));
     drawBox(telemetry.camera_pose.pos, telemetry.camera_pose.quat, .{ 0.35, 0.8, 0.22 }, rl.Color.sky_blue);
 
-    const nose = math.quaternionRotate(telemetry.camera_pose.quat, [3]f32{ 0, 1, 0 });
-    rl.drawLine3D(sub, toRay(add3(telemetry.camera_pose.pos, nose)), rl.Color.orange);
-    const command_forward = math.quaternionRotate(self.orientation, [3]f32{ 0, 2, 0 });
-    drawArrow(telemetry.camera_pose.pos, command_forward, 0.02, rl.Color.green);
+    const nose = math.quaternionRotate(widenQuat(telemetry.camera_pose.quat), .{ 0, 1, 0 });
+    rl.drawLine3D(sub, toRay(add3(telemetry.camera_pose.pos, narrow3(nose))), rl.Color.orange);
+    const command_forward = math.quaternionRotate(self.orientation, .{ 0, 2, 0 });
+    drawArrow(telemetry.camera_pose.pos, narrow3(command_forward), 0.02, rl.Color.green);
     const command_move = math.quaternionRotate(self.orientation, self.translation);
     if (math.dot3f(command_move, command_move) > 1e-6)
-        drawArrow(telemetry.camera_pose.pos, scaled3(command_move, 1.2), 0.045, rl.Color.magenta);
+        drawArrow(telemetry.camera_pose.pos, scaled3(narrow3(command_move), 1.2), 0.045, rl.Color.magenta);
     if (self.mission_control and self.mission_target_initialized) {
-        rl.drawSphere(toRay(self.mission_position), 0.18, rl.Color.yellow);
-        drawArrow(self.mission_position, self.mission_look_direction, 0.035, rl.Color.yellow);
+        rl.drawSphere(toRay(narrow3(self.mission_position)), 0.18, rl.Color.yellow);
+        drawArrow(narrow3(self.mission_position), narrow3(self.mission_look_direction), 0.035, rl.Color.yellow);
     }
-    const force_error = math.quaternionRotate(telemetry.camera_pose.quat, telemetry.force_error);
+    const force_error = math.quaternionRotate(widenQuat(telemetry.camera_pose.quat), widen3(telemetry.force_error));
     if (math.dot3f(force_error, force_error) > 1e-6)
-        drawArrow(telemetry.camera_pose.pos, force_error, 0.03, rl.Color.yellow);
+        drawArrow(telemetry.camera_pose.pos, narrow3(force_error), 0.03, rl.Color.yellow);
 
     if (input.scene_draw == null) {
         for (telemetry.objects[0..telemetry.objects_len], 0..) |object, i| {
@@ -509,12 +509,12 @@ pub fn tick(self: *Self, input: Input) !Actions {
         .runtime_switch_pending = self.runtime_panel.pending_config != null,
         .control_ready = self.runtime_panel.synchronized(),
         .send_error = input.send_error,
-        .translation = self.translation,
-        .orientation = self.orientation,
+        .translation = narrow3(self.translation),
+        .orientation = narrowQuat(self.orientation),
         .mission_kind = self.mission_kind,
         .mission_maneuver = self.mission_maneuver,
-        .mission_position = self.mission_position,
-        .mission_look = self.mission_look_direction,
+        .mission_position = narrow3(self.mission_position),
+        .mission_look = narrow3(self.mission_look_direction),
         .mission_class = self.mission_object_class,
         .target_initialized = self.mission_target_initialized,
         .config = &self.config_packet,
@@ -593,7 +593,8 @@ fn drawBox(pos: [3]f32, quat: [4]f32, size: [3]f32, color: rl.Color) void {
                     sy * size[1] * 0.5,
                     sz * size[2] * 0.5,
                 };
-                corners[n] = toRay(add3(pos, math.quaternionRotate(quat, local)));
+                const rotated = math.quaternionRotate(widenQuat(quat), widen3(local));
+                corners[n] = toRay(add3(pos, narrow3(rotated)));
                 n += 1;
             }
         }
@@ -610,27 +611,42 @@ fn objectColor(cls: u8) rl.Color {
     return rl.colorFromHSV(@floatFromInt((@as(u16, cls) * 47) % 360), 0.75, 0.95);
 }
 
-fn axisAngle(axis: [3]f32, angle: f32) [4]f32 {
+fn axisAngle(axis: math.Vector3f, angle: f64) math.Quaternionf {
     const half = angle * 0.5;
     const sine = @sin(half);
     return .{ axis[0] * sine, axis[1] * sine, axis[2] * sine, @cos(half) };
 }
 
-fn normalizeQuaternion(quat: *[4]f32) void {
-    const value: math.Quaternionf = quat.*;
-    const length = @sqrt(@reduce(.Add, value * value));
-    if (length > 1e-6)
-        quat.* = value / @as(math.Quaternionf, @splat(length));
+fn widen3(v: [3]f32) math.Vector3f {
+    return .{ v[0], v[1], v[2] };
 }
 
-fn normalizeTranslation(translation: *[3]f32) void {
+fn widenQuat(q: [4]f32) math.Quaternionf {
+    return .{ q[0], q[1], q[2], q[3] };
+}
+
+fn narrow3(v: math.Vector3f) [3]f32 {
+    return .{ @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]) };
+}
+
+fn narrowQuat(q: math.Quaternionf) [4]f32 {
+    return .{ @floatCast(q[0]), @floatCast(q[1]), @floatCast(q[2]), @floatCast(q[3]) };
+}
+
+fn normalizeQuaternion(quat: *math.Quaternionf) void {
+    const length = @sqrt(@reduce(.Add, quat.* * quat.*));
+    if (length > 1e-6)
+        quat.* = quat.* / @as(math.Quaternionf, @splat(length));
+}
+
+fn normalizeTranslation(translation: *math.Vector3f) void {
     const length = @sqrt(
         translation[0] * translation[0] +
             translation[1] * translation[1] +
             translation[2] * translation[2],
     );
     if (length > 1e-6) {
-        for (translation) |*axis| axis.* /= length;
+        translation.* = translation.* / @as(math.Vector3f, @splat(length));
     }
 }
 

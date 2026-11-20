@@ -25,7 +25,7 @@ fn gravity(runtime: *Session) void {
     for (runtime.wrenches, scene.objects) |*wrench, slot| {
         const e = database.entity(slot);
         if (database.motionFrom(e.motion) == .dynamic)
-            wrench.force = S.add(wrench.force, S.scale(scene.settings.gravity, e.dry_mass - e.mass));
+            wrench.force = S.toAbi3(S.add(S.fromAbi3(wrench.force), S.scale(scene.settings.gravity, e.dry_mass - e.mass)));
     }
 }
 
@@ -51,7 +51,7 @@ fn hydro(runtime: *Session) !void {
             const transform = S.compose(S.bodyPose(bodies[index]), database.poseOf(h.pos, h.quat));
             const positions = database.vertexSlice(robot.db, h.vertex_start, h.vertex_count);
             for (positions) |position| {
-                const z = S.point(transform, position)[2];
+                const z = S.point(transform, S.fromAbi3(position))[2];
                 wet[hi].lo = @min(wet[hi].lo, z);
                 wet[hi].hi = @max(wet[hi].hi, z);
             }
@@ -62,7 +62,7 @@ fn hydro(runtime: *Session) !void {
             const e = database.entity(model.objects[index]);
             const body = bodies[index];
             const pose = S.bodyPose(body);
-            S.addForce(&runtime.fluid[index], S.scale(model.settings.gravity, -model.settings.water_density * e.volume), S.point(pose, e.buoyancy), body.com);
+            S.addForce(&runtime.fluid[index], S.scale(model.settings.gravity, -model.settings.water_density * e.volume), S.point(pose, S.fromAbi3(e.buoyancy)), S.fromAbi3(body.com));
         };
         for (0..hull_count) |hi| {
             const h = database.hullAt(robot.db, robot.slot, hi);
@@ -74,26 +74,26 @@ fn hydro(runtime: *Session) !void {
             const out = &runtime.fluid[index];
             if (minz[index] <= 0 and extent.hi > 0) {
                 const fraction = if (extent.lo > 0) 1 else extent.hi / (extent.hi - extent.lo);
-                S.addForce(out, S.scale(model.settings.gravity, -fraction * h.volume * model.settings.water_density), S.point(transform, h.centroid), body.com);
+                S.addForce(out, S.scale(model.settings.gravity, -fraction * h.volume * model.settings.water_density), S.point(transform, S.fromAbi3(h.centroid)), S.fromAbi3(body.com));
             }
-            var pressure_linear = S.v(0, 0, 0);
-            var pressure_angular = S.v(0, 0, 0);
-            var skin_linear = S.v(0, 0, 0);
-            var skin_angular = S.v(0, 0, 0);
+            var pressure_linear: types.Vec3 = @splat(0);
+            var pressure_angular: types.Vec3 = @splat(0);
+            var skin_linear: types.Vec3 = @splat(0);
+            var skin_angular: types.Vec3 = @splat(0);
             const positions = database.vertexSlice(robot.db, h.vertex_start, h.vertex_count);
             var vertex: usize = 0;
             while (vertex < positions.len) : (vertex += 3) {
-                const a = S.point(transform, positions[vertex]);
-                const b = S.point(transform, positions[vertex + 1]);
-                const d = S.point(transform, positions[vertex + 2]);
+                const a = S.point(transform, S.fromAbi3(positions[vertex]));
+                const b = S.point(transform, S.fromAbi3(positions[vertex + 1]));
+                const d = S.point(transform, S.fromAbi3(positions[vertex + 2]));
                 var normal = S.cross(S.sub(b, a), S.sub(d, a));
                 const twice = S.norm(normal);
                 if (twice < 1e-6) continue;
                 normal = S.scale(normal, 1 / twice);
                 const center = S.scale(S.add(S.add(a, b), d), 1.0 / 3.0);
                 if (minz[index] <= 0 and center[2] <= 0) continue;
-                const arm = S.sub(center, body.com);
-                const relative = S.sub(model.settings.current, S.add(body.linear_vel, S.cross(body.angular_vel, arm)));
+                const arm = S.sub(center, S.fromAbi3(body.com));
+                const relative = S.sub(model.settings.current, S.add(S.fromAbi3(body.linear_vel), S.cross(S.fromAbi3(body.angular_vel), arm)));
                 const vn = S.dot(relative, normal);
                 if (vn < -1e-12) {
                     const force = S.scale(relative, S.norm(relative) * -vn * 0.5 * twice);
@@ -108,14 +108,14 @@ fn hydro(runtime: *Session) !void {
                 }
             }
             const rho = model.settings.water_density;
-            const frame = S.multiply(S.bodyPose(body).quat, h.coefficient_frame);
-            out.force = S.add(S.add(out.force, coefficients(pressure_linear, frame, h.drag, 0.5 * rho)), coefficients(skin_linear, frame, h.skin, rho));
-            out.torque = S.add(S.add(out.torque, coefficients(pressure_angular, frame, h.drag, 0.5 * rho)), coefficients(skin_angular, frame, h.skin, rho));
+            const frame = S.multiply(S.bodyPose(body).quat, S.fromAbi4(h.coefficient_frame));
+            out.force = S.toAbi3(S.add(S.add(S.fromAbi3(out.force), coefficients(pressure_linear, frame, S.fromAbi3(h.drag), 0.5 * rho)), coefficients(skin_linear, frame, S.fromAbi3(h.skin), rho)));
+            out.torque = S.toAbi3(S.add(S.add(S.fromAbi3(out.torque), coefficients(pressure_angular, frame, S.fromAbi3(h.drag), 0.5 * rho)), coefficients(skin_angular, frame, S.fromAbi3(h.skin), rho)));
         }
     }
     for (w, 0..) |*wrench, index| {
-        wrench.force = S.add(wrench.force, runtime.fluid[index].force);
-        wrench.torque = S.add(wrench.torque, runtime.fluid[index].torque);
+        wrench.force = S.toAbi3(S.add(S.fromAbi3(wrench.force), S.fromAbi3(runtime.fluid[index].force)));
+        wrench.torque = S.toAbi3(S.add(S.fromAbi3(wrench.torque), S.fromAbi3(runtime.fluid[index].torque)));
     }
 }
 
@@ -137,21 +137,21 @@ fn thrusters(runtime: *Session) void {
         rotor.omega = std.math.clamp((t.inertia * rotor.omega + dt * (t.kp * target + t.ki * rotor.integral - damping)) / (t.inertia + dt * t.kp), -2 * max, 2 * max);
         rotor.integral = std.math.clamp(rotor.integral + error_omega * dt, -5, 5);
         const pose = S.bodyPose(body);
-        const p = S.point(pose, t.position);
-        const axis = S.rotate(pose.quat, t.direction);
+        const p = S.point(pose, S.fromAbi3(t.position));
+        const axis = S.rotate(pose.quat, S.fromAbi3(t.direction));
         rotor.thrust = 0;
         if (p[2] <= 0) {
             rotor.torque = 0;
             continue;
         }
-        const inflow = S.dot(axis, S.sub(S.add(body.linear_vel, S.cross(body.angular_vel, S.sub(p, body.com))), model.settings.current));
+        const inflow = S.dot(axis, S.sub(S.add(S.fromAbi3(body.linear_vel), S.cross(S.fromAbi3(body.angular_vel), S.sub(p, S.fromAbi3(body.com)))), model.settings.current));
         const n = rotor.omega / (2 * std.math.pi);
         const d = t.diameter;
         const rho = model.settings.water_density;
         rotor.thrust = rho * d * d * d * @abs(n) * (d * t.thrust * n - t.thrust * inflow);
         rotor.torque = -rho * d * d * d * d * @abs(n) * (d * t.torque * n - t.torque * inflow);
         const wrench = &runtime.wrenches[index];
-        S.addForce(wrench, S.scale(axis, rotor.thrust), p, body.com);
-        wrench.torque = S.add(wrench.torque, S.scale(axis, rotor.torque));
+        S.addForce(wrench, S.scale(axis, rotor.thrust), p, S.fromAbi3(body.com));
+        wrench.torque = S.toAbi3(S.add(S.fromAbi3(wrench.torque), S.scale(axis, rotor.torque)));
     }
 }

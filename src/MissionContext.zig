@@ -55,7 +55,7 @@ use_position: bool = false,
 use_orientation: bool = false,
 position_axes: Auv.AxisOk = .{ .x = true, .y = true, .z = true },
 desired: math.Vector2f = .{ 0, 0 },
-desired_height: ?f32 = null,
+desired_height: ?f64 = null,
 translation: ?math.Vector3f = null,
 pid_sum_err: math.Vector6f = @splat(0),
 pid_prev_err: math.Vector6f = @splat(0),
@@ -346,10 +346,7 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     telemetry_frame.magic = "AUV1".*;
     telemetry_frame.abi_version = MissionIO.telemetry_frame_abi_version;
     telemetry_frame.timestamp = ctx.frame.timestamp;
-    telemetry_frame.camera_pose = .{
-        .pos = ctx.frame.camera_pose.pos,
-        .quat = ctx.frame.camera_pose.quat,
-    };
+    telemetry_frame.camera_pose = MissionIO.telemetryPose(ctx.frame.camera_pose);
     telemetry_frame.position_ok = .{
         .x = ctx.frame.position_ok.x,
         .y = ctx.frame.position_ok.y,
@@ -363,7 +360,7 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
         ._pad = 0,
     };
     telemetry_frame.depth_ok = ctx.frame.pressure_depth_ok;
-    telemetry_frame.depth = ctx.frame.pressure_depth;
+    telemetry_frame.depth = MissionIO.telemetryFloat(ctx.frame.pressure_depth);
     const step_len = @min(ctx.step.len, telemetry_frame.step.len);
     telemetry_frame.step_len = @intCast(step_len);
     @memcpy(telemetry_frame.step[0..step_len], ctx.step[0..step_len]);
@@ -405,12 +402,12 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     }
     const elapsed = start.untilNow(ctx.io);
     telemetry_frame.cycle_us = @intCast(@max(0, elapsed.raw.toMicroseconds()));
-    telemetry_frame.force_error = ctx.force_error;
+    telemetry_frame.force_error = MissionIO.telemetryVec3(ctx.force_error);
     telemetry_frame.objects_len = @intCast(nobj);
     for (ctx.seen_objects[0..nobj], telemetry_frame.objects[0..nobj]) |source, *dest| {
         dest.* = .{
-            .pose = .{ .pos = source.bbox.pose.pos, .quat = source.bbox.pose.quat },
-            .size = source.bbox.size,
+            .pose = MissionIO.telemetryPose(source.bbox.pose),
+            .size = MissionIO.telemetryVec3(source.bbox.size),
             .id = source.id,
             .cls = source.cls,
             ._pad = .{ 0, 0, 0 },
@@ -430,7 +427,10 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     @memcpy(telemetry_frame.thrusters[0..ctx.config.tam_len], thruster_values[0..ctx.config.tam_len]);
     telemetry_frame.goals_len = @intCast(goals_len);
     for (goals[0..goals_len], telemetry_frame.goals[0..goals_len]) |source, *dest| {
-        dest.* = .{ .position = source.position, .look_at = source.look_at };
+        dest.* = .{
+            .position = MissionIO.telemetryVec3(source.position),
+            .look_at = MissionIO.telemetryVec3(source.look_at),
+        };
     }
     ctx.telemetry.publishTelemetry(ctx.io, telemetry_frame);
     if (comptime simulator_enabled) {
@@ -448,7 +448,7 @@ pub fn resetOdometryPid(ctx: *MissionContext) void {
 }
 
 /// World direction of body +Y at a level heading. Yaw 0 looks along +Y.
-fn lookAtHeading(heading: f32) math.Vector3f {
+fn lookAtHeading(heading: f64) math.Vector3f {
     return .{ -@sin(heading), @cos(heading), 0 };
 }
 
@@ -458,20 +458,15 @@ fn setLookAtTarget(ctx: *MissionContext, target: math.Vector3f) !void {
     const offset = target - ctx.frame.camera_pose.pos;
     if (math.length3f(offset) <= 1e-6) return;
     const toward = math.normalize3f(offset);
-    const camera_forward: math.Vector3f = .{
-        ctx.config.camera_forward[0],
-        ctx.config.camera_forward[1],
-        ctx.config.camera_forward[2],
-    };
-    const rotation_limit: math.Vector3f = .{
-        ctx.config.rotation_limit[0],
-        ctx.config.rotation_limit[1],
-        ctx.config.rotation_limit[2],
-    };
-    ctx.target_orientation = try bc.lookWithinLimits(camera_forward, toward, bc.identity, rotation_limit);
+    ctx.target_orientation = try bc.lookWithinLimits(
+        ctx.config.camera_forward,
+        toward,
+        bc.identity,
+        ctx.config.rotation_limit,
+    );
 }
 
-fn slew3(current: math.Vector3f, desired: math.Vector3f, max_step: f32) math.Vector3f {
+fn slew3(current: math.Vector3f, desired: math.Vector3f, max_step: f64) math.Vector3f {
     if (max_step <= 0) return current;
     const delta = desired - current;
     const len = math.length3f(delta);
@@ -497,7 +492,7 @@ fn attitudeToward(ctx: *const MissionContext, orientation: math.Quaternionf) ?ma
 }
 
 /// Pose error for the axes the context is tracking. Untracked and unavailable axes are zero here.
-fn poseError(ctx: *const MissionContext) [6]f32 {
+fn poseError(ctx: *const MissionContext) math.Vector6f {
     const translation = if (ctx.use_position)
         bodyTranslationError(ctx, ctx.target_position, ctx.position_axes)
     else
@@ -524,7 +519,7 @@ fn poseAvailable(ctx: *const MissionContext) [6]bool {
 
 /// Visual body error from the first box on this frame. Null when the frame has no box or `interaction` does not match the image error.
 /// Translation rows come from the interaction matrix. Roll and pitch are the level-look error plus those matrix rows.
-fn visualBodyError(ctx: *MissionContext) ?[6]f32 {
+fn visualBodyError(ctx: *MissionContext) ?math.Vector6f {
     if (ctx.frame.objects2d_len == 0) return null;
     const object = ctx.frame.objects2d[0];
     const metrics = math.boxMetrics(
@@ -534,12 +529,12 @@ fn visualBodyError(ctx: *MissionContext) ?[6]f32 {
         .{ object.bottom_right.x, object.bottom_right.y },
     );
     const ibvs = ctx.config.ibvs;
-    const image_error = [_]f32{
+    const image_error = [_]f64{
         math.withinDeadband(ctx.desired[0] - metrics.cx, ibvs.center_deadband),
         math.withinDeadband(ctx.desired[1] - metrics.cy, ibvs.center_deadband),
         (ctx.desired_height orelse ibvs.target_height) - metrics.height,
     };
-    var interaction_rows: [math.interaction_output_len][]const f32 = undefined;
+    var interaction_rows: [math.interaction_output_len][]const f64 = undefined;
     const ibvs_cols = @min(ibvs.interaction_cols, MissionConfig.max_ibvs_error_cols);
     for (&interaction_rows, ctx.config.ibvs.interaction) |*row, interaction_row| {
         row.* = interaction_row[0..ibvs_cols];
@@ -549,17 +544,12 @@ fn visualBodyError(ctx: *MissionContext) ?[6]f32 {
     };
     const current = bc.normalizedQuat(ctx.frame.camera_pose.quat) catch unreachable;
     const yaw = math.quaternionToEuler(current)[2] + mapped[5];
-    const camera_forward: math.Vector3f = .{
-        ctx.config.camera_forward[0],
-        ctx.config.camera_forward[1],
-        ctx.config.camera_forward[2],
-    };
-    const rotation_limit: math.Vector3f = .{
-        ctx.config.rotation_limit[0],
-        ctx.config.rotation_limit[1],
-        ctx.config.rotation_limit[2],
-    };
-    const look_q = bc.lookWithinLimits(camera_forward, lookAtHeading(yaw), bc.identity, rotation_limit) catch unreachable;
+    const look_q = bc.lookWithinLimits(
+        ctx.config.camera_forward,
+        lookAtHeading(yaw),
+        bc.identity,
+        ctx.config.rotation_limit,
+    ) catch unreachable;
     var angular = bc.attitudeError(current, look_q) catch unreachable;
     angular[0] += mapped[3];
     angular[1] += mapped[4];
@@ -572,7 +562,7 @@ fn anyAxis(available: [6]bool) bool {
 }
 
 /// Fill one body error from the pose, then ibvs. An axis with neither source is zero.
-fn bodyError(ctx: *MissionContext) [6]f32 {
+fn bodyError(ctx: *MissionContext) math.Vector6f {
     const visual = visualBodyError(ctx);
     var available = poseAvailable(ctx);
     var position_error = poseError(ctx);
@@ -605,29 +595,19 @@ fn controlStep(
 ) []const f32 {
     const body_error = ctx.bodyError();
     const timestamp_ns = ctx.frame.timestamp;
-    const dt: ?f32 = if (ctx.pid_prev_timestamp_ns) |previous| blk: {
+    const dt: ?f64 = if (ctx.pid_prev_timestamp_ns) |previous| blk: {
         const elapsed_ns = timestamp_ns - previous;
         ctx.pid_prev_timestamp_ns = timestamp_ns;
-        break :blk @as(f32, @floatFromInt(elapsed_ns)) * 1e-9;
+        break :blk @as(f64, @floatFromInt(elapsed_ns)) * 1e-9;
     } else blk: {
         ctx.pid_prev_timestamp_ns = timestamp_ns;
         break :blk null;
     };
 
     const tam_len = ctx.config.tam_len;
-    var tam_storage: [MissionConfig.thruster_count]math.Vector6f = undefined;
-    for (ctx.config.tam[0..tam_len], tam_storage[0..tam_len]) |source, *dest| dest.* = @bitCast(source);
-    const tam_rows = tam_storage[0..tam_len];
-    const camera_forward: math.Vector3f = .{
-        ctx.config.camera_forward[0],
-        ctx.config.camera_forward[1],
-        ctx.config.camera_forward[2],
-    };
-    const rotation_limit: math.Vector3f = .{
-        ctx.config.rotation_limit[0],
-        ctx.config.rotation_limit[1],
-        ctx.config.rotation_limit[2],
-    };
+    const tam_rows = ctx.config.tam[0..tam_len];
+    const camera_forward = ctx.config.camera_forward;
+    const rotation_limit = ctx.config.rotation_limit;
     const thrust_direction = bc.ThrustDirections.fromTamLinearForces(tam_rows) catch unreachable;
     const current = ctx.frame.camera_pose.quat;
     const error_body: math.Vector3f = .{ body_error[0], body_error[1], body_error[2] };
@@ -645,7 +625,7 @@ fn controlStep(
         const available = thrust_direction.alongThrust(error_body);
         var force_body: math.Vector3f = .{ 0, 0, 0 };
         inline for (0..3) |i| {
-            var rate: f32 = 0;
+            var rate: f64 = 0;
             if (dt) |t| {
                 ctx.pid_sum_err[i] += available[i] * t;
                 rate = (error_body[i] - ctx.pid_prev_err[i]) / t;
@@ -685,7 +665,7 @@ fn controlStep(
     inline for (0..3) |i| {
         const lane = i + 3;
         if (attitude_axis[i]) {
-            var rate: f32 = 0;
+            var rate: f64 = 0;
             if (dt) |t| {
                 rate = (attitude_error[i] - ctx.pid_prev_err[lane]) / t;
                 ctx.pid_sum_err[lane] += attitude_error[i] * t;
@@ -701,30 +681,34 @@ fn controlStep(
         translation_body[0], translation_body[1], translation_body[2],
         rotation[0],         rotation[1],         rotation[2],
     };
+    var thruster_math: [MissionConfig.thruster_count]f64 = undefined;
     _ = math.tamToThrusters(
         tam_rows,
         input,
         ctx.config.thrustor_saturate,
         5.0,
-        thruster_buffer[0..tam_len],
+        thruster_math[0..tam_len],
     );
+    for (thruster_math[0..tam_len], thruster_buffer[0..tam_len]) |value, *out| out.* = @floatCast(value);
     telemetry_frame.clear_screen = ctx.config.clear_print_stuff;
     telemetry_frame.has_dt = dt != null;
-    telemetry_frame.dt = dt orelse 0;
-    telemetry_frame.kp = @bitCast(odom.kp);
-    telemetry_frame.ki = @bitCast(odom.ki);
-    telemetry_frame.kd = @bitCast(odom.kd);
+    telemetry_frame.dt = MissionIO.telemetryFloat(dt orelse 0);
+    telemetry_frame.kp = MissionIO.telemetryVec6(odom.kp);
+    telemetry_frame.ki = MissionIO.telemetryVec6(odom.ki);
+    telemetry_frame.kd = MissionIO.telemetryVec6(odom.kd);
     var telemetry_tam: [MissionConfig.thruster_count][MissionConfig.tam_cols]f32 = @splat(@splat(0));
-    for (tam_storage[0..tam_len], 0..) |row, index| telemetry_tam[index] = @bitCast(row);
+    for (ctx.config.tam[0..tam_len], 0..) |row, index| {
+        telemetry_tam[index] = MissionIO.telemetryVec6(row);
+    }
     telemetry_frame.tam = telemetry_tam;
     telemetry_frame.tam_len = @intCast(tam_len);
-    telemetry_frame.control_pose = @bitCast(math.poseTo6f(ctx.frame.camera_pose));
-    telemetry_frame.translation_error = @bitCast(error_body);
-    telemetry_frame.target_orientation = @bitCast(ctx.target_orientation);
-    telemetry_frame.target_quaternion = @bitCast(target_q);
-    telemetry_frame.attitude_error = @bitCast(attitude_error);
-    telemetry_frame.rotation_limit = @bitCast(rotation_limit);
-    telemetry_frame.input = @bitCast(input);
+    telemetry_frame.control_pose = MissionIO.telemetryVec6(math.poseTo6f(ctx.frame.camera_pose));
+    telemetry_frame.translation_error = MissionIO.telemetryVec3(error_body);
+    telemetry_frame.target_orientation = MissionIO.telemetryQuat(ctx.target_orientation);
+    telemetry_frame.target_quaternion = MissionIO.telemetryQuat(target_q);
+    telemetry_frame.attitude_error = MissionIO.telemetryVec3(attitude_error);
+    telemetry_frame.rotation_limit = MissionIO.telemetryVec3(rotation_limit);
+    telemetry_frame.input = MissionIO.telemetryVec6(input);
     return thruster_buffer[0..tam_len];
 }
 
@@ -744,8 +728,8 @@ pub fn yieldFind(ctx: *MissionContext, cls: u8) !*const Auv.Object {
     }
 }
 
-const object_clearance: f32 = 2;
-const look_done: f32 = 0.1;
+const object_clearance: f64 = 2;
+const look_done: f64 = 0.1;
 
 fn reached(ctx: *const MissionContext, target: math.Vector3f) bool {
     const ok = ctx.frame.position_ok;
@@ -761,7 +745,7 @@ fn approachDirection(ctx: *const MissionContext, object: *const Auv.Object) math
 }
 
 /// Half the oriented box, measured along a horizontal unit direction.
-fn horizontalHalfExtent(object: *const Auv.Object, direction: math.Vector2f) f32 {
+fn horizontalHalfExtent(object: *const Auv.Object, direction: math.Vector2f) f64 {
     const rot = math.normalize4f(object.bbox.pose.quat);
     const world_dir: math.Vector3f = .{ direction[0], direction[1], 0 };
     const size = object.bbox.size;
@@ -770,13 +754,13 @@ fn horizontalHalfExtent(object: *const Auv.Object, direction: math.Vector2f) f32
         math.quaternionRotate(rot, .{ 0, 1, 0 }),
         math.quaternionRotate(rot, .{ 0, 0, 1 }),
     };
-    var extent: f32 = 0;
+    var extent: f64 = 0;
     inline for (axes, 0..) |axis, i| extent += @abs(math.dot3f(world_dir, axis)) * size[i];
     return 0.5 * extent;
 }
 
 /// `sign` is -1 on the approach side and +1 on the far side. `direction` stays fixed for the maneuver.
-fn standoffAlong(object: *const Auv.Object, direction: math.Vector2f, sign: f32) math.Vector3f {
+fn standoffAlong(object: *const Auv.Object, direction: math.Vector2f, sign: f64) math.Vector3f {
     const reach = horizontalHalfExtent(object, direction) + object_clearance;
     const offset = direction * @as(math.Vector2f, @splat(sign * reach));
     const center = object.bbox.pose.pos;
@@ -863,7 +847,7 @@ const circle_corners: [4]math.Vector2f = .{
     .{ -0.5, 0.5 },
 };
 
-fn circleCorner(object: *const Auv.Object, index: usize, depth: f32) math.Vector3f {
+fn circleCorner(object: *const Auv.Object, index: usize, depth: f64) math.Vector3f {
     const local_2d = circle_corners[index] * math.xy(object.bbox.size);
     const rotated = math.xy(math.quaternionRotate(math.normalize4f(object.bbox.pose.quat), .{ local_2d[0], local_2d[1], 0 }));
     const outward = if (math.length2f(rotated) <= 1e-4) math.Vector2f{ 1, 0 } else math.normalize2f(rotated);
@@ -886,7 +870,7 @@ pub fn yieldCircle(ctx: *MissionContext, object: *const Auv.Object) !void {
     for (0..circle_corners.len) |i| corners[i] = circleCorner(object, i, start[2]);
 
     var first: usize = 0;
-    var best = std.math.inf(f32);
+    var best = std.math.inf(f64);
     const sub = math.xy(start);
     for (corners, 0..) |corner, i| {
         const dist = math.length2f(math.xy(corner) - sub);

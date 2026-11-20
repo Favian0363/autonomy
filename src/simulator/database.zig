@@ -1,8 +1,7 @@
 //! In-memory catalog of simulation objects. Each entity is a slot in parallel
 //! record columns and stores its own intrusive-list links. Slots are u32 ids.
 //! Child rows point at their owner slot. Geometry is packed xyz floats and
-//! triangle indices. Links and generation stay in memory; the file stores the
-//! columns only. Runtime loads frozen bytes via `load` (exact-size slices; no growth).
+//! triangle indices. Runtime loads frozen bytes via `load` (exact-size slices; no growth).
 const std = @import("std");
 const types = @import("types.zig");
 const abi = @import("abi.zig");
@@ -24,11 +23,6 @@ pub const Sensor = abi.Sensor;
 pub const Name = abi.Name;
 const strides = abi.strides;
 const aligns = abi.aligns;
-
-pub const Membership = struct {
-    db: *Database,
-    slots: []const u32,
-};
 
 /// Body row in a specific loaded catalog (required when a scene joins multiple DBs).
 pub const BodySlot = struct {
@@ -117,47 +111,10 @@ pub fn sensorKind(record: *const Sensor) types.SensorKind {
     };
 }
 
-pub const IntrusiveList = struct {
-    head: u32 = nil,
-    tail: u32 = nil,
-    count: u32 = 0,
-
-    pub fn append(self: *IntrusiveList, prev: []u32, next: []u32, id: u32) void {
-        next[id] = nil;
-        prev[id] = self.tail;
-        if (self.tail == nil) self.head = id else next[self.tail] = id;
-        self.tail = id;
-        self.count += 1;
-    }
-
-    pub fn unlink(self: *IntrusiveList, prev: []u32, next: []u32, id: u32) void {
-        if (self.head != id and prev[id] == nil and next[id] == nil) return;
-        if (prev[id] == nil) self.head = next[id] else next[prev[id]] = next[id];
-        if (next[id] == nil) self.tail = prev[id] else prev[next[id]] = prev[id];
-        prev[id] = nil;
-        next[id] = nil;
-        self.count -= 1;
-    }
-
-    pub fn clear(self: *IntrusiveList, prev: []u32, next: []u32) void {
-        var id = self.head;
-        while (id != nil) {
-            const upcoming = next[id];
-            prev[id] = nil;
-            next[id] = nil;
-            id = upcoming;
-        }
-        self.* = .{};
-    }
-};
-
 pub const Database = struct {
     allocator: std.mem.Allocator,
     strings: []u8 = &.{},
     entities: []Entity = &.{},
-    prev: []u32 = &.{},
-    next: []u32 = &.{},
-    generation: []u32 = &.{},
     colliders: []Collider = &.{},
     thrusters: []Thruster = &.{},
     hulls: []Hull = &.{},
@@ -165,7 +122,6 @@ pub const Database = struct {
     positions: []f32 = &.{},
     indices: []u32 = &.{},
     names: []Name = &.{},
-    active: IntrusiveList = .{},
 
     pub fn deinit(self: *Database) void {
         const a = self.allocator;
@@ -176,9 +132,6 @@ pub const Database = struct {
         a.free(self.hulls);
         a.free(self.thrusters);
         a.free(self.colliders);
-        a.free(self.generation);
-        a.free(self.next);
-        a.free(self.prev);
         a.free(self.entities);
         a.free(self.strings);
         self.* = undefined;
@@ -186,15 +139,6 @@ pub const Database = struct {
 
     pub fn string(self: *const Database, offset: u32, len: u32) []const u8 {
         return self.strings[offset..][0..len];
-    }
-
-    pub fn spliceActive(self: *Database, slots: []const u32) !void {
-        for (slots, 0..) |id, i| {
-            if (id >= self.entities.len) return error.InvalidSlot;
-            for (slots[0..i]) |earlier| if (earlier == id) return error.InvalidSlot;
-        }
-        self.active.clear(self.prev, self.next);
-        for (slots) |id| self.active.append(self.prev, self.next, id);
     }
 
     pub fn save(self: *const Database, allocator: std.mem.Allocator) ![]u8 {
@@ -242,13 +186,6 @@ pub const Database = struct {
         db.positions = try copyColumn(f32, allocator, bytes, entries[table.positions]);
         db.indices = try copyColumn(u32, allocator, bytes, entries[table.indices]);
         db.names = try copyColumn(Name, allocator, bytes, entries[table.names]);
-        db.prev = try allocator.alloc(u32, db.entities.len);
-        db.next = try allocator.alloc(u32, db.entities.len);
-        db.generation = try allocator.alloc(u32, db.entities.len);
-        @memset(db.prev, nil);
-        @memset(db.next, nil);
-        @memset(db.generation, 1);
-        for (0..db.entities.len) |id| db.active.append(db.prev, db.next, @intCast(id));
         try db.validate();
         return db;
     }
@@ -320,10 +257,10 @@ pub fn readHeader(bytes: []const u8) ![table_count]TableEntry {
     return expected;
 }
 
-pub fn boxMesh(hx: f32, hy: f32, hz: f32) struct { positions: [8]types.Vec3, triangles: [12]types.Triangle } {
-    const positions = [_]types.Vec3{
-        .{ -hx, -hy, -hz }, .{ hx, -hy, -hz }, .{ hx, hy, -hz }, .{ -hx, hy, -hz },
-        .{ -hx, -hy, hz },  .{ hx, -hy, hz },  .{ hx, hy, hz },  .{ -hx, hy, hz },
+pub fn boxMesh(hx: f64, hy: f64, hz: f64) struct { positions: [8]abi.Vec3, triangles: [12]types.Triangle } {
+    const positions = [_]abi.Vec3{
+        .{ @floatCast(-hx), @floatCast(-hy), @floatCast(-hz) }, .{ @floatCast(hx), @floatCast(-hy), @floatCast(-hz) }, .{ @floatCast(hx), @floatCast(hy), @floatCast(-hz) }, .{ @floatCast(-hx), @floatCast(hy), @floatCast(-hz) },
+        .{ @floatCast(-hx), @floatCast(-hy), @floatCast(hz) },  .{ @floatCast(hx), @floatCast(-hy), @floatCast(hz) },  .{ @floatCast(hx), @floatCast(hy), @floatCast(hz) },  .{ @floatCast(-hx), @floatCast(hy), @floatCast(hz) },
     };
     const triangles = [_]types.Triangle{
         .{ .a = 0, .b = 1, .c = 2 }, .{ .a = 0, .b = 2, .c = 3 },
@@ -374,6 +311,13 @@ fn copyColumn(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8,
     return slice;
 }
 
+pub fn validateEntitySlots(db: *const Database, slots: []const u32) !void {
+    for (slots, 0..) |id, i| {
+        if (id >= db.entities.len) return error.InvalidSlot;
+        for (slots[0..i]) |earlier| if (earlier == id) return error.InvalidSlot;
+    }
+}
+
 pub fn ownedCount(records: anytype, owner: u32) usize {
     var n: usize = 0;
     for (records) |record| {
@@ -395,9 +339,9 @@ pub fn shapeFrom(db: *const Database, record: *const Collider) types.Shape {
     };
 }
 
-pub fn vertexSlice(db: *const Database, start: u32, count: u32) []const types.Vec3 {
+pub fn vertexSlice(db: *const Database, start: u32, count: u32) []const abi.Vec3 {
     const floats = db.positions[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
-    return std.mem.bytesAsSlice(types.Vec3, std.mem.sliceAsBytes(floats));
+    return std.mem.bytesAsSlice(abi.Vec3, std.mem.sliceAsBytes(floats));
 }
 
 pub fn triangleSlice(db: *const Database, start: u32, count: u32) []const types.Triangle {
@@ -423,7 +367,10 @@ pub fn motionFrom(value: u32) types.Motion {
 }
 
 pub fn poseOf(pos: [3]f32, quat: [4]f32) types.Pose {
-    return .{ .pos = pos, .quat = quat };
+    return .{
+        .pos = .{ @floatCast(pos[0]), @floatCast(pos[1]), @floatCast(pos[2]) },
+        .quat = .{ @floatCast(quat[0]), @floatCast(quat[1]), @floatCast(quat[2]), @floatCast(quat[3]) },
+    };
 }
 
 test "embedded scenes.bin loads presets" {
