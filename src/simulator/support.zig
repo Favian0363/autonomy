@@ -79,42 +79,6 @@ pub fn validPose(a: types.Pose) error{InvalidPose}!void {
     if (!finite3(a.pos) or !finite4(a.quat) or @abs(n - 1) >= 1e-4) return error.InvalidPose;
 }
 
-pub const Hash = struct {
-    value: u64 = 1469598103934665603,
-
-    pub fn raw(self: *Hash, data: []const u8) void {
-        // Seed the standard hasher with the simulator's running hash.
-        var hasher: std.hash.Fnv1a_64 = .{ .value = self.value };
-        hasher.update(data);
-        self.value = hasher.final();
-    }
-
-    pub fn scalar(self: *Hash, comptime T: type, n: T) void {
-        var value = n;
-        if (T == f32 or T == f64) {
-            if (value == 0) value = 0;
-        }
-        self.raw(std.mem.asBytes(&value));
-    }
-
-    pub fn vec(self: *Hash, a: types.Vec3) void {
-        for (a) |f| self.scalar(f32, f);
-    }
-
-    pub fn quat(self: *Hash, a: types.Quat) void {
-        for (a) |f| self.scalar(f32, f);
-    }
-
-    pub fn state(self: *Hash, s: abi.BodyState) void {
-        self.scalar(u32, s.id);
-        self.vec(s.pose_pos);
-        self.quat(s.pose_quat);
-        self.vec(s.com);
-        self.vec(s.linear_vel);
-        self.vec(s.angular_vel);
-    }
-};
-
 pub fn bodyPose(s: abi.BodyState) types.Pose {
     return .{ .pos = s.pose_pos, .quat = s.pose_quat };
 }

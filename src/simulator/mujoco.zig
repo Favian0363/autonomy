@@ -16,12 +16,10 @@ data: ?*mj.mjData = null,
 body_ids: []c_int = &.{},
 states: []abi.BodyState = &.{},
 contacts: std.ArrayList(abi.Contact) = .empty,
-hash_state: []mj.mjtNum = &.{},
 
 pub fn deinit(self: *MujocoBackend) void {
     if (self.data) |data| mj.mj_deleteData(data);
     if (self.model) |model| mj.mj_deleteModel(model);
-    self.allocator.free(self.hash_state);
     self.contacts.deinit(self.allocator);
     self.allocator.free(self.states);
     self.allocator.free(self.body_ids);
@@ -123,7 +121,6 @@ pub fn reset(self: *MujocoBackend, input: ?[]const abi.BodyState) !void {
 }
 
 pub fn step(self: *MujocoBackend, input: []const abi.Wrench) !void {
-    if (input.len != self.source.objects.len) return error.InvalidWrenchCount;
     for (input, self.source.objects) |wrench, slot| {
         if (wrench.id != database.entity(slot).id or !S.finite3(wrench.force) or !S.finite3(wrench.torque))
             return error.InvalidWrench;
@@ -138,13 +135,6 @@ pub fn step(self: *MujocoBackend, input: []const abi.Wrench) !void {
     }
     mj.mj_step(m, d);
     try self.refresh();
-}
-
-pub fn hash(self: *const MujocoBackend) u64 {
-    mj.mj_getState(self.model, self.data, self.hash_state.ptr, mj.mjSTATE_INTEGRATION);
-    var h: S.Hash = .{};
-    for (self.hash_state) |n| h.scalar(f64, n);
-    return h.value;
 }
 
 pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !MujocoBackend {
@@ -238,7 +228,6 @@ pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !MujocoBackend {
             if (geom_id < 0) return error.MuJoCoGeomMissing;
         }
     }
-    self.hash_state = try self.allocator.alloc(mj.mjtNum, @intCast(mj.mj_stateSize(m, mj.mjSTATE_INTEGRATION)));
     m.opt.integrator = switch (scene.settings.integrator) {
         .euler => mj.mjINT_EULER,
         .implicit => mj.mjINT_IMPLICIT,
