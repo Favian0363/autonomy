@@ -44,7 +44,7 @@ fn hydro(runtime: *Session) !void {
         @memset(maxz, -std.math.inf(f64));
         const Wet = struct { lo: f64 = std.math.inf(f64), hi: f64 = -std.math.inf(f64) };
         var wet: [types.max_hulls]Wet = @splat(.{});
-        const hull_count = database.ownedCount(robot.db.hulls.items, robot.slot);
+        const hull_count = database.ownedCount(robot.db.hulls, robot.slot);
         for (0..hull_count) |hi| {
             const h = database.hullAt(robot.db, robot.slot, hi);
             const index = h.body;

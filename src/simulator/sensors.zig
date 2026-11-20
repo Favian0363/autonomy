@@ -19,7 +19,7 @@ fn objectBounds(slot: database.BodySlot, lo: *types.Vec3, hi: *types.Vec3) void 
     @setFloatMode(.strict);
     lo.* = S.v(std.math.inf(f64), std.math.inf(f64), std.math.inf(f64));
     hi.* = S.v(-std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64));
-    const count = database.ownedCount(slot.db.colliders.items, slot.slot);
+    const count = database.ownedCount(slot.db.colliders, slot.slot);
     for (0..count) |ki| {
         const c = database.colliderAt(slot.db, slot.slot, ki);
         const pose = database.poseOf(c.pos, c.quat);

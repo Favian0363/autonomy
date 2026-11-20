@@ -2,8 +2,7 @@
 //! record columns and stores its own intrusive-list links. Slots are u32 ids.
 //! Child rows point at their owner slot. Geometry is packed xyz floats and
 //! triangle indices. Links and generation stay in memory; the file stores the
-//! columns only. Runtime loads frozen bytes via `load`; catalogs are built offline
-//! Scene presets are built in `scenes/robosub_source.zig`; Blender meshes via `export_mesh`.
+//! columns only. Runtime loads frozen bytes via `load` (exact-size slices; no growth).
 const std = @import("std");
 const types = @import("types.zig");
 const abi = @import("abi.zig");
@@ -37,23 +36,48 @@ pub const BodySlot = struct {
     slot: u32,
 };
 
+pub const ScenePreset = struct {
+    name: []const u8,
+    slots: []u32,
+};
+
+pub fn allocScenePresets(allocator: std.mem.Allocator, db: *const Database) ![]ScenePreset {
+    const presets = try allocator.alloc(ScenePreset, db.names.len);
+    errdefer allocator.free(presets);
+    for (db.names, 0..) |name, i| {
+        const slots = try allocator.alloc(u32, name.entity_count);
+        errdefer allocator.free(slots);
+        for (0..name.entity_count) |j| slots[j] = name.entity_start + @as(u32, @intCast(j));
+        presets[i] = .{
+            .name = db.string(name.name_offset, name.name_len),
+            .slots = slots,
+        };
+    }
+    return presets;
+}
+
+pub fn deinitScenePresets(allocator: std.mem.Allocator, presets: []ScenePreset) void {
+    for (presets) |preset| allocator.free(preset.slots);
+    allocator.free(presets);
+}
+
 pub fn entity(slot: BodySlot) *const Entity {
-    return &slot.db.entities.items[slot.slot];
+    return &slot.db.entities[slot.slot];
 }
 
 pub fn entityName(db: *const Database, slot: u32) []const u8 {
-    const e = &db.entities.items[slot];
+    const e = &db.entities[slot];
     return db.string(e.name_offset, e.name_len);
 }
 
 pub fn entityInitialPose(db: *const Database, slot: u32, spawn_override: ?types.Pose) types.Pose {
     if (spawn_override) |pose| return pose;
-    const e = &db.entities.items[slot];
+    const e = &db.entities[slot];
     return poseOf(e.initial_pos, e.initial_quat);
 }
 
 pub fn entityCenterOfMass(db: *const Database, slot: u32) types.Pose {
-    const e = &db.entities.items[slot];
+    const e = &db.entities[slot];
     return poseOf(e.com_pos, e.com_quat);
 }
 
@@ -68,19 +92,19 @@ pub fn ownedNth(comptime Row: type, records: []const Row, owner: u32, nth: usize
 }
 
 pub fn colliderAt(db: *const Database, owner: u32, nth: usize) *const Collider {
-    return &db.colliders.items[ownedNth(Collider, db.colliders.items, owner, nth)];
+    return &db.colliders[ownedNth(Collider, db.colliders, owner, nth)];
 }
 
 pub fn thrusterAt(db: *const Database, owner: u32, nth: usize) *const Thruster {
-    return &db.thrusters.items[ownedNth(Thruster, db.thrusters.items, owner, nth)];
+    return &db.thrusters[ownedNth(Thruster, db.thrusters, owner, nth)];
 }
 
 pub fn hullAt(db: *const Database, owner: u32, nth: usize) *const Hull {
-    return &db.hulls.items[ownedNth(Hull, db.hulls.items, owner, nth)];
+    return &db.hulls[ownedNth(Hull, db.hulls, owner, nth)];
 }
 
 pub fn sensorAt(db: *const Database, owner: u32, nth: usize) *const Sensor {
-    return &db.sensors.items[ownedNth(Sensor, db.sensors.items, owner, nth)];
+    return &db.sensors[ownedNth(Sensor, db.sensors, owner, nth)];
 }
 
 pub fn sensorKind(record: *const Sensor) types.SensorKind {
@@ -129,60 +153,61 @@ pub const IntrusiveList = struct {
 
 pub const Database = struct {
     allocator: std.mem.Allocator,
-    strings: std.ArrayList(u8) = .empty,
-    entities: std.ArrayList(Entity) = .empty,
-    prev: std.ArrayList(u32) = .empty,
-    next: std.ArrayList(u32) = .empty,
-    generation: std.ArrayList(u32) = .empty,
-    colliders: std.ArrayList(Collider) = .empty,
-    thrusters: std.ArrayList(Thruster) = .empty,
-    hulls: std.ArrayList(Hull) = .empty,
-    sensors: std.ArrayList(Sensor) = .empty,
-    positions: std.ArrayList(f32) = .empty,
-    indices: std.ArrayList(u32) = .empty,
-    names: std.ArrayList(Name) = .empty,
+    strings: []u8 = &.{},
+    entities: []Entity = &.{},
+    prev: []u32 = &.{},
+    next: []u32 = &.{},
+    generation: []u32 = &.{},
+    colliders: []Collider = &.{},
+    thrusters: []Thruster = &.{},
+    hulls: []Hull = &.{},
+    sensors: []Sensor = &.{},
+    positions: []f32 = &.{},
+    indices: []u32 = &.{},
+    names: []Name = &.{},
     active: IntrusiveList = .{},
 
     pub fn deinit(self: *Database) void {
-        self.names.deinit(self.allocator);
-        self.indices.deinit(self.allocator);
-        self.positions.deinit(self.allocator);
-        self.sensors.deinit(self.allocator);
-        self.hulls.deinit(self.allocator);
-        self.thrusters.deinit(self.allocator);
-        self.colliders.deinit(self.allocator);
-        self.generation.deinit(self.allocator);
-        self.next.deinit(self.allocator);
-        self.prev.deinit(self.allocator);
-        self.entities.deinit(self.allocator);
-        self.strings.deinit(self.allocator);
+        const a = self.allocator;
+        a.free(self.names);
+        a.free(self.indices);
+        a.free(self.positions);
+        a.free(self.sensors);
+        a.free(self.hulls);
+        a.free(self.thrusters);
+        a.free(self.colliders);
+        a.free(self.generation);
+        a.free(self.next);
+        a.free(self.prev);
+        a.free(self.entities);
+        a.free(self.strings);
         self.* = undefined;
     }
 
     pub fn string(self: *const Database, offset: u32, len: u32) []const u8 {
-        return self.strings.items[offset..][0..len];
+        return self.strings[offset..][0..len];
     }
 
     pub fn spliceActive(self: *Database, slots: []const u32) !void {
         for (slots, 0..) |id, i| {
-            if (id >= self.entities.items.len) return error.InvalidSlot;
+            if (id >= self.entities.len) return error.InvalidSlot;
             for (slots[0..i]) |earlier| if (earlier == id) return error.InvalidSlot;
         }
-        self.active.clear(self.prev.items, self.next.items);
-        for (slots) |id| self.active.append(self.prev.items, self.next.items, id);
+        self.active.clear(self.prev, self.next);
+        for (slots) |id| self.active.append(self.prev, self.next, id);
     }
 
     pub fn save(self: *const Database, allocator: std.mem.Allocator) ![]u8 {
         const columns = [_][]const u8{
-            self.strings.items,
-            std.mem.sliceAsBytes(self.entities.items),
-            std.mem.sliceAsBytes(self.colliders.items),
-            std.mem.sliceAsBytes(self.thrusters.items),
-            std.mem.sliceAsBytes(self.hulls.items),
-            std.mem.sliceAsBytes(self.sensors.items),
-            std.mem.sliceAsBytes(self.positions.items),
-            std.mem.sliceAsBytes(self.indices.items),
-            std.mem.sliceAsBytes(self.names.items),
+            self.strings,
+            std.mem.sliceAsBytes(self.entities),
+            std.mem.sliceAsBytes(self.colliders),
+            std.mem.sliceAsBytes(self.thrusters),
+            std.mem.sliceAsBytes(self.hulls),
+            std.mem.sliceAsBytes(self.sensors),
+            std.mem.sliceAsBytes(self.positions),
+            std.mem.sliceAsBytes(self.indices),
+            std.mem.sliceAsBytes(self.names),
         };
         var counts: [table_count]u32 = undefined;
         for (columns, 0..) |bytes, i| counts[i] = try asU32(bytes.len / strides[i]);
@@ -194,12 +219,12 @@ pub const Database = struct {
         @memcpy(out[0..magic.len], magic);
         std.mem.writeInt(u32, out[magic.len..][0..4], version, .little);
         std.mem.writeInt(u32, out[magic.len + 4 ..][0..4], table_count, .little);
-        for (entries, columns, 0..) |entry, bytes, i| {
+        for (entries, columns, 0..) |entry, column, i| {
             const at = directory_at + i * entry_size;
             std.mem.writeInt(u32, out[at..][0..4], entry.offset, .little);
             std.mem.writeInt(u32, out[at + 4 ..][0..4], entry.count, .little);
             std.mem.writeInt(u32, out[at + 8 ..][0..4], entry.stride, .little);
-            if (bytes.len != 0) @memcpy(out[entry.offset..][0..bytes.len], bytes);
+            if (column.len != 0) @memcpy(out[entry.offset..][0..column.len], column);
         }
         return out;
     }
@@ -208,39 +233,39 @@ pub const Database = struct {
         const entries = try readHeader(bytes);
         var db: Database = .{ .allocator = allocator };
         errdefer db.deinit();
-        try copyColumn(u8, allocator, &db.strings, bytes, entries[table.strings]);
-        try copyColumn(Entity, allocator, &db.entities, bytes, entries[table.entities]);
-        try copyColumn(Collider, allocator, &db.colliders, bytes, entries[table.colliders]);
-        try copyColumn(Thruster, allocator, &db.thrusters, bytes, entries[table.thrusters]);
-        try copyColumn(Hull, allocator, &db.hulls, bytes, entries[table.hulls]);
-        try copyColumn(Sensor, allocator, &db.sensors, bytes, entries[table.sensors]);
-        try copyColumn(f32, allocator, &db.positions, bytes, entries[table.positions]);
-        try copyColumn(u32, allocator, &db.indices, bytes, entries[table.indices]);
-        try copyColumn(Name, allocator, &db.names, bytes, entries[table.names]);
-        try db.prev.resize(allocator, db.entities.items.len);
-        try db.next.resize(allocator, db.entities.items.len);
-        try db.generation.resize(allocator, db.entities.items.len);
-        @memset(db.prev.items, nil);
-        @memset(db.next.items, nil);
-        @memset(db.generation.items, 1);
-        for (0..db.entities.items.len) |id| db.active.append(db.prev.items, db.next.items, @intCast(id));
+        db.strings = try copyColumn(u8, allocator, bytes, entries[table.strings]);
+        db.entities = try copyColumn(Entity, allocator, bytes, entries[table.entities]);
+        db.colliders = try copyColumn(Collider, allocator, bytes, entries[table.colliders]);
+        db.thrusters = try copyColumn(Thruster, allocator, bytes, entries[table.thrusters]);
+        db.hulls = try copyColumn(Hull, allocator, bytes, entries[table.hulls]);
+        db.sensors = try copyColumn(Sensor, allocator, bytes, entries[table.sensors]);
+        db.positions = try copyColumn(f32, allocator, bytes, entries[table.positions]);
+        db.indices = try copyColumn(u32, allocator, bytes, entries[table.indices]);
+        db.names = try copyColumn(Name, allocator, bytes, entries[table.names]);
+        db.prev = try allocator.alloc(u32, db.entities.len);
+        db.next = try allocator.alloc(u32, db.entities.len);
+        db.generation = try allocator.alloc(u32, db.entities.len);
+        @memset(db.prev, nil);
+        @memset(db.next, nil);
+        @memset(db.generation, 1);
+        for (0..db.entities.len) |id| db.active.append(db.prev, db.next, @intCast(id));
         try db.validate();
         return db;
     }
 
     fn validate(self: *const Database) !void {
-        if (self.positions.items.len % 3 != 0 or self.indices.items.len % 3 != 0) return error.InvalidDatabase;
-        const vertex_total: u64 = self.positions.items.len / 3;
-        const triangle_total: u64 = self.indices.items.len / 3;
-        for (self.positions.items) |component| if (!std.math.isFinite(component)) return error.InvalidDatabase;
-        for (self.entities.items) |row| {
-            try bounds(self.strings.items.len, row.name_offset, row.name_len);
-            try bounds(self.strings.items.len, row.asset_offset, row.asset_len);
+        if (self.positions.len % 3 != 0 or self.indices.len % 3 != 0) return error.InvalidDatabase;
+        const vertex_total: u64 = self.positions.len / 3;
+        const triangle_total: u64 = self.indices.len / 3;
+        for (self.positions) |component| if (!std.math.isFinite(component)) return error.InvalidDatabase;
+        for (self.entities) |row| {
+            try bounds(self.strings.len, row.name_offset, row.name_len);
+            try bounds(self.strings.len, row.asset_offset, row.asset_len);
             if (row.name_len == 0 or row.tracked > 1 or row.fuzz > 1 or row.motion > 2)
                 return error.InvalidDatabase;
         }
-        for (self.colliders.items) |collider| {
-            if (collider.owner >= self.entities.items.len or collider.collisions > 1) return error.InvalidDatabase;
+        for (self.colliders) |collider| {
+            if (collider.owner >= self.entities.len or collider.collisions > 1) return error.InvalidDatabase;
             switch (collider.shape) {
                 0, 1, 2 => if (collider.vertex_count != 0 or collider.triangle_count != 0) return error.InvalidDatabase,
                 3 => {
@@ -249,29 +274,28 @@ pub const Database = struct {
                     if (@as(u64, collider.triangle_start) + collider.triangle_count > triangle_total) return error.InvalidDatabase;
                     const start = @as(usize, collider.triangle_start) * 3;
                     const end = start + @as(usize, collider.triangle_count) * 3;
-                    for (self.indices.items[start..end]) |index| if (index >= collider.vertex_count) return error.InvalidDatabase;
+                    for (self.indices[start..end]) |index| if (index >= collider.vertex_count) return error.InvalidDatabase;
                 },
                 else => return error.InvalidDatabase,
             }
         }
-        for (self.thrusters.items) |thruster| if (thruster.owner >= self.entities.items.len) return error.InvalidDatabase;
-        for (self.hulls.items) |hull| {
-            if (hull.owner >= self.entities.items.len or hull.vertex_count == 0 or hull.vertex_count % 3 != 0)
+        for (self.thrusters) |thruster| if (thruster.owner >= self.entities.len) return error.InvalidDatabase;
+        for (self.hulls) |hull| {
+            if (hull.owner >= self.entities.len or hull.vertex_count == 0 or hull.vertex_count % 3 != 0)
                 return error.InvalidDatabase;
             if (@as(u64, hull.vertex_start) + hull.vertex_count > vertex_total) return error.InvalidDatabase;
         }
-        for (self.sensors.items) |sensor| {
-            if (sensor.owner >= self.entities.items.len or sensor.enabled > 1 or sensor.kind > 3)
+        for (self.sensors) |sensor| {
+            if (sensor.owner >= self.entities.len or sensor.enabled > 1 or sensor.kind > 3)
                 return error.InvalidDatabase;
             if (sensor.position_axes > 7 or sensor.attitude_axes > 7) return error.InvalidDatabase;
         }
-        for (self.names.items) |name| {
-            try bounds(self.strings.items.len, name.name_offset, name.name_len);
+        for (self.names) |name| {
+            try bounds(self.strings.len, name.name_offset, name.name_len);
             if (name.name_len == 0 or name.entity_count == 0) return error.InvalidDatabase;
-            if (@as(u64, name.entity_start) + name.entity_count > self.entities.items.len) return error.InvalidDatabase;
+            if (@as(u64, name.entity_start) + name.entity_count > self.entities.len) return error.InvalidDatabase;
         }
     }
-
 };
 
 pub fn readHeader(bytes: []const u8) ![table_count]TableEntry {
@@ -318,8 +342,8 @@ fn placeTables(counts: [table_count]u32) ![table_count]TableEntry {
     for (counts, 0..) |count, i| {
         cursor = alignForward(cursor, aligns[i]);
         entries[i] = .{ .offset = cursor, .count = count, .stride = strides[i] };
-        const bytes = @as(u64, count) * strides[i];
-        const end = @as(u64, cursor) + bytes;
+        const byte_len = @as(u64, count) * strides[i];
+        const end = @as(u64, cursor) + byte_len;
         if (end > std.math.maxInt(u32)) return error.InvalidDatabase;
         cursor = @intCast(end);
     }
@@ -340,21 +364,14 @@ fn alignForward(value: u32, alignment: u32) u32 {
     return (value + mask) & ~mask;
 }
 
-fn copyColumn(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    list: *std.ArrayList(T),
-    bytes: []const u8,
-    entry: TableEntry,
-) !void {
-    const items = try allocator.alloc(T, entry.count);
-    errdefer allocator.free(items);
+fn copyColumn(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8, entry: TableEntry) ![]T {
+    const slice = try allocator.alloc(T, entry.count);
+    errdefer allocator.free(slice);
     if (entry.count != 0) {
         const raw = bytes[entry.offset..][0 .. @as(usize, entry.count) * @sizeOf(T)];
-        @memcpy(std.mem.sliceAsBytes(items), raw);
+        @memcpy(std.mem.sliceAsBytes(slice), raw);
     }
-    try list.appendSlice(allocator, items);
-    allocator.free(items);
+    return slice;
 }
 
 pub fn ownedCount(records: anytype, owner: u32) usize {
@@ -379,12 +396,12 @@ pub fn shapeFrom(db: *const Database, record: *const Collider) types.Shape {
 }
 
 pub fn vertexSlice(db: *const Database, start: u32, count: u32) []const types.Vec3 {
-    const floats = db.positions.items[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
+    const floats = db.positions[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
     return std.mem.bytesAsSlice(types.Vec3, std.mem.sliceAsBytes(floats));
 }
 
 pub fn triangleSlice(db: *const Database, start: u32, count: u32) []const types.Triangle {
-    const idxs = db.indices.items[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
+    const idxs = db.indices[@as(usize, start) * 3 ..][0 .. @as(usize, count) * 3];
     return std.mem.bytesAsSlice(types.Triangle, std.mem.sliceAsBytes(idxs));
 }
 
@@ -407,4 +424,18 @@ pub fn motionFrom(value: u32) types.Motion {
 
 pub fn poseOf(pos: [3]f32, quat: [4]f32) types.Pose {
     return .{ .pos = pos, .quat = quat };
+}
+
+test "embedded scenes.bin loads presets" {
+    if (!@import("build_options").simulator) return error.SkipZigTest;
+    const embedded = @embedFile("scenes.bin");
+    var db = try Database.load(std.testing.allocator, embedded);
+    defer db.deinit();
+    const presets = try allocScenePresets(std.testing.allocator, &db);
+    defer deinitScenePresets(std.testing.allocator, presets);
+    var found = false;
+    for (presets) |preset| {
+        if (std.mem.eql(u8, preset.name, "robosub_course")) found = true;
+    }
+    try std.testing.expect(found);
 }

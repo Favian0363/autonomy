@@ -110,7 +110,6 @@ pub const Layout = struct {
         const mx = margin + lw + gap;
         const rx = mx + mw + gap;
         const scene_h = @floor((ch - gap) * 0.49);
-        const state_h = @floor((ch - gap) * 0.39);
         const control_h = @floor((ch - gap) * 0.39);
         const empty = rect(margin, y, 1, 1);
         return .{
@@ -120,8 +119,8 @@ pub const Layout = struct {
             .content = rect(margin, y, cw, ch),
             .scene = rect(margin, y, lw, scene_h),
             .video = rect(margin, y + scene_h + gap, lw, ch - scene_h - gap),
-            .state = rect(mx, y, mw, state_h),
-            .thrusters = rect(mx, y + state_h + gap, mw, ch - state_h - gap),
+            .state = rect(mx, y, mw, ch),
+            .thrusters = empty,
             .controls = rect(rx, y, rw, control_h),
             .editor = rect(rx, y, rw, control_h),
             .gains = rect(rx, y + control_h + gap, rw, ch - control_h - gap),
@@ -303,21 +302,17 @@ fn videoPanel(d: Data, p: Rect) void {
         rl.drawRectangleLinesEx(rect(dest.x + x0 * scale, dest.y + y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale), 2, teal);
     };
 }
-fn thrusterPanel(d: Data, p: Rect) void {
-    panel(p);
-    title(d.font, "THRUSTERS", p);
-    if (d.telemetry_status != .live) {
-        text(d.font, "Unavailable", p.x + 14, p.y + 44, 13, amber);
-        return;
-    }
+fn drawThrusterBars(d: Data, p: Rect, top_y: f32) void {
+    if (d.telemetry_status != .live) return;
     if (d.frame.thrusters_len == 0) {
-        text(d.font, "No data", p.x + 14, p.y + 44, 13, muted);
+        text(d.font, "No thruster data", p.x + 10, top_y, 11, muted);
         return;
     }
     const count: usize = d.frame.thrusters_len;
-    const step = @min(@as(f32, 27), (p.height - 55) / @as(f32, @floatFromInt(@max(count, 1))));
+    const usable = @max(0, p.y + p.height - top_y - 16);
+    const step = @min(@as(f32, 24), usable / @as(f32, @floatFromInt(@max(count, 1))));
     for (d.frame.thrusters[0..count], 0..) |v, i| {
-        const yy = p.y + 45 + @as(f32, @floatFromInt(i)) * step;
+        const yy = top_y + 4 + @as(f32, @floatFromInt(i)) * step;
         const start = p.x + 37;
         const end = p.x + p.width - 45;
         const mid = (start + end) / 2;
@@ -349,7 +344,14 @@ fn statePanel(d: Data, p: Rect) void {
     const angles = IO.Math.quaternionToEuler(d.frame.camera_pose.quat) * @as(@TypeOf(d.frame.camera_pose.pos), @splat(180.0 / std.math.pi));
     text(d.font, "ROLL / PITCH / YAW (deg)", p.x + 10, p.y + 157, 10, muted);
     text(d.font, rl.textFormat("%.1f  %.1f  %.1f", .{ @as(f64, angles[0]), @as(f64, angles[1]), @as(f64, angles[2]) }), p.x + 10, p.y + 173, 11, white);
-    if (p.height > 215) text(d.font, if (d.frame.position_ok.x and d.frame.position_ok.y and d.frame.position_ok.z and d.frame.attitude_ok.x and d.frame.attitude_ok.y and d.frame.attitude_ok.z) "Pose valid" else "Pose validity incomplete", p.x + 10, p.y + 198, 10, teal);
+    const pose_y: f32 = 198;
+    if (p.height > pose_y + 14) text(d.font, if (d.frame.position_ok.x and d.frame.position_ok.y and d.frame.position_ok.z and d.frame.attitude_ok.x and d.frame.attitude_ok.y and d.frame.attitude_ok.z) "Pose valid" else "Pose validity incomplete", p.x + 10, p.y + pose_y, 10, teal);
+    const thrusters_top = p.y + 222;
+    if (p.height > thrusters_top - p.y + 24) {
+        line(p.x + 10, thrusters_top - 10, p.width - 20);
+        text(d.font, "THRUSTERS", p.x + 10, thrusters_top, 10, muted);
+        drawThrusterBars(d, p, thrusters_top + 14);
+    }
 }
 fn drawDirectThrusterSliders(d: Data, p: Rect) void {
     const count = d.direct_thruster_count;
@@ -403,7 +405,6 @@ fn dashboard(d: Data) void {
     scenePanel(d, l.sceneContent(.runtime));
     videoPanel(d, l.video);
     statePanel(d, l.state);
-    thrusterPanel(d, l.thrusters);
     const p = l.controls;
     panel(p);
     title(d.font, "CONTROL MODE", p);

@@ -19,7 +19,7 @@ pub const SceneMeshCache = struct {
 
         for (scene.objects, 0..) |slot, body_index| {
             const entity = database.entity(slot);
-            const collider_count = database.ownedCount(slot.db.colliders.items, slot.slot);
+            const collider_count = database.ownedCount(slot.db.colliders, slot.slot);
             for (0..collider_count) |ki| {
                 const collider = database.colliderAt(slot.db, slot.slot, ki);
                 const shape = database.shapeFrom(slot.db, collider);

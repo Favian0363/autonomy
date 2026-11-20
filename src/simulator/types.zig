@@ -5,7 +5,7 @@
 //! rotor state, contacts, previous velocities, tick, commands, embedded catalogs).
 //!
 //! **Keep types here** for:
-//! - Scene authoring inputs (`ColliderInput`, `SensorInput`); presets live in `scenes/robosub_source.zig`
+//! - Scene authoring inputs (`ColliderInput`, `SensorInput`); presets live in committed `scenes.bin`
 //! - Scene policy (`Settings`, `Fault`, `Force`) — not in session snapshots
 //! - Mission/control buffers (`ThrusterCommands`, `ThrusterCommandInput`)
 //! - Recomputed after load (`Observation`, `SensorSample`, `Detection`, `Imu`)

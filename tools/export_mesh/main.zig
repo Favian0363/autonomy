@@ -6,7 +6,7 @@ const help =
     \\Usage: export_mesh <file.blend> --object <name> -o <out.meshbin>
     \\
     \\Exports one Blender object's triangle mesh (no scene metadata). Commit the
-    \\.meshbin under src/simulator/scenes/meshes/ and use meshFromBlob in robosub_source.zig.
+    \\.meshbin under src/simulator/scenes/meshes/ for offline SIMDB authoring.
 ;
 
 pub fn main(init: std.process.Init) !void {

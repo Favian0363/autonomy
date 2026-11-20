@@ -171,7 +171,7 @@ pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !MujocoBackend {
             const placeholder = @max(e.inertia[0], e.inertia[1], e.inertia[2]);
             xyz(&body.*.inertia, S.v(placeholder, placeholder, placeholder));
         }
-        const collider_count = database.ownedCount(slot.db.colliders.items, slot.slot);
+        const collider_count = database.ownedCount(slot.db.colliders, slot.slot);
         for (0..collider_count) |k| {
             const c = database.colliderAt(slot.db, slot.slot, k);
             if (c.restitution != 0) return error.UnsupportedRestitution;
@@ -222,7 +222,7 @@ pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !MujocoBackend {
         if (id < 0) return error.MuJoCoBodyMissing;
         self.body_ids[i] = id;
         if (database.motionFrom(e.motion) == .dynamic) xyz(m.body_inertia + 3 * @as(usize, @intCast(id)), e.inertia);
-        const collider_count = database.ownedCount(slot.db.colliders.items, slot.slot);
+        const collider_count = database.ownedCount(slot.db.colliders, slot.slot);
         for (0..collider_count) |k| {
             const geom_id = mj.mj_name2id(m, mj.mjOBJ_GEOM, (try namePrint(&name_buffer, "g{d}_{d}", .{ i, k })).ptr);
             if (geom_id < 0) return error.MuJoCoGeomMissing;

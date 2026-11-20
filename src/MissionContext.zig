@@ -21,7 +21,6 @@ const SimSession = if (simulator_enabled) @import("simulator/Session.zig").Sessi
     pub fn nextFrame(_: *@This(), _: *Auv.Frame) !void {
         return error.SimulatorNotBuilt;
     }
-    pub fn rebaseClock(_: *@This()) void {}
 };
 
 const MissionContext = @This();
@@ -256,7 +255,6 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         ctx.simulator = @as(SimSession, undefined);
         errdefer if (ctx.simulator) |*session| session.deinit();
         try ctx.simulator.?.init(allocator, io, &ctx.config, tam_len, realtime);
-        ctx.simulator.?.rebaseClock();
         if (ctx.visualizer) |embedded| {
             embedded.scene_meshes = try SceneMeshCache.init(allocator, &ctx.simulator.?.scene);
             embedded.has_scene_meshes = true;

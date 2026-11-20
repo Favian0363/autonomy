@@ -31,13 +31,12 @@ Environment layout is selected with `sim_scene_catalog` in mission config (see [
 
 | `sim_scene_catalog` | Behavior |
 |---|---|
-| `embedded_bin` (default) | Load committed [`src/simulator/scenes.bin`](src/simulator/scenes.bin), then `patchLoadedCatalog` in [`robosub_source.zig`](src/simulator/scenes/robosub_source.zig) |
-| `scratch` | Build only `buildScratchPreset` in that file (no bin) |
-| `file` | Load `sim_scene_catalog_path`, then `patchLoadedCatalog` |
+| `embedded_bin` (default) | Load committed [`src/simulator/scenes.bin`](src/simulator/scenes.bin) |
+| `file` | Load `sim_scene_catalog_path` |
 
-`sim_scene` still picks a **preset name** inside the catalog (`robosub_course`, `robot_only`, …). After load, use `addEntity` / `refreshPresets` on the catalog to edit in memory. Robots stay in `robots.bin`.
+`sim_scene` still picks a **preset name** inside the catalog (`robosub_course`, `robot_only`, …). Scene and robot data are load-only SIMDB blobs (`database.Database.load`). Robots stay in `robots.bin`.
 
-Blender is only for **mesh geometry** (`zig build export-mesh` → `.meshbin` → `meshFromBlob` in scratch or patch code).
+Blender is only for **mesh geometry** (`zig build export-mesh` → `.meshbin` for offline SIMDB authoring).
 
 ## ZED sensor plugin
 

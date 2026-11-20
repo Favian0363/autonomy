@@ -2,7 +2,6 @@
 const std = @import("std");
 const Auv = @import("../Auv.zig");
 const Scene = @import("Scene.zig");
-const scenes = @import("scenes/robosub_source.zig");
 const database = @import("database.zig");
 const types = @import("types.zig");
 const S = @import("support.zig");
@@ -21,7 +20,7 @@ catalogs_owned: bool,
 robot_db: database.Database,
 robot_slots: []u32,
 scene_db: database.Database,
-scene_presets: []scenes.ScenePreset,
+scene_presets: []database.ScenePreset,
 scene: Scene,
 backend: MujocoBackend,
 sensors: Sensors,
@@ -39,6 +38,7 @@ tick: u64 = 0,
 realtime: bool,
 tam_len: usize,
 failed: bool = false,
+live: bool = false,
 started: std.Io.Clock.Timestamp,
 
 pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *const MissionConfig.MissionConfig, tam_len: usize, realtime: bool) !void {
@@ -66,36 +66,23 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *c
         .started = undefined,
     };
     self.robot_db = try database.Database.load(allocator, @embedFile("robots.bin"));
-    errdefer self.robot_db.deinit();
-    self.robot_slots = try allocator.alloc(u32, self.robot_db.names.items.len);
-    errdefer allocator.free(self.robot_slots);
-    for (self.robot_db.names.items, 0..) |name, i| {
+    self.robot_slots = try allocator.alloc(u32, self.robot_db.names.len);
+    for (self.robot_db.names, 0..) |name, i| {
         if (name.entity_count != 1) return error.InvalidDatabase;
         self.robot_slots[i] = name.entity_start;
     }
     switch (config.sim_scene_catalog) {
         .embedded_bin => {
             self.scene_db = try database.Database.load(allocator, @embedFile("scenes.bin"));
-            errdefer self.scene_db.deinit();
-            try scenes.patchLoadedCatalog(&self.scene_db);
-        },
-        .scratch => {
-            self.scene_db = .{ .allocator = allocator };
-            errdefer self.scene_db.deinit();
-            try scenes.buildScratchPreset(&self.scene_db);
         },
         .file => {
             const path = try config.sim_scene_catalog_path.slice();
             if (path.len == 0) return error.MissingSceneCatalogPath;
             const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.math.maxInt(usize)));
-            defer allocator.free(bytes);
             self.scene_db = try database.Database.load(allocator, bytes);
-            errdefer self.scene_db.deinit();
-            try scenes.patchLoadedCatalog(&self.scene_db);
         },
     }
-    self.scene_presets = try scenes.allocScenePresets(allocator, &self.scene_db);
-    errdefer scenes.deinitScenePresets(allocator, self.scene_presets);
+    self.scene_presets = try database.allocScenePresets(allocator, &self.scene_db);
     const robot_index: usize = blk: {
         for (self.robot_slots, 0..) |slot, i| {
             if (std.mem.eql(u8, robot_name, database.entityName(&self.robot_db, slot))) break :blk i;
@@ -104,7 +91,7 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *c
     };
     const robot_slot = self.robot_slots[robot_index];
     const robot = database.BodySlot{ .db = &self.robot_db, .slot = robot_slot };
-    if (database.ownedCount(robot.db.thrusters.items, robot.slot) != tam_len) return error.InvalidThrusterCount;
+    if (database.ownedCount(robot.db.thrusters, robot.slot) != tam_len) return error.InvalidThrusterCount;
     const robot_slots = self.robot_slots[robot_index..][0..1];
 
     const robot_membership = [_]database.Membership{
@@ -113,7 +100,7 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *c
     const selected_scene = if (std.mem.eql(u8, scene_name, "robot_only"))
         try Scene.init(allocator, robot, null, &.{}, .{}, &.{}, &robot_membership)
     else blk: {
-        const preset: *const scenes.ScenePreset = find_preset: {
+        const preset: *const database.ScenePreset = find_preset: {
             for (self.scene_presets) |*p| if (std.mem.eql(u8, scene_name, p.name)) break :find_preset p;
             return error.UnknownSimScene;
         };
@@ -126,111 +113,51 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *c
             .{ .db = &self.scene_db, .slots = preset.slots },
         };
         const extras = try allocator.alloc(database.BodySlot, preset.slots.len);
-        defer allocator.free(extras);
         for (preset.slots, extras) |slot, *body| body.* = .{ .db = &self.scene_db, .slot = slot };
         break :blk try Scene.init(allocator, robot, start, extras, .{}, &.{}, &membership);
     };
     self.scene = selected_scene;
     if (tam_len != self.scene.thruster_len) return error.InvalidThrusterCount;
-    errdefer self.scene.deinit();
     self.preset_robot = try allocator.dupe(u8, robot_name);
-    errdefer self.scene.allocator.free(self.preset_robot);
     self.preset_scene = try allocator.dupe(u8, scene_name);
-    errdefer self.scene.allocator.free(self.preset_scene);
-    try self.initPhysics();
-    errdefer self.deinitPhysics();
-    self.rebaseClock();
-}
-
-pub fn initWithScene(self: *Session, io: std.Io, scene: Scene, tam_len: usize, realtime: bool) !void {
-    if (tam_len == 0 or tam_len > MissionConfig.thruster_count) return error.InvalidThrusterCount;
-    if (tam_len != scene.thruster_len) return error.InvalidThrusterCount;
-    self.* = .{
-        .io = io,
-        .catalogs_owned = false,
-        .robot_db = undefined,
-        .robot_slots = undefined,
-        .scene_db = undefined,
-        .scene_presets = undefined,
-        .scene = scene,
-        .backend = undefined,
-        .sensors = undefined,
-        .wrenches = undefined,
-        .fluid = undefined,
-        .previous_linear = undefined,
-        .previous_angular = undefined,
-        .scratch = undefined,
-        .thruster_len = 0,
-        .realtime = realtime,
-        .tam_len = tam_len,
-        .started = undefined,
-    };
-    errdefer self.scene.deinit();
-    self.preset_robot = try scene.allocator.dupe(u8, "");
-    errdefer scene.allocator.free(self.preset_robot);
-    self.preset_scene = try scene.allocator.dupe(u8, "");
-    errdefer scene.allocator.free(self.preset_scene);
-    try self.initPhysics();
-    errdefer self.deinitPhysics();
-    self.rebaseClock();
-}
-
-fn initPhysics(self: *Session) !void {
     const scene = &self.scene;
-    const allocator = scene.allocator;
-    self.backend = try MujocoBackend.init(allocator, scene);
+    const physics_allocator = scene.allocator;
+    self.backend = try MujocoBackend.init(physics_allocator, scene);
     errdefer self.backend.deinit();
-    self.sensors = try Sensors.init(allocator, scene);
-    errdefer self.sensors.deinit(allocator);
+    self.sensors = try Sensors.init(physics_allocator, scene);
+    errdefer {
+        self.sensors.deinit(physics_allocator);
+        self.backend.deinit();
+    }
     self.thruster_len = scene.thruster_len;
     const count = scene.objects.len;
-    self.wrenches = try allocator.alloc(abi.Wrench, count);
-    errdefer allocator.free(self.wrenches);
-    self.fluid = try allocator.alloc(abi.Wrench, count);
-    errdefer allocator.free(self.fluid);
-    self.previous_linear = try allocator.alloc(abi.Vec3, count);
-    errdefer allocator.free(self.previous_linear);
-    self.previous_angular = try allocator.alloc(abi.Vec3, count);
-    errdefer allocator.free(self.previous_angular);
+    self.wrenches = try physics_allocator.alloc(abi.Wrench, count);
+    self.fluid = try physics_allocator.alloc(abi.Wrench, count);
+    self.previous_linear = try physics_allocator.alloc(abi.Vec3, count);
+    self.previous_angular = try physics_allocator.alloc(abi.Vec3, count);
     // Hydrodynamics uses two temporary f64 extents per body.
-    self.scratch = try allocator.alignedAlloc(u8, .of(f64), 2 * count * @sizeOf(f64));
-    errdefer allocator.free(self.scratch);
+    self.scratch = try physics_allocator.alignedAlloc(u8, .of(f64), 2 * count * @sizeOf(f64));
     try self.initializeTick();
+    self.started = .now(self.io, .awake);
+    self.live = true;
 }
 
-fn deinitPhysics(self: *Session) void {
-    const allocator = self.scene.allocator;
-    self.backend.deinit();
-    self.sensors.deinit(allocator);
-    allocator.free(self.scratch);
-    allocator.free(self.previous_angular);
-    allocator.free(self.previous_linear);
-    allocator.free(self.fluid);
-    allocator.free(self.wrenches);
-}
-
+/// Releases MuJoCo handles only; Zig allocations live until the mission arena resets.
 pub fn deinit(self: *Session) void {
-    const allocator = self.scene.allocator;
-    self.deinitPhysics();
-    if (self.preset_robot.len != 0) allocator.free(self.preset_robot);
-    if (self.preset_scene.len != 0) allocator.free(self.preset_scene);
-    self.scene.deinit();
-    if (self.catalogs_owned) {
-        scenes.deinitScenePresets(allocator, self.scene_presets);
-        self.scene_db.deinit();
-        allocator.free(self.robot_slots);
-        self.robot_db.deinit();
+    if (!self.live) {
+        self.* = undefined;
+        return;
     }
+    const allocator = self.scene.allocator;
+    self.sensors.deinit(allocator);
+    self.backend.deinit();
+    self.live = false;
     self.* = undefined;
 }
 
 pub fn setThrusters(self: *Session, values: *const types.ThrusterCommandInput) !void {
     for (values[0..self.tam_len]) |v| if (!std.math.isFinite(v) or v < -1 or v > 1) return error.InvalidThrust;
     for (values[0..self.tam_len], 0..) |v, i| self.commands[i] = v;
-}
-
-pub fn rebaseClock(self: *Session) void {
-    self.started = .now(self.io, .awake);
 }
 
 pub fn timestamp(self: *const Session) u64 {
@@ -369,12 +296,10 @@ pub fn snapshot(self: *const Session, allocator: std.mem.Allocator) ![]u8 {
         try self.robot_db.save(allocator)
     else
         &[_]u8{};
-    defer if (self.catalogs_owned) allocator.free(robot_catalog);
     const scene_catalog = if (self.catalogs_owned)
         try self.scene_db.save(allocator)
     else
         &[_]u8{};
-    defer if (self.catalogs_owned) allocator.free(scene_catalog);
 
     const meta: abi.SessionMeta = .{
         .tick = self.tick,
@@ -386,9 +311,7 @@ pub fn snapshot(self: *const Session, allocator: std.mem.Allocator) ![]u8 {
     };
 
     const prev_linear_slots = try allocator.alloc(abi.Vec3Slot, self.previous_linear.len);
-    defer allocator.free(prev_linear_slots);
     const prev_angular_slots = try allocator.alloc(abi.Vec3Slot, self.previous_angular.len);
-    defer allocator.free(prev_angular_slots);
     for (self.previous_linear, prev_linear_slots) |v, *s| s.v = v;
     for (self.previous_angular, prev_angular_slots) |v, *s| s.v = v;
 
@@ -408,15 +331,13 @@ pub fn snapshot(self: *const Session, allocator: std.mem.Allocator) ![]u8 {
     };
     const entries = try placeSnapshotChunks(&counts);
     const end = snapshotPayloadEnd(&entries);
-    const out = try allocator.alloc(u8, end);
-    errdefer allocator.free(out);
+    const out = try allocator.alignedAlloc(u8, .of(abi.SessionMeta), end);
     @memset(out, 0);
     @memcpy(out[0..abi.session_magic.len], abi.session_magic);
     std.mem.writeInt(u32, out[abi.session_magic.len..][0..4], abi.session_version, .little);
     std.mem.writeInt(u32, out[abi.session_magic.len + 4 ..][0..4], abi.session_chunk_count, .little);
 
     const strings_buf = try allocator.alloc(u8, self.preset_robot.len + self.preset_scene.len);
-    defer allocator.free(strings_buf);
     @memcpy(strings_buf[0..self.preset_robot.len], self.preset_robot);
     @memcpy(strings_buf[self.preset_robot.len..], self.preset_scene);
 
@@ -539,11 +460,14 @@ fn readSnapshotHeader(bytes: []const u8) ![abi.session_chunk_count]abi.TableEntr
 
 test "session snapshot round trip restores tick" {
     if (!@import("build_options").simulator) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     var session: Session = undefined;
     var config = MissionConfig.startup_config;
     config.sim_robot = .fromLiteral("proteus");
     config.sim_scene = .fromLiteral("robot_only");
-    try session.init(std.testing.allocator, std.testing.io, &config, 6, false);
+    try session.init(allocator, std.testing.io, &config, 6, false);
     defer session.deinit();
     const idle: types.ThrusterCommandInput = @splat(0);
     try session.setThrusters(&idle);
@@ -576,9 +500,8 @@ test "session snapshot round trip restores tick" {
         session.refreshSensors();
     }
     const tick_before = session.tick;
-    const bytes = try session.snapshot(std.testing.allocator);
-    defer std.testing.allocator.free(bytes);
+    const bytes = try session.snapshot(allocator);
     session.tick += 1;
-    try session.restoreSnapshot(std.testing.allocator, bytes);
+    try session.restoreSnapshot(allocator, bytes);
     try std.testing.expectEqual(tick_before, session.tick);
 }

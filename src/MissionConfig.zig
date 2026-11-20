@@ -77,12 +77,10 @@ pub const SensorSource = enum(u8) { simulated, plugin };
 
 /// How the simulator loads environment objects (robot still comes from `robots.bin`).
 pub const SimSceneCatalog = enum(u8) {
-    /// Committed `src/simulator/scenes.bin`, then optional `patchLoadedCatalog`.
+    /// Committed `src/simulator/scenes.bin`.
     embedded_bin = 0,
-    /// Empty catalog built only from `buildScratchPreset` in `robosub_source.zig`.
-    scratch = 1,
-    /// Read SIMDB bytes from `sim_scene_catalog_path` at runtime, then optional patch.
-    file = 2,
+    /// Read SIMDB bytes from `sim_scene_catalog_path` at runtime.
+    file = 1,
 };
 pub const path_max = 256;
 pub const name_max = 64;

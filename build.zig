@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) !void {
         .target = b.graph.host,
     });
     const mesh_wire = b.createModule(.{
-        .root_source_file = b.path("src/simulator/scenes/robosub_source.zig"),
+        .root_source_file = b.path("src/simulator/mesh_wire.zig"),
         .target = b.graph.host,
     });
     const export_mesh = b.addExecutable(.{

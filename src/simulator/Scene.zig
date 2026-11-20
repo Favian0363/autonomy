@@ -29,9 +29,9 @@ pub fn init(
     membership: []const database.Membership,
 ) !Scene {
     if (additional.len >= 4096) return error.SceneCapacity;
-    const thruster_count = database.ownedCount(robot_slot.db.thrusters.items, robot_slot.slot);
-    const hull_count = database.ownedCount(robot_slot.db.hulls.items, robot_slot.slot);
-    const sensor_count = database.ownedCount(robot_slot.db.sensors.items, robot_slot.slot);
+    const thruster_count = database.ownedCount(robot_slot.db.thrusters, robot_slot.slot);
+    const hull_count = database.ownedCount(robot_slot.db.hulls, robot_slot.slot);
+    const sensor_count = database.ownedCount(robot_slot.db.sensors, robot_slot.slot);
     if (thruster_count > types.thruster_count or hull_count > types.max_hulls or sensor_count > 64)
         return error.SceneCapacity;
 
@@ -96,7 +96,7 @@ fn validate(self: *Scene) !void {
         try math.validPose(self.initialPose(i));
         try math.validPose(database.entityCenterOfMass(object.db, object.slot));
         for (self.objects[0..i]) |other| if (e.id == database.entity(other).id) return error.DuplicateBodyId;
-        const collider_count = database.ownedCount(object.db.colliders.items, object.slot);
+        const collider_count = database.ownedCount(object.db.colliders, object.slot);
         if (collider_count == 0 or collider_count > 1024) return error.InvalidColliders;
         for (0..collider_count) |k| try validateCollider(object.db, database.colliderAt(object.db, object.slot, k));
     }
@@ -108,7 +108,7 @@ fn validate(self: *Scene) !void {
             !std.math.isFinite(t.thrust) or !std.math.isFinite(t.torque) or !nonnegative(t.kp) or !nonnegative(t.ki) or
             (t.command_sign != 1 and t.command_sign != -1)) return error.InvalidThruster;
     }
-    const hull_count = database.ownedCount(robot_slot.db.hulls.items, robot_slot.slot);
+    const hull_count = database.ownedCount(robot_slot.db.hulls, robot_slot.slot);
     for (0..hull_count) |index| {
         const h = database.hullAt(robot_slot.db, robot_slot.slot, index);
         if (h.body >= self.objects.len or h.vertex_count == 0 or h.vertex_count % 3 != 0 or
