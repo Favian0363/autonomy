@@ -131,6 +131,46 @@ pub const BlendFile = struct {
         return try out.toOwnedSlice(self.allocator);
     }
 
+    /// Triangle mesh for one Blender object by name (mesh data only; no scene metadata).
+    pub fn exportMeshNamed(self: *BlendFile, object_name: []const u8) !MeshExport {
+        const object_layout = self.sdna.structNamed("Object") orelse return error.MissingDNA;
+        const mesh_layout = self.sdna.structNamed("Mesh") orelse return error.MissingDNA;
+        for (self.blocks) |block| {
+            if (!codeIs(&block.code, "OB")) continue;
+            if (block.count == 0) continue;
+            const elem = block.data[0..@min(object_layout.size, block.data.len)];
+            const name = readNameStatic(object_layout, elem);
+            if (!std.mem.eql(u8, name, object_name) and !std.mem.endsWith(u8, name, object_name)) continue;
+            const mesh_ptr = object_layout.readPointer(self.endian, self.pointer_size, elem, "data") orelse return error.MeshNotFound;
+            const mesh_block = self.by_old.get(mesh_ptr) orelse return error.MeshNotFound;
+            if (!codeIs(&mesh_block.code, "ME")) return error.MeshNotFound;
+            const mesh = try readMeshGeometry(self, mesh_layout, mesh_block.data[0..mesh_block.data.len]);
+            errdefer {
+                self.allocator.free(mesh.positions);
+                self.allocator.free(mesh.triangles);
+            }
+            if (mesh.positions.len == 0) return error.EmptyMesh;
+            return .{
+                .name = try self.allocator.dupe(u8, name),
+                .positions = mesh.positions,
+                .triangles = mesh.triangles,
+            };
+        }
+        return error.MeshNotFound;
+    }
+
+    pub fn deinitMeshExport(self: *BlendFile, mesh: MeshExport) void {
+        self.allocator.free(mesh.name);
+        self.allocator.free(mesh.positions);
+        self.allocator.free(mesh.triangles);
+    }
+
+    pub const MeshExport = struct {
+        name: []const u8,
+        positions: []types.Vec3,
+        triangles: []types.Triangle,
+    };
+
     pub fn deinitExported(self: *BlendFile, objects: []ExportedObject) void {
         for (objects) |object| {
             self.allocator.free(object.name);
@@ -162,10 +202,14 @@ pub const Block = struct {
 };
 
 fn readName(allocator: std.mem.Allocator, layout: SDNAStruct, elem: []const u8) ![]u8 {
-    const field = layout.field("name") orelse return allocator.dupe(u8, "object");
+    return allocator.dupe(u8, readNameStatic(layout, elem));
+}
+
+fn readNameStatic(layout: SDNAStruct, elem: []const u8) []const u8 {
+    const field = layout.field("name") orelse return "object";
     const raw = elem[field.offset..][0..@min(field.size, 64)];
     const end = std.mem.indexOfScalar(u8, raw, 0) orelse raw.len;
-    return allocator.dupe(u8, raw[0..end]);
+    return raw[0..end];
 }
 
 const SimProps = struct { id: ?u32, cls: ?u32, tracked: ?bool, collisions: ?bool, hx: ?f32, hy: ?f32, hz: ?f32 };

@@ -3,26 +3,31 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
 
-    const export_scene_catalog_emit = b.createModule(.{
-        .root_source_file = b.path("src/simulator/catalog_emit.zig"),
+    const optimize = b.standardOptimizeOption(.{});
+    const blend_catalog = b.createModule(.{
+        .root_source_file = b.path("src/simulator/blend_catalog.zig"),
         .target = b.graph.host,
     });
-    const export_scene = b.addExecutable(.{
-        .name = "export_scene",
+    const mesh_wire = b.createModule(.{
+        .root_source_file = b.path("src/simulator/scenes/robosub_source.zig"),
+        .target = b.graph.host,
+    });
+    const export_mesh = b.addExecutable(.{
+        .name = "export_mesh",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/export_scene/main.zig"),
+            .root_source_file = b.path("tools/export_mesh/main.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
             .imports = &.{
-                .{ .name = "catalog_emit", .module = export_scene_catalog_emit },
+                .{ .name = "blend_catalog", .module = blend_catalog },
+                .{ .name = "mesh_wire", .module = mesh_wire },
             },
         }),
     });
-    const install_export_scene = b.addInstallArtifact(export_scene, .{});
-    const export_scene_step = b.step("export-scene", "Build export_scene (run with a .blend file to refresh scenes.bin)");
-    export_scene_step.dependOn(&install_export_scene.step);
+    const install_export_mesh = b.addInstallArtifact(export_mesh, .{});
+    const export_mesh_step = b.step("export-mesh", "Export one Blender object mesh to a .meshbin file");
+    export_mesh_step.dependOn(&install_export_mesh.step);
 
-    const optimize = b.standardOptimizeOption(.{});
     const cxx = b.option([]const u8, "cxx", "System C++ compiler") orelse "g++";
     const zed_prefix = b.option([]const u8, "zed-prefix", "ZED SDK install prefix") orelse "/usr/local/zed";
     const cuda_prefix = b.option([]const u8, "cuda-prefix", "CUDA install prefix") orelse "/usr/local/cuda";

@@ -56,12 +56,12 @@ fn dupVec3Slots(allocator: std.mem.Allocator, slice: []const abi.Vec3) ![]align(
 pub fn capture(allocator: std.mem.Allocator, session: *const Session) !Snapshot {
     if (session.backend.contacts.items.len > abi.max_snapshot_contacts) return error.TooManyContacts;
     const robot_catalog = if (session.catalogs_owned)
-        try session.catalog.db.save(allocator)
+        try session.robot_db.save(allocator)
     else
         try allocator.dupe(u8, &.{});
     errdefer allocator.free(robot_catalog);
     const scene_catalog = if (session.catalogs_owned)
-        try session.scene_catalog.db.save(allocator)
+        try session.scene_db.save(allocator)
     else
         try allocator.dupe(u8, &.{});
     errdefer allocator.free(scene_catalog);

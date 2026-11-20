@@ -3,7 +3,7 @@
 //! Child rows point at their owner slot. Geometry is packed xyz floats and
 //! triangle indices. Links and generation stay in memory; the file stores the
 //! columns only. Runtime loads frozen bytes via `load`; catalogs are built offline
-//! with `database_builder.zig` / `export_scene`.
+//! Scene presets are built in `scenes/robosub_source.zig`; Blender meshes via `export_mesh`.
 const std = @import("std");
 const types = @import("types.zig");
 const abi = @import("abi.zig");

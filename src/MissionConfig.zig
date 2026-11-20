@@ -74,6 +74,16 @@ pub const MissionProfileId = enum(u8) {
 
 pub const MissionId = enum(u8) { prequalify_coco, prequalify_robosub, teleop, mission_control, thruster_control };
 pub const SensorSource = enum(u8) { simulated, plugin };
+
+/// How the simulator loads environment objects (robot still comes from `robots.bin`).
+pub const SimSceneCatalog = enum(u8) {
+    /// Committed `src/simulator/scenes.bin`, then optional `patchLoadedCatalog`.
+    embedded_bin = 0,
+    /// Empty catalog built only from `buildScratchPreset` in `robosub_source.zig`.
+    scratch = 1,
+    /// Read SIMDB bytes from `sim_scene_catalog_path` at runtime, then optional patch.
+    file = 2,
+};
 pub const path_max = 256;
 pub const name_max = 64;
 pub const control_port: u16 = 8080;
@@ -94,6 +104,8 @@ pub const MissionConfig = struct {
     serial_port: FixedText(path_max) = .{},
     sim_robot: FixedText(name_max) = .fromLiteral("hydrus"),
     sim_scene: FixedText(name_max) = .fromLiteral("robosub_course"),
+    sim_scene_catalog: SimSceneCatalog = .embedded_bin,
+    sim_scene_catalog_path: FixedText(path_max) = .{},
     sim_realtime: bool = false,
 
     // Startup/control connection. These values must match between the runtime
@@ -123,7 +135,8 @@ pub const MissionConfig = struct {
         return a.mission_id == b.mission_id and a.mission_profile == b.mission_profile and
             a.sensor_source == b.sensor_source and textEqual(a.sensor_library, b.sensor_library) and
             textEqual(a.serial_port, b.serial_port) and textEqual(a.sim_robot, b.sim_robot) and
-            textEqual(a.sim_scene, b.sim_scene) and a.sim_realtime == b.sim_realtime;
+            textEqual(a.sim_scene, b.sim_scene) and a.sim_scene_catalog == b.sim_scene_catalog and
+            textEqual(a.sim_scene_catalog_path, b.sim_scene_catalog_path) and a.sim_realtime == b.sim_realtime;
     }
 
     pub fn telemetryAddr(self: *const MissionConfig) error{InvalidTextLength}![]const u8 {
@@ -157,6 +170,10 @@ pub const MissionConfig = struct {
             std.mem.indexOfScalar(u8, robot, 0) != null or std.mem.indexOfScalar(u8, scene, 0) != null) return error.InvalidPath;
         if (self.sensor_source == .plugin and library.len == 0) return error.InvalidPath;
         if (robot.len == 0 or scene.len == 0) return error.InvalidPath;
+        if (self.sim_scene_catalog == .file) {
+            const catalog_path = try self.sim_scene_catalog_path.slice();
+            if (catalog_path.len == 0) return error.InvalidPath;
+        }
         if (serial.len != 0 and self.mission_profile != .proteus_hwd) return error.InvalidProfile;
         if (self.teleop_port != control_port and !@import("builtin").is_test) return error.InvalidPath;
         if (self.tam_len == 0 or self.tam_len > thruster_count) return error.InvalidTamLen;

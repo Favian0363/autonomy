@@ -27,12 +27,17 @@ zig build run -Dsimulator
 zig build run -Dsimulator -- --headless
 ```
 
-Scene geometry comes from the embedded catalog `src/simulator/scenes.bin`. `sim_scene` selects a preset **name** inside that catalog (`robot_only`, `robosub_course`, etc.). Robots always come from embedded `robots.bin`. Refresh the committed catalog from Blender:
+Environment layout is selected with `sim_scene_catalog` in mission config (see [`MissionConfig.zig`](src/MissionConfig.zig)):
 
-```sh
-zig build export-scene
-./zig-out/bin/export_scene path/to/course.blend --collection robosub_course
-```
+| `sim_scene_catalog` | Behavior |
+|---|---|
+| `embedded_bin` (default) | Load committed [`src/simulator/scenes.bin`](src/simulator/scenes.bin), then `patchLoadedCatalog` in [`robosub_source.zig`](src/simulator/scenes/robosub_source.zig) |
+| `scratch` | Build only `buildScratchPreset` in that file (no bin) |
+| `file` | Load `sim_scene_catalog_path`, then `patchLoadedCatalog` |
+
+`sim_scene` still picks a **preset name** inside the catalog (`robosub_course`, `robot_only`, …). After load, use `addEntity` / `refreshPresets` on the catalog to edit in memory. Robots stay in `robots.bin`.
+
+Blender is only for **mesh geometry** (`zig build export-mesh` → `.meshbin` → `meshFromBlob` in scratch or patch code).
 
 ## ZED sensor plugin
 

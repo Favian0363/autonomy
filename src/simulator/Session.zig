@@ -2,8 +2,7 @@
 const std = @import("std");
 const Auv = @import("../Auv.zig");
 const Scene = @import("Scene.zig");
-const RobotCatalog = @import("robots.zig").RobotCatalog;
-const SceneCatalog = @import("scenes.zig").SceneCatalog;
+const scenes = @import("scenes/robosub_source.zig");
 const database = @import("database.zig");
 const types = @import("types.zig");
 const S = @import("support.zig");
@@ -20,8 +19,10 @@ const frame_ticks = 6;
 
 io: std.Io,
 catalogs_owned: bool,
-catalog: RobotCatalog,
-scene_catalog: SceneCatalog,
+robot_db: database.Database,
+robot_slots: []u32,
+scene_db: database.Database,
+scene_presets: []scenes.ScenePreset,
 scene: Scene,
 backend: MujocoBackend,
 sensors: Sensors,
@@ -41,10 +42,6 @@ tam_len: usize,
 failed: bool = false,
 started: std.Io.Clock.Timestamp,
 
-fn loadSceneCatalog(allocator: std.mem.Allocator, _: std.Io, _: *const MissionConfig.MissionConfig) !SceneCatalog {
-    return SceneCatalog.init(allocator);
-}
-
 pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *const MissionConfig.MissionConfig, tam_len: usize, realtime: bool) !void {
     const robot_name = try config.sim_robot.slice();
     const scene_name = try config.sim_scene.slice();
@@ -52,8 +49,10 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *c
     self.* = .{
         .io = io,
         .catalogs_owned = true,
-        .catalog = undefined,
-        .scene_catalog = undefined,
+        .robot_db = undefined,
+        .robot_slots = undefined,
+        .scene_db = undefined,
+        .scene_presets = undefined,
         .scene = undefined,
         .backend = undefined,
         .sensors = undefined,
@@ -67,33 +66,69 @@ pub fn init(self: *Session, allocator: std.mem.Allocator, io: std.Io, config: *c
         .tam_len = tam_len,
         .started = undefined,
     };
-    self.catalog = try RobotCatalog.init(allocator);
-    errdefer self.catalog.deinit();
-    self.scene_catalog = try loadSceneCatalog(allocator, io, config);
-    errdefer self.scene_catalog.deinit();
-    const robot_index = self.catalog.index(robot_name) orelse return error.UnknownSimRobot;
-    const robot = self.catalog.body(robot_index);
+    self.robot_db = try database.Database.load(allocator, @embedFile("robots.bin"));
+    errdefer self.robot_db.deinit();
+    self.robot_slots = try allocator.alloc(u32, self.robot_db.names.items.len);
+    errdefer allocator.free(self.robot_slots);
+    for (self.robot_db.names.items, 0..) |name, i| {
+        if (name.entity_count != 1) return error.InvalidDatabase;
+        self.robot_slots[i] = name.entity_start;
+    }
+    switch (config.sim_scene_catalog) {
+        .embedded_bin => {
+            self.scene_db = try database.Database.load(allocator, @embedFile("scenes.bin"));
+            errdefer self.scene_db.deinit();
+            try scenes.patchLoadedCatalog(&self.scene_db);
+        },
+        .scratch => {
+            self.scene_db = .{ .allocator = allocator };
+            errdefer self.scene_db.deinit();
+            try scenes.buildScratchPreset(&self.scene_db);
+        },
+        .file => {
+            const path = try config.sim_scene_catalog_path.slice();
+            if (path.len == 0) return error.MissingSceneCatalogPath;
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.math.maxInt(usize)));
+            defer allocator.free(bytes);
+            self.scene_db = try database.Database.load(allocator, bytes);
+            errdefer self.scene_db.deinit();
+            try scenes.patchLoadedCatalog(&self.scene_db);
+        },
+    }
+    self.scene_presets = try scenes.allocScenePresets(allocator, &self.scene_db);
+    errdefer scenes.deinitScenePresets(allocator, self.scene_presets);
+    const robot_index: usize = blk: {
+        for (self.robot_slots, 0..) |slot, i| {
+            if (std.mem.eql(u8, robot_name, database.entityName(&self.robot_db, slot))) break :blk i;
+        }
+        return error.UnknownSimRobot;
+    };
+    const robot_slot = self.robot_slots[robot_index];
+    const robot = database.BodySlot{ .db = &self.robot_db, .slot = robot_slot };
     if (database.ownedCount(robot.db.thrusters.items, robot.slot) != tam_len) return error.InvalidThrusterCount;
-    const robot_slots = self.catalog.slots[robot_index..][0..1];
+    const robot_slots = self.robot_slots[robot_index..][0..1];
 
     const robot_membership = [_]database.Membership{
-        .{ .db = &self.catalog.db, .slots = robot_slots },
+        .{ .db = &self.robot_db, .slots = robot_slots },
     };
     const selected_scene = if (std.mem.eql(u8, scene_name, "robot_only"))
         try Scene.init(allocator, robot, null, &.{}, .{}, &.{}, &robot_membership)
     else blk: {
-        const preset = self.scene_catalog.find(scene_name) orelse return error.UnknownSimScene;
+        const preset: *const scenes.ScenePreset = find_preset: {
+            for (self.scene_presets) |*p| if (std.mem.eql(u8, scene_name, p.name)) break :find_preset p;
+            return error.UnknownSimScene;
+        };
         const start: ?types.Pose = if (std.mem.eql(u8, scene_name, "robosub_course"))
             .{ .pos = .{ 0, 2, 2 }, .quat = .{ 0, 0, 1, 0 } }
         else
             null;
         const membership = [_]database.Membership{
-            .{ .db = &self.catalog.db, .slots = robot_slots },
-            .{ .db = &self.scene_catalog.db, .slots = preset.slots },
+            .{ .db = &self.robot_db, .slots = robot_slots },
+            .{ .db = &self.scene_db, .slots = preset.slots },
         };
         const extras = try allocator.alloc(database.BodySlot, preset.slots.len);
         defer allocator.free(extras);
-        self.scene_catalog.presetBodySlots(preset, extras);
+        for (preset.slots, extras) |slot, *body| body.* = .{ .db = &self.scene_db, .slot = slot };
         break :blk try Scene.init(allocator, robot, start, extras, .{}, &.{}, &membership);
     };
     self.scene = selected_scene;
@@ -114,8 +149,10 @@ pub fn initWithScene(self: *Session, io: std.Io, scene: Scene, tam_len: usize, r
     self.* = .{
         .io = io,
         .catalogs_owned = false,
-        .catalog = undefined,
-        .scene_catalog = undefined,
+        .robot_db = undefined,
+        .robot_slots = undefined,
+        .scene_db = undefined,
+        .scene_presets = undefined,
         .scene = scene,
         .backend = undefined,
         .sensors = undefined,
@@ -180,8 +217,10 @@ pub fn deinit(self: *Session) void {
     if (self.preset_scene.len != 0) allocator.free(self.preset_scene);
     self.scene.deinit();
     if (self.catalogs_owned) {
-        self.scene_catalog.deinit();
-        self.catalog.deinit();
+        scenes.deinitScenePresets(allocator, self.scene_presets);
+        self.scene_db.deinit();
+        allocator.free(self.robot_slots);
+        self.robot_db.deinit();
     }
     self.* = undefined;
 }

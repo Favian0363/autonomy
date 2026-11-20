@@ -14,7 +14,6 @@ pub fn evaluate(force: types.Force, runtime: *Session) !void {
 }
 
 fn coefficients(force: types.Vec3, basis: types.Quat, cd: types.Vec3, scale: f64) types.Vec3 {
-    @setFloatMode(.strict);
     const d = S.rotate(S.conjugate(basis), force);
     const len = S.norm(d);
     const factor = if (len < 1.4901161193847656e-8) 0 else scale * (@abs(d[0]) * cd[0] + @abs(d[1]) * cd[1] + @abs(d[2]) * cd[2]) / len;
@@ -22,7 +21,6 @@ fn coefficients(force: types.Vec3, basis: types.Quat, cd: types.Vec3, scale: f64
 }
 
 fn gravity(runtime: *Session) void {
-    @setFloatMode(.strict);
     const scene = runtime.scene;
     for (runtime.wrenches, scene.objects) |*wrench, slot| {
         const e = database.entity(slot);
@@ -32,7 +30,6 @@ fn gravity(runtime: *Session) void {
 }
 
 fn hydro(runtime: *Session) !void {
-    @setFloatMode(.strict);
     const model = runtime.scene;
     const bodies = runtime.backend.states;
     const w = runtime.wrenches;
@@ -123,7 +120,6 @@ fn hydro(runtime: *Session) !void {
 }
 
 fn thrusters(runtime: *Session) void {
-    @setFloatMode(.strict);
     const model = runtime.scene;
     const bodies = runtime.backend.states;
     const dt = model.settings.timestep();
