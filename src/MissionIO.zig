@@ -4,6 +4,7 @@ const Io = std.Io;
 const math = @import("math.zig");
 const Auv = @import("Auv.zig");
 const MissionConfig = @import("MissionConfig.zig");
+const reflection = @import("simulator/ReflectionWriter.zig");
 
 /// The compiled profile definitions shared by the runtime and viewer.
 pub const CompiledConfig = MissionConfig;
@@ -628,6 +629,9 @@ comptime {
         @compileError("telemetry diagnostics ABI drift");
 }
 
+/// Fingerprint of `TelemetryFrame`. A datagram is this hash plus the raw `extern` image.
+pub const telemetry_schema_hash: u64 = reflection.schemaHash(TelemetryFrame);
+
 const outbound_buf_len = 64 * 1024;
 
 pub const UdpPublisher = struct {
@@ -721,9 +725,21 @@ pub const TelemetryPublisher = union(TelemetryTransport) {
 };
 
 pub fn encodeTelemetryFrame(buf: []u8, frame: TelemetryFrame) ![]const u8 {
-    var writer: Io.Writer = .fixed(buf);
-    try SerialBinary.write(&writer, frame);
-    return writer.buffered();
+    const image = std.mem.asBytes(&frame);
+    if (buf.len < 8 + image.len) return error.NoSpaceLeft;
+    std.mem.writeInt(u64, buf[0..8], telemetry_schema_hash, .little);
+    @memcpy(buf[8..][0..image.len], image);
+    return buf[0 .. 8 + image.len];
+}
+
+/// A matching hash and an aligned payload are a pointer into `buf`.
+pub fn telemetryFrameView(buf: []const u8) error{ EndOfStream, UnsupportedAbiVersion, MisalignedTelemetry }!*const TelemetryFrame {
+    if (buf.len < 8 + @sizeOf(TelemetryFrame)) return error.EndOfStream;
+    if (std.mem.readInt(u64, buf[0..8], .little) != telemetry_schema_hash) return error.UnsupportedAbiVersion;
+    const payload = buf[8..][0..@sizeOf(TelemetryFrame)];
+    if (@intFromPtr(payload.ptr) % @alignOf(TelemetryFrame) != 0) return error.MisalignedTelemetry;
+    const aligned: []align(@alignOf(TelemetryFrame)) const u8 = @alignCast(payload);
+    return std.mem.bytesAsValue(TelemetryFrame, aligned);
 }
 
 fn roundDisplayFloat(value: f32) f32 {
@@ -920,8 +936,12 @@ fn processTelemetry(
 
 /// Decode the fixed telemetry frame used for UDP and logs.
 pub fn decodeTelemetryFrame(buf: []const u8, frame: *TelemetryFrame) !void {
-    var reader: Io.Reader = .fixed(buf);
-    frame.* = try SerialBinary.read(&reader, TelemetryFrame);
+    if (telemetryFrameView(buf)) |view| {
+        frame.* = view.*;
+    } else |err| switch (err) {
+        error.MisalignedTelemetry => @memcpy(std.mem.asBytes(frame), buf[8..][0..@sizeOf(TelemetryFrame)]),
+        else => return err,
+    }
     if (!std.mem.eql(u8, &frame.magic, "AUV1")) return error.BadMagic;
     if (frame.abi_version != telemetry_frame_abi_version) return error.UnsupportedAbiVersion;
     if (frame.objects_len > frame.objects.len or frame.boxes_len > frame.boxes.len or
@@ -1407,6 +1427,45 @@ pub fn setText(destination: anytype, message: []const u8) void {
     const len = @min(destination.bytes.len, message.len);
     @memcpy(destination.bytes[0..len], message[0..len]);
     destination.len = @intCast(len);
+}
+
+test "telemetry hash plus raw frame round trip" {
+    var frame = std.mem.zeroes(TelemetryFrame);
+    frame.magic = "AUV1".*;
+    frame.abi_version = telemetry_frame_abi_version;
+    frame.depth = 1.25;
+    frame.thrusters_len = 6;
+    frame.thrusters[0] = 0.5;
+    const packet_len = 8 + @sizeOf(TelemetryFrame);
+    const storage = try std.testing.allocator.alignedAlloc(u8, .of(TelemetryFrame), packet_len);
+    defer std.testing.allocator.free(storage);
+    const encoded = try encodeTelemetryFrame(storage, frame);
+    const view = try telemetryFrameView(encoded);
+    const start = @intFromPtr(encoded.ptr);
+    try std.testing.expect(@intFromPtr(view) >= start and @intFromPtr(view) < start + encoded.len);
+    try std.testing.expectEqual(frame.depth, view.depth);
+
+    var decoded: TelemetryFrame = undefined;
+    try decodeTelemetryFrame(encoded, &decoded);
+    try std.testing.expectEqual(frame.depth, decoded.depth);
+    try std.testing.expectEqual(frame.thrusters[0], decoded.thrusters[0]);
+    try std.testing.expectEqual(frame.thrusters_len, decoded.thrusters_len);
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(TelemetryFrame, "camera_pose"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(TelemetryFrame, "thrusters_len"));
+    try std.testing.expectEqual(@as(usize, 9284), @offsetOf(TelemetryFrame, "thrusters"));
+
+    const raw = try std.testing.allocator.alignedAlloc(u8, .of(TelemetryFrame), packet_len + 1);
+    defer std.testing.allocator.free(raw);
+    const misaligned = raw[1..][0..encoded.len];
+    @memcpy(misaligned, encoded);
+    try std.testing.expectError(error.MisalignedTelemetry, telemetryFrameView(misaligned));
+    try decodeTelemetryFrame(misaligned, &decoded);
+    try std.testing.expectEqual(frame.depth, decoded.depth);
+
+    var bad = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(bad);
+    bad[0] ^= 0xff;
+    try std.testing.expectError(error.UnsupportedAbiVersion, decodeTelemetryFrame(bad, &decoded));
 }
 
 test "lifecycle requests deduplicate and the latest request wins" {

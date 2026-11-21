@@ -34,9 +34,9 @@ Environment layout is selected with `sim_scene_catalog` in mission config (see [
 | `embedded_bin` (default) | Load committed [`src/simulator/scenes.bin`](src/simulator/scenes.bin) |
 | `file` | Load `sim_scene_catalog_path` |
 
-`sim_scene` still picks a **preset name** inside the catalog (`robosub_course`, `robot_only`, …). Scene and robot data are load-only SIMDB blobs (`database.Database.load`). Robots stay in `robots.bin`.
+`sim_scene` still picks a **preset name** inside the catalog (`robosub_course`, `robot_only`, …). Scene and robot files are separate DNA documents (`database.loadScene`, `database.loadRobot`). Each file header is the reflection of the struct that was saved. Robots stay in `robots.bin`.
 
-Blender is only for **mesh geometry** (`zig build export-mesh` → `.meshbin` for offline SIMDB authoring).
+Blender is only for **mesh geometry** (`zig build export-mesh` → `.meshbin` for offline catalog authoring).
 
 ## ZED sensor plugin
 

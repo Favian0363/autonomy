@@ -1,6 +1,5 @@
-//! Blender `.meshbin` wire format for `export_mesh`.
 const std = @import("std");
-const types = @import("types.zig");
+const types = @import("types");
 
 pub const mesh_magic: [4]u8 = "SMM1".*;
 

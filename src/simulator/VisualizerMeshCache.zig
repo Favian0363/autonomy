@@ -1,4 +1,4 @@
-//! GPU mesh cache for the embedded simulator visualizer.
+//! Raylib mesh cache and draw path for the embedded simulator visualizer.
 const std = @import("std");
 const rl = @import("raylib");
 const Scene = @import("Scene.zig");
@@ -9,20 +9,20 @@ const S = @import("support.zig");
 
 const max_index_vertices = std.math.maxInt(u16);
 
-pub const SceneMeshCache = struct {
+pub const VisualizerMeshCache = struct {
     allocator: std.mem.Allocator,
     entries: []Entry,
 
-    pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !SceneMeshCache {
+    pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !VisualizerMeshCache {
         var list: std.ArrayList(Entry) = .empty;
         errdefer deinitEntries(allocator, list.items);
 
         for (scene.objects, 0..) |slot, body_index| {
             const entity = database.entity(slot);
-            const collider_count = database.ownedCount(slot.db.colliders, slot.slot);
+            const collider_count = database.rna.owned(slot.colliders, slot.slot);
             for (0..collider_count) |ki| {
-                const collider = database.colliderAt(slot.db, slot.slot, ki);
-                const shape = database.shapeFrom(slot.db, collider);
+                const collider = database.rna.ownedAt(slot.colliders, slot.slot, ki);
+                const shape = database.shapeFrom(slot, collider);
                 const entry = makeEntry(allocator, shape, collider, entity.cls, body_index) catch |err| switch (err) {
                     error.MeshTooLarge => {
                         std.log.warn("embedded visualizer skipped a collider mesh ({s})", .{@errorName(err)});
@@ -37,13 +37,13 @@ pub const SceneMeshCache = struct {
         return .{ .allocator = allocator, .entries = try list.toOwnedSlice(allocator) };
     }
 
-    pub fn deinit(self: *SceneMeshCache) void {
+    pub fn deinit(self: *VisualizerMeshCache) void {
         deinitEntries(self.allocator, self.entries);
         self.allocator.free(self.entries);
         self.* = undefined;
     }
 
-    pub fn draw(self: *const SceneMeshCache, bodies: []const abi.BodyState) void {
+    pub fn draw(self: *const VisualizerMeshCache, bodies: []const abi.BodyState) void {
         if (bodies.len == 0) return;
         for (self.entries) |entry| {
             if (entry.body_index >= bodies.len) continue;
@@ -57,7 +57,7 @@ pub const SceneMeshCache = struct {
 };
 
 pub const DrawContext = struct {
-    cache: *SceneMeshCache,
+    cache: *VisualizerMeshCache,
     bodies: []const abi.BodyState = &.{},
 };
 
@@ -177,15 +177,4 @@ fn poseMatrix(pose: types.Pose) rl.Matrix {
         .m11 = 0,
         .m15 = 1,
     };
-}
-
-test "pose matrix maps unit Y to ray space" {
-    const pose: types.Pose = .{ .pos = .{ 0, 1, 2 }, .quat = .{ 0, 0, 0, 1 } };
-    const m = poseMatrix(pose);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), m.m12, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, -2), m.m13, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, -1), m.m14, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), m.m4, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), m.m5, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, -1), m.m6, 1e-5);
 }

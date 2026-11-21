@@ -1,12 +1,12 @@
 const std = @import("std");
-const blend = @import("blend_catalog");
-const mesh_wire = @import("mesh_wire");
+const blend_file = @import("blend_file");
+const mesh_export_codec = @import("mesh_export_codec");
 
 const help =
     \\Usage: export_mesh <file.blend> --object <name> -o <out.meshbin>
     \\
     \\Exports one Blender object's triangle mesh (no scene metadata). Commit the
-    \\.meshbin under src/simulator/scenes/meshes/ for offline SIMDB authoring.
+    \\.meshbin under src/simulator/scenes/meshes/ for offline catalog authoring.
 ;
 
 pub fn main(init: std.process.Init) !void {
@@ -42,11 +42,11 @@ pub fn main(init: std.process.Init) !void {
     const obj = object_name orelse return error.Usage;
     const out = output_path orelse return error.Usage;
 
-    var file = try blend.BlendFile.load(allocator, io, blend_path);
+    var file = try blend_file.BlendFile.load(allocator, io, blend_path);
     defer file.deinit();
-    var mesh = try file.exportMeshNamed(obj);
+    const mesh = try file.exportMeshNamed(obj);
     defer file.deinitMeshExport(mesh);
-    const bytes = try mesh_wire.encode(allocator, mesh.positions, mesh.triangles);
+    const bytes = try mesh_export_codec.encode(allocator, mesh.positions, mesh.triangles);
     defer allocator.free(bytes);
     const dir = std.Io.Dir.cwd();
     try dir.writeFile(io, .{ .sub_path = out, .data = bytes });

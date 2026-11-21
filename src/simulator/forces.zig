@@ -44,12 +44,12 @@ fn hydro(runtime: *Session) !void {
         @memset(maxz, -std.math.inf(f64));
         const Wet = struct { lo: f64 = std.math.inf(f64), hi: f64 = -std.math.inf(f64) };
         var wet: [types.max_hulls]Wet = @splat(.{});
-        const hull_count = database.ownedCount(robot.db.hulls, robot.slot);
+        const hull_count = database.rna.owned(model.robot_catalog.hulls, robot.slot);
         for (0..hull_count) |hi| {
-            const h = database.hullAt(robot.db, robot.slot, hi);
+            const h = database.rna.ownedAt(model.robot_catalog.hulls, robot.slot, hi);
             const index = h.body;
             const transform = S.compose(S.bodyPose(bodies[index]), database.poseOf(h.pos, h.quat));
-            const positions = database.vertexSlice(robot.db, h.vertex_start, h.vertex_count);
+            const positions = database.rna.vec3s(robot.positions, h.vertex_start, h.vertex_count);
             for (positions) |position| {
                 const z = S.point(transform, S.fromAbi3(position))[2];
                 wet[hi].lo = @min(wet[hi].lo, z);
@@ -65,7 +65,7 @@ fn hydro(runtime: *Session) !void {
             S.addForce(&runtime.fluid[index], S.scale(model.settings.gravity, -model.settings.water_density * e.volume), S.point(pose, S.fromAbi3(e.buoyancy)), S.fromAbi3(body.com));
         };
         for (0..hull_count) |hi| {
-            const h = database.hullAt(robot.db, robot.slot, hi);
+            const h = database.rna.ownedAt(model.robot_catalog.hulls, robot.slot, hi);
             const extent = wet[hi];
             const index = h.body;
             const body = bodies[index];
@@ -80,7 +80,7 @@ fn hydro(runtime: *Session) !void {
             var pressure_angular: types.Vec3 = @splat(0);
             var skin_linear: types.Vec3 = @splat(0);
             var skin_angular: types.Vec3 = @splat(0);
-            const positions = database.vertexSlice(robot.db, h.vertex_start, h.vertex_count);
+            const positions = database.rna.vec3s(robot.positions, h.vertex_start, h.vertex_count);
             var vertex: usize = 0;
             while (vertex < positions.len) : (vertex += 3) {
                 const a = S.point(transform, S.fromAbi3(positions[vertex]));
@@ -125,7 +125,7 @@ fn thrusters(runtime: *Session) void {
     const dt = model.settings.timestep();
     const robot = model.robot();
     for (0..model.thruster_len) |ti| {
-        const t = database.thrusterAt(robot.db, robot.slot, ti);
+        const t = database.rna.ownedAt(model.robot_catalog.thrusters, robot.slot, ti);
         const rotor = &runtime.rotors[ti];
         const command = runtime.commands[ti];
         const index = t.body;

@@ -47,8 +47,6 @@
 			</external_part>
 		</base_link>
 
-		<ros_subscriber thrusters="/bridge/thrusters" />
-
     <actuator name="thruster_0_front_left" type="thruster">
 			<link name="Hydrus" />
 			<origin rpy="0.0 0.0 -1.1781" xyz="0.198 0.407 0.0" />
@@ -222,7 +220,6 @@
 			<link name="Hydrus" />
 
 			<origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />
-			<ros_publisher topic="/bridge/odometry" />
 		</sensor>
 
 		<sensor name="HydrusCameraIMU" rate="30.0" type="imu">
@@ -231,14 +228,12 @@
 			<history samples="1" />
 			<origin xyz="0.0 0.0  0.0" rpy="0.0 0.0 0.0" />
 			<link name="Hydrus" />
-			<ros_publisher topic="/bridge/imu" />
 		</sensor>
 
 		<sensor name="RGBCamera" rate="20.0" type="camera">
 			<specs resolution_x="800" resolution_y="600" horizontal_fov="60.0" />
 			<origin xyz="0.0 0.3 0.0" rpy="1.5708 0.0 3.14" />
 			<link name="Hydrus" />
-			<ros_publisher topic="/bridge/rgb_camera" frame_id="hydrus_camera" />
 		</sensor>
 
 

@@ -1,26 +1,8 @@
-//! On-disk SIMDB layout: extern rows and integer tags (SIMDB001 v1).
+
 pub const Vec3 = [3]f32;
 pub const Quat = [4]f32;
 
 pub const nil: u32 = @import("std").math.maxInt(u32);
-pub const magic = "SIMDB001";
-pub const version: u32 = 1;
-pub const table_count: u32 = 9;
-pub const directory_at: usize = magic.len + 8;
-pub const entry_size: usize = 12;
-pub const header_size: usize = directory_at + table_count * entry_size;
-
-pub const table = struct {
-    pub const strings: usize = 0;
-    pub const entities: usize = 1;
-    pub const colliders: usize = 2;
-    pub const thrusters: usize = 3;
-    pub const hulls: usize = 4;
-    pub const sensors: usize = 5;
-    pub const positions: usize = 6;
-    pub const indices: usize = 7;
-    pub const names: usize = 8;
-};
 
 pub const motion_tag = enum(u32) {
     static = 0,
@@ -41,8 +23,6 @@ pub const sensor_kind_tag = enum(u32) {
     pressure = 2,
     camera = 3,
 };
-
-pub const TableEntry = struct { offset: u32, count: u32, stride: u32 };
 
 pub const Entity = extern struct {
     name_offset: u32,
@@ -146,31 +126,28 @@ pub const Name = extern struct {
     entity_count: u32,
 };
 
-pub const strides = [table_count]u32{
-    1,
-    @sizeOf(Entity),
-    @sizeOf(Collider),
-    @sizeOf(Thruster),
-    @sizeOf(Hull),
-    @sizeOf(Sensor),
-    @sizeOf(f32),
-    @sizeOf(u32),
-    @sizeOf(Name),
+/// Robot document. Thrusters, hulls, and sensors belong to this catalog.
+pub const RobotCatalog = struct {
+    strings: []u8 = &.{},
+    entities: []Entity = &.{},
+    colliders: []Collider = &.{},
+    thrusters: []Thruster = &.{},
+    hulls: []Hull = &.{},
+    sensors: []Sensor = &.{},
+    positions: []f32 = &.{},
+    indices: []u32 = &.{},
+    names: []Name = &.{},
 };
 
-pub const aligns = [table_count]u32{
-    1,
-    @alignOf(Entity),
-    @alignOf(Collider),
-    @alignOf(Thruster),
-    @alignOf(Hull),
-    @alignOf(Sensor),
-    @alignOf(f32),
-    @alignOf(u32),
-    @alignOf(Name),
+pub const SceneCatalog = struct {
+    strings: []u8 = &.{},
+    entities: []Entity = &.{},
+    colliders: []Collider = &.{},
+    positions: []f32 = &.{},
+    indices: []u32 = &.{},
+    names: []Name = &.{},
 };
 
-/// Dynamics rows and session container (SIMSESS001 v1).
 pub const thruster_slots: usize = 8;
 pub const max_snapshot_contacts: usize = 1024;
 
@@ -205,10 +182,6 @@ pub const Contact = extern struct {
     normal_force: f64,
 };
 
-pub const Vec3Slot = extern struct {
-    v: Vec3,
-};
-
 pub const SessionMeta = extern struct {
     tick: u64,
     thruster_len: u8,
@@ -218,36 +191,25 @@ pub const SessionMeta = extern struct {
     commands: [thruster_slots]f64,
 };
 
-pub const session_magic = "SIMSESS001";
-pub const session_version: u32 = 1;
-pub const session_chunk_count: u32 = 11;
-pub const session_directory_at: usize = session_magic.len + 8;
-pub const session_entry_size: usize = 12;
-
-pub const session_chunk = struct {
-    pub const strings: usize = 0;
-    pub const meta: usize = 1;
-    pub const robot_catalog: usize = 2;
-    pub const scene_catalog: usize = 3;
-    pub const body_states: usize = 4;
-    pub const wrenches: usize = 5;
-    pub const fluid_wrenches: usize = 6;
-    pub const prev_linear: usize = 7;
-    pub const prev_angular: usize = 8;
-    pub const rotors: usize = 9;
-    pub const contacts: usize = 10;
+pub const SessionStateCatalog = struct {
+    strings: []u8 = &.{},
+    meta: SessionMeta = std_zero_meta,
+    robot_catalog: []u8 = &.{},
+    scene_catalog: []u8 = &.{},
+    body_states: []BodyState = &.{},
+    wrenches: []Wrench = &.{},
+    fluid: []Wrench = &.{},
+    previous_linear: []Vec3 = &.{},
+    previous_angular: []Vec3 = &.{},
+    rotors: []RotorState = &.{},
+    contacts: []Contact = &.{},
 };
 
-pub const session_strides = [session_chunk_count]u32{
-    1,
-    @sizeOf(SessionMeta),
-    1,
-    1,
-    @sizeOf(BodyState),
-    @sizeOf(Wrench),
-    @sizeOf(Wrench),
-    @sizeOf(Vec3Slot),
-    @sizeOf(Vec3Slot),
-    @sizeOf(RotorState),
-    @sizeOf(Contact),
+const std_zero_meta = SessionMeta{
+    .tick = 0,
+    .thruster_len = 0,
+    .robot_name_len = 0,
+    .scene_name_len = 0,
+    .pad0 = .{ 0, 0, 0, 0, 0 },
+    .commands = @splat(0),
 };

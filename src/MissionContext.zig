@@ -5,7 +5,6 @@ const bc = @import("BodyControl.zig");
 
 const Auv = @import("Auv.zig");
 const Serial = @import("Serial.zig");
-const Protocol = @import("Protocol.zig");
 const MissionConfig = @import("MissionConfig.zig");
 const MissionIO = @import("MissionIO.zig");
 
@@ -25,12 +24,12 @@ const SimSession = if (simulator_enabled) @import("simulator/Session.zig").Sessi
 
 const MissionContext = @This();
 const Visualizer = if (simulator_enabled) @import("Visualizer.zig") else void;
-const SceneMeshCache = if (simulator_enabled) @import("simulator/scene_meshes.zig").SceneMeshCache else void;
-const SceneMeshDraw = if (simulator_enabled) @import("simulator/scene_meshes.zig").DrawContext else void;
-const drawSceneMeshes = if (simulator_enabled) @import("simulator/scene_meshes.zig").drawEmbedded else void;
+const VisualizerMeshCache = if (simulator_enabled) @import("simulator/VisualizerMeshCache.zig").VisualizerMeshCache else void;
+const SceneMeshDraw = if (simulator_enabled) @import("simulator/VisualizerMeshCache.zig").DrawContext else void;
+const drawSceneMeshes = if (simulator_enabled) @import("simulator/VisualizerMeshCache.zig").drawEmbedded else void;
 const EmbeddedView = if (simulator_enabled) struct {
     viewer: Visualizer,
-    scene_meshes: SceneMeshCache = undefined,
+    scene_meshes: VisualizerMeshCache = undefined,
     has_scene_meshes: bool = false,
     mesh_draw: SceneMeshDraw = .{ .cache = undefined, .bodies = &.{} },
     last_idle_draw: ?Io.Clock.Timestamp = null,
@@ -73,8 +72,8 @@ seen_objects2d_len: u8 = 0,
 
 auv: ?Auv,
 mission_diyn_loader: ?MissionIO.MissionDiynLoader,
-serial: ?Serial,
-serial_parser: Protocol.Parser = .{},
+serial: ?Serial.Port,
+serial_parser: Serial.Parser = .{},
 simulator: if (simulator_enabled) ?SimSession else void = if (simulator_enabled) null else {},
 hardware_frame_time: ?Io.Clock.Timestamp = null,
 
@@ -173,7 +172,7 @@ fn present(ctx: *MissionContext, frame: ?*const MissionIO.TelemetryFrame) !void 
     if (actions.mission) |command| ctx.telemetry.acceptMission(command) catch |err| ctx.telemetry.report(err);
 }
 
-fn waitForReady(ctx: *MissionContext, port: *Serial, parser: *Protocol.Parser) !void {
+fn waitForReady(ctx: *MissionContext, port: *Serial.Port, parser: *Serial.Parser) !void {
     const max_retries = 1000;
     for (0..max_retries + 1) |attempt| {
         try ctx.serviceWithoutFrame();
@@ -215,9 +214,9 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         try auv.?.yieldUntilNextFrame(&initial_frame);
         try telemetry.pollControl(io, &ctx.config);
     }
-    var serial = try Serial.init(io, try config.serial_port.sentinelSlice());
+    var serial = try Serial.Port.init(io, try config.serial_port.sentinelSlice());
     errdefer if (serial) |*port| port.deinit();
-    var parser: Protocol.Parser = .{};
+    var parser: Serial.Parser = .{};
     if (serial) |*port| {
         try ctx.waitForReady(port, &parser);
         std.log.info("READY on {s} at 115200 baud", .{try config.serial_port.slice()});
@@ -251,12 +250,12 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
 
     if (comptime simulator_enabled) {
         const realtime = ctx.visualizer != null or config.sim_realtime or config.serial_port.len != 0;
-        // Init in place: scene BodySlot pointers must reference catalog.db in this Session, not a stack copy.
+        // Init in place: scene BodySlot slices must reference catalogs stored in this Session, not a stack copy.
         ctx.simulator = @as(SimSession, undefined);
         errdefer if (ctx.simulator) |*session| session.deinit();
         try ctx.simulator.?.init(allocator, io, &ctx.config, tam_len, realtime);
         if (ctx.visualizer) |embedded| {
-            embedded.scene_meshes = try SceneMeshCache.init(allocator, &ctx.simulator.?.scene);
+            embedded.scene_meshes = try VisualizerMeshCache.init(allocator, &ctx.simulator.?.scene);
             embedded.has_scene_meshes = true;
             embedded.mesh_draw = .{ .cache = &embedded.scene_meshes, .bodies = &.{} };
         }
@@ -374,7 +373,7 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     if (!direct or ctx.telemetry.direct_command != null) {
         if (comptime simulator_enabled) try ctx.simulator.?.setThrusters(&thruster_buffer);
         if (ctx.serial) |*port| {
-            const packet = Protocol.encode(&thruster_values[0..Protocol.protocol_v2_command_channel_count].*);
+            const packet = Serial.encode(&thruster_values[0..Serial.protocol_v2_command_channel_count].*);
             try port.writeAll(&packet, 100);
         }
     }

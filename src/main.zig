@@ -6,7 +6,6 @@ const simulator_enabled = @import("build_options").simulator;
 test {
     std.testing.refAllDecls(@import("BodyControl.zig"));
     std.testing.refAllDecls(@import("Serial.zig"));
-    std.testing.refAllDecls(@import("Protocol.zig"));
     std.testing.refAllDecls(MissionContext);
 }
 

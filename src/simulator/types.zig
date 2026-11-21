@@ -1,17 +1,4 @@
-//! Simulator types: compile-time scene authoring and ephemeral per-tick outputs.
-//!
-//! **Use `abi.zig` in application/runtime code** for any simulation-time state that is
-//! persisted or round-tripped (`SIMSESS001`: body states, wrenches, fluid wrenches,
-//! rotor state, contacts, previous velocities, tick, commands, embedded catalogs).
-//!
-//! **Keep types here** for:
-//! - Scene authoring inputs (`ColliderInput`, `SensorInput`); presets live in committed `scenes.bin`
-//! - Scene policy (`Settings`, `Fault`, `Force`) — not in session snapshots
-//! - Mission/control buffers (`ThrusterCommands`, `ThrusterCommandInput`)
-//! - Recomputed after load (`Observation`, `SensorSample`, `Detection`, `Imu`)
-//!
-//! Runtime vectors use `f64`; SIMDB rows stay `f32` in `abi.zig` and convert through `support.zig`.
-//! Simulator data uses XYZW quaternions and world-frame velocities at the center of mass.
+
 const abi = @import("abi.zig");
 
 pub const Vec3 = [3]f64;
@@ -25,16 +12,12 @@ pub const BodyIndex = enum(usize) { robot = 0, _ };
 pub const SensorIndex = enum(usize) { _ };
 pub const max_hulls = 5;
 
-/// Must match `MissionConfig.thruster_count` (see `src/MissionConfig.zig`).
 pub const thruster_count = 8;
-/// Full thruster command vector passed into the simulator runtime.
 pub const ThrusterCommands = [thruster_count]f64;
-/// Control-side thruster command buffer shared with the mission controller.
 pub const ThrusterCommandInput = [thruster_count]f32;
 
 pub const Triangle = struct { a: u32, b: u32, c: u32 };
 pub const Mesh = struct {
-    /// Vertex rows in SIMDB layout; widen with `support.fromAbi3` for force/sensor math.
     positions: []const abi.Vec3,
     triangles: []const Triangle,
 };
@@ -114,7 +97,6 @@ pub const Settings = struct {
 };
 pub const Force = enum { gravity, hydrodynamics, thrusters };
 
-/// Ephemeral: rebuilt each tick / after `Session.refreshSensors()`; not in `SIMSESS001`.
 pub const Detection = struct {
     id: u32,
     cls: u32,
@@ -125,9 +107,7 @@ pub const Detection = struct {
     x1: u32 = 0,
     y1: u32 = 0,
 };
-/// Ephemeral: per-sensor tick cache; not in `SIMSESS001`.
 pub const Imu = struct { orientation: Quat, gyro: Vec3, accel: Vec3 };
-/// Ephemeral: per-sensor tick cache; not in `SIMSESS001`.
 pub const SensorSample = struct {
     tick: u64 = 0,
     value: ?union(SensorKind) {
@@ -138,7 +118,6 @@ pub const SensorSample = struct {
     } = null,
 };
 
-/// Ephemeral: fused view for mission I/O; not in `SIMSESS001`.
 pub const Observation = struct {
     body: Pose = .{},
     position_axes: AxisMask = 0,

@@ -1,12 +1,31 @@
-//! f64 geometry for the simulator. SIMDB / session ABI vectors in `abi.zig` are f32;
-//! widen on read and narrow on write only via `fromAbi*` / `toAbi*`.
+
 const std = @import("std");
 const types = @import("types.zig");
 const abi = @import("abi.zig");
+const math = @import("../math.zig");
 
 pub const Vec3 = types.Vec3;
 pub const Quat = types.Quat;
 pub const Pose = types.Pose;
+
+const V3 = math.Vector3f;
+const Q4 = math.Quaternionf;
+
+inline fn v3(a: Vec3) V3 {
+    return .{ a[0], a[1], a[2] };
+}
+
+inline fn arr3(v: V3) Vec3 {
+    return .{ v[0], v[1], v[2] };
+}
+
+inline fn q4(a: Quat) Q4 {
+    return .{ a[0], a[1], a[2], a[3] };
+}
+
+inline fn arr4(v: Q4) Quat {
+    return .{ v[0], v[1], v[2], v[3] };
+}
 
 pub fn fromAbi3(v: abi.Vec3) Vec3 {
     return .{ @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]) };
@@ -25,71 +44,66 @@ pub fn toAbi4(v: Quat) abi.Quat {
 }
 
 pub fn add(a: Vec3, b: Vec3) Vec3 {
-    return .{ a[0] + b[0], a[1] + b[1], a[2] + b[2] };
+    return arr3(v3(a) + v3(b));
 }
 
 pub fn sub(a: Vec3, b: Vec3) Vec3 {
-    return .{ a[0] - b[0], a[1] - b[1], a[2] - b[2] };
+    return arr3(v3(a) - v3(b));
 }
 
 pub fn scale(a: Vec3, s: f64) Vec3 {
-    return .{ a[0] * s, a[1] * s, a[2] * s };
+    return arr3(v3(a) * @as(V3, @splat(s)));
 }
 
 pub fn dot(a: Vec3, b: Vec3) f64 {
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    return math.dot3f(v3(a), v3(b));
 }
 
 pub fn norm(a: Vec3) f64 {
-    return @sqrt(dot(a, a));
+    return math.length3f(v3(a));
 }
 
 pub fn cross(a: Vec3, b: Vec3) Vec3 {
-    return .{
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    };
+    return arr3(math.cross3f(v3(a), v3(b)));
 }
 
 pub fn conjugate(a: Quat) Quat {
-    return .{ -a[0], -a[1], -a[2], a[3] };
+    return arr4(math.quaternionConjugate(q4(a)));
 }
 
 pub fn multiply(a: Quat, b: Quat) Quat {
-    return .{
-        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
-        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
-        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
-        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
-    };
+    return arr4(math.quaternionMul(q4(a), q4(b)));
 }
 
 pub fn rotate(a: Quat, b: Vec3) Vec3 {
-    const u: Vec3 = .{ a[0], a[1], a[2] };
-    const twice_cross = scale(cross(u, b), 2);
-    return add(b, add(scale(twice_cross, a[3]), cross(u, twice_cross)));
+    return arr3(math.quaternionRotate(q4(a), v3(b)));
 }
 
 pub fn point(a: Pose, b: Vec3) Vec3 {
-    return add(a.pos, rotate(a.quat, b));
+    return arr3(v3(a.pos) + math.quaternionRotate(q4(a.quat), v3(b)));
 }
 
 pub fn compose(a: Pose, b: Pose) Pose {
-    return .{ .pos = point(a, b.pos), .quat = multiply(a.quat, b.quat) };
+    const aq = q4(a.quat);
+    const bq = q4(b.quat);
+    return .{
+        .pos = arr3(v3(a.pos) + math.quaternionRotate(aq, v3(b.pos))),
+        .quat = arr4(math.quaternionMul(aq, bq)),
+    };
 }
 
 pub fn finite3(a: Vec3) bool {
-    return std.math.isFinite(a[0]) and std.math.isFinite(a[1]) and std.math.isFinite(a[2]);
+    const v = v3(a);
+    return std.math.isFinite(v[0]) and std.math.isFinite(v[1]) and std.math.isFinite(v[2]);
 }
 
 pub fn finite4(a: Quat) bool {
-    return std.math.isFinite(a[0]) and std.math.isFinite(a[1]) and std.math.isFinite(a[2]) and std.math.isFinite(a[3]);
+    const v = q4(a);
+    return std.math.isFinite(v[0]) and std.math.isFinite(v[1]) and std.math.isFinite(v[2]) and std.math.isFinite(v[3]);
 }
 
 pub fn validPose(a: Pose) error{InvalidPose}!void {
-    var n: f64 = 0;
-    for (a.quat) |x| n += x * x;
+    const n = @reduce(.Add, q4(a.quat) * q4(a.quat));
     if (!finite3(a.pos) or !finite4(a.quat) or @abs(n - 1) >= 1e-4) return error.InvalidPose;
 }
 
@@ -98,6 +112,7 @@ pub fn bodyPose(s: abi.BodyState) Pose {
 }
 
 pub fn addForce(w: *abi.Wrench, f: Vec3, p: Vec3, com: Vec3) void {
-    w.force = toAbi3(add(fromAbi3(w.force), f));
-    w.torque = toAbi3(add(fromAbi3(w.torque), cross(sub(p, com), f)));
+    const arm = v3(p) - v3(com);
+    w.force = toAbi3(arr3(v3(fromAbi3(w.force)) + v3(f)));
+    w.torque = toAbi3(arr3(v3(fromAbi3(w.torque)) + math.cross3f(arm, v3(f))));
 }

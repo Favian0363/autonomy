@@ -108,7 +108,7 @@ pub fn reset(self: *MujocoBackend, input: ?[]const abi.BodyState) !void {
             const qa: usize = @intCast(m.jnt_qposadr[joint]);
             const va: usize = @intCast(m.jnt_dofadr[joint]);
             transform(d.qpos + qa, d.qpos + qa + 3, pose);
-            const com = database.entityCenterOfMass(slot.db, slot.slot);
+            const com = database.entityCenterOfMass(slot);
             const offset = S.rotate(pose.quat, com.pos);
             xyz(d.qvel + va, S.sub(S.fromAbi3(state.linear_vel), S.cross(S.fromAbi3(state.angular_vel), offset)));
             xyz(d.qvel + va + 3, S.rotate(S.conjugate(pose.quat), S.fromAbi3(state.angular_vel)));
@@ -166,15 +166,15 @@ pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !MujocoBackend {
         if (motion == .dynamic) {
             if (mj.mjs_addFreeJoint(body) == null) return error.OutOfMemory;
             body.*.explicitinertial = if (@TypeOf(body.*.explicitinertial) == bool) true else 1;
-            const com = database.entityCenterOfMass(slot.db, slot.slot);
+            const com = database.entityCenterOfMass(slot);
             transform(&body.*.ipos, &body.*.iquat, com);
             body.*.mass = e.mass;
             const placeholder = @max(e.inertia[0], e.inertia[1], e.inertia[2]);
             xyz(&body.*.inertia, .{ placeholder, placeholder, placeholder });
         }
-        const collider_count = database.ownedCount(slot.db.colliders, slot.slot);
+        const collider_count = database.rna.owned(slot.colliders, slot.slot);
         for (0..collider_count) |k| {
-            const c = database.colliderAt(slot.db, slot.slot, k);
+            const c = database.rna.ownedAt(slot.colliders, slot.slot, k);
             if (c.restitution != 0) return error.UnsupportedRestitution;
             const geom = mj.mjs_addGeom(body, null);
             if (geom == null) return error.OutOfMemory;
@@ -184,7 +184,7 @@ pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !MujocoBackend {
             geom.*.contype = @intFromBool(c.collisions != 0);
             geom.*.conaffinity = @intFromBool(c.collisions != 0);
             xyz(&geom.*.friction, .{ c.friction, 0, 0 });
-            const shape = database.shapeFrom(slot.db, c);
+            const shape = database.shapeFrom(slot, c);
             if (shape == .mesh) {
                 const mesh = mj.mjs_addMesh(spec, null);
                 if (mesh == null) return error.OutOfMemory;
@@ -223,7 +223,7 @@ pub fn init(allocator: std.mem.Allocator, scene: *const Scene) !MujocoBackend {
         if (id < 0) return error.MuJoCoBodyMissing;
         self.body_ids[i] = id;
         if (database.motionFrom(e.motion) == .dynamic) xyz(m.body_inertia + 3 * @as(usize, @intCast(id)), S.fromAbi3(e.inertia));
-        const collider_count = database.ownedCount(slot.db.colliders, slot.slot);
+        const collider_count = database.rna.owned(slot.colliders, slot.slot);
         for (0..collider_count) |k| {
             const geom_id = mj.mj_name2id(m, mj.mjOBJ_GEOM, (try namePrint(&name_buffer, "g{d}_{d}", .{ i, k })).ptr);
             if (geom_id < 0) return error.MuJoCoGeomMissing;

@@ -4,13 +4,19 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
 
     const optimize = b.standardOptimizeOption(.{});
-    const blend_catalog = b.createModule(.{
-        .root_source_file = b.path("src/simulator/blend_catalog.zig"),
+    const sim_types = b.createModule(.{
+        .root_source_file = b.path("src/simulator/types.zig"),
         .target = b.graph.host,
     });
-    const mesh_wire = b.createModule(.{
-        .root_source_file = b.path("src/simulator/mesh_wire.zig"),
+    const blend_file = b.createModule(.{
+        .root_source_file = b.path("src/simulator/BlendFile.zig"),
         .target = b.graph.host,
+        .imports = &.{.{ .name = "types", .module = sim_types }},
+    });
+    const mesh_export_codec = b.createModule(.{
+        .root_source_file = b.path("src/simulator/MeshExportCodec.zig"),
+        .target = b.graph.host,
+        .imports = &.{.{ .name = "types", .module = sim_types }},
     });
     const export_mesh = b.addExecutable(.{
         .name = "export_mesh",
@@ -19,8 +25,8 @@ pub fn build(b: *std.Build) !void {
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
             .imports = &.{
-                .{ .name = "blend_catalog", .module = blend_catalog },
-                .{ .name = "mesh_wire", .module = mesh_wire },
+                .{ .name = "blend_file", .module = blend_file },
+                .{ .name = "mesh_export_codec", .module = mesh_export_codec },
             },
         }),
     });

@@ -79,7 +79,7 @@ pub const SensorSource = enum(u8) { simulated, plugin };
 pub const SimSceneCatalog = enum(u8) {
     /// Committed `src/simulator/scenes.bin`.
     embedded_bin = 0,
-    /// Read SIMDB bytes from `sim_scene_catalog_path` at runtime.
+    /// Read a scene-catalog DNA document from `sim_scene_catalog_path` at runtime.
     file = 1,
 };
 pub const path_max = 256;

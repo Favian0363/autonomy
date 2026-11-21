@@ -1,7 +1,6 @@
 //! Minimal .blend reader for scene export. Pinned to Blender 4.x file format.
 const std = @import("std");
-const types = @import("types.zig");
-const database = @import("database.zig");
+const types = @import("types");
 
 pub const pinned_version_major: u8 = 4;
 
@@ -113,10 +112,8 @@ pub const BlendFile = struct {
                 self.allocator.free(mesh.triangles);
             }
             if (mesh.positions.len == 0 and props.hx != null and props.hy != null and props.hz != null) {
-                const box = database.boxMesh(props.hx.?, props.hy.?, props.hz.?);
-                var box_positions: [8]types.Vec3 = undefined;
-                for (box.positions, &box_positions) |p, *out| out.* = .{ p[0], p[1], p[2] };
-                mesh.positions = try self.allocator.dupe(types.Vec3, &box_positions);
+                const box = boxMesh(props.hx.?, props.hy.?, props.hz.?);
+                mesh.positions = try self.allocator.dupe(types.Vec3, &box.positions);
                 mesh.triangles = try self.allocator.dupe(types.Triangle, &box.triangles);
             }
             try out.append(self.allocator, .{
@@ -202,6 +199,22 @@ pub const Block = struct {
     sdna_index: u32,
     data: []const u8,
 };
+
+fn boxMesh(hx: f64, hy: f64, hz: f64) struct { positions: [8]types.Vec3, triangles: [12]types.Triangle } {
+    const positions = [_]types.Vec3{
+        .{ -hx, -hy, -hz }, .{ hx, -hy, -hz }, .{ hx, hy, -hz }, .{ -hx, hy, -hz },
+        .{ -hx, -hy, hz },  .{ hx, -hy, hz },  .{ hx, hy, hz },  .{ -hx, hy, hz },
+    };
+    const triangles = [_]types.Triangle{
+        .{ .a = 0, .b = 1, .c = 2 }, .{ .a = 0, .b = 2, .c = 3 },
+        .{ .a = 4, .b = 6, .c = 5 }, .{ .a = 4, .b = 7, .c = 6 },
+        .{ .a = 0, .b = 4, .c = 5 }, .{ .a = 0, .b = 5, .c = 1 },
+        .{ .a = 2, .b = 6, .c = 7 }, .{ .a = 2, .b = 7, .c = 3 },
+        .{ .a = 0, .b = 3, .c = 7 }, .{ .a = 0, .b = 7, .c = 4 },
+        .{ .a = 1, .b = 5, .c = 6 }, .{ .a = 1, .b = 6, .c = 2 },
+    };
+    return .{ .positions = positions, .triangles = triangles };
+}
 
 fn readName(allocator: std.mem.Allocator, layout: SDNAStruct, elem: []const u8) ![]u8 {
     return allocator.dupe(u8, readNameStatic(layout, elem));

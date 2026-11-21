@@ -19,11 +19,11 @@ fn objectBounds(slot: database.BodySlot, lo: *types.Vec3, hi: *types.Vec3) void 
     @setFloatMode(.strict);
     lo.* = @splat(std.math.inf(f64));
     hi.* = @splat(-std.math.inf(f64));
-    const count = database.ownedCount(slot.db.colliders, slot.slot);
+    const count = database.rna.owned(slot.colliders, slot.slot);
     for (0..count) |ki| {
-        const c = database.colliderAt(slot.db, slot.slot, ki);
+        const c = database.rna.ownedAt(slot.colliders, slot.slot, ki);
         const pose = database.poseOf(c.pos, c.quat);
-        const shape = database.shapeFrom(slot.db, c);
+        const shape = database.shapeFrom(slot, c);
         switch (shape) {
             .mesh => |mesh| {
                 for (mesh.positions) |position| extend(lo, hi, S.point(pose, S.fromAbi3(position)));
@@ -177,12 +177,12 @@ fn assemble(self: *State, scene: *const Scene) void {
     const tracking_index = if (scene.routing.get(.pose)) |ref| @backingInt(ref) else null;
     const tracking = if (tracking_index) |index| self.samples[index].value else null;
     if (tracking) |value| {
-        const mount = database.poseOf(database.sensorAt(robot.db, robot.slot, tracking_index.?).pos, database.sensorAt(robot.db, robot.slot, tracking_index.?).quat);
+        const mount = database.poseOf(database.rna.ownedAt(scene.robot_catalog.sensors, robot.slot, tracking_index.?).pos, database.rna.ownedAt(scene.robot_catalog.sensors, robot.slot, tracking_index.?).quat);
         out.body.quat = S.multiply(value.pose.pose.quat, S.conjugate(mount.quat));
         out.attitude_axes = value.pose.axes.attitude_axes;
     }
     if (scene.routing.get(.imu)) |ref| if (self.samples[@backingInt(ref)].value) |value| {
-        const s = database.sensorAt(robot.db, robot.slot, @intCast(@backingInt(ref)));
+        const s = database.rna.ownedAt(scene.robot_catalog.sensors, robot.slot, @intCast(@backingInt(ref)));
         const mount = database.poseOf(s.pos, s.quat);
         out.imu = S.multiply(value.imu.orientation, S.conjugate(mount.quat));
         out.gyro = S.rotate(mount.quat, value.imu.gyro);
@@ -193,7 +193,7 @@ fn assemble(self: *State, scene: *const Scene) void {
         }
     };
     if (tracking) |value| {
-        const s = database.sensorAt(robot.db, robot.slot, tracking_index.?);
+        const s = database.rna.ownedAt(scene.robot_catalog.sensors, robot.slot, tracking_index.?);
         const mount = database.poseOf(s.pos, s.quat);
         if (out.attitude_axes == 7 or S.norm(mount.pos) == 0) {
             out.body.pos = S.sub(value.pose.pose.pos, S.rotate(out.body.quat, mount.pos));
@@ -201,7 +201,7 @@ fn assemble(self: *State, scene: *const Scene) void {
         }
     }
     if (scene.routing.get(.pressure)) |ref| if (self.samples[@backingInt(ref)].value) |value| {
-        const s = database.sensorAt(robot.db, robot.slot, @intCast(@backingInt(ref)));
+        const s = database.rna.ownedAt(scene.robot_catalog.sensors, robot.slot, @intCast(@backingInt(ref)));
         const mount = database.poseOf(s.pos, s.quat);
         out.depth = value.pressure;
         out.depth_ok = true;
@@ -212,7 +212,7 @@ fn assemble(self: *State, scene: *const Scene) void {
     };
     if (scene.routing.get(.camera)) |ref| {
         const index = @backingInt(ref);
-        const record = database.sensorAt(robot.db, robot.slot, index);
+        const record = database.rna.ownedAt(scene.robot_catalog.sensors, robot.slot, index);
         const camera = cameraFrom(record);
         out.image_width = camera.width;
         out.image_height = camera.height;
@@ -225,7 +225,6 @@ fn assemble(self: *State, scene: *const Scene) void {
 }
 
 pub fn sample(runtime: *Session) void {
-    @setFloatMode(.strict);
     const self = &runtime.sensors;
     const scene = &runtime.scene;
     const bodies = runtime.backend.states;
@@ -235,7 +234,7 @@ pub fn sample(runtime: *Session) void {
     const dt = scene.settings.timestep();
     const robot = scene.robot();
     for (0..scene.sensor_len) |index| {
-        const record = database.sensorAt(robot.db, robot.slot, index);
+        const record = database.rna.ownedAt(scene.robot_catalog.sensors, robot.slot, index);
         const reading = &self.samples[index];
         if (tick != 0 and tick % record.period_ticks != 0) continue;
         reading.* = .{ .tick = tick };

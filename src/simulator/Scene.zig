@@ -1,12 +1,13 @@
-//! Validated scene records. The runtime and MuJoCo backend borrow this scene.
 const Scene = @This();
 const std = @import("std");
 const types = @import("types.zig");
 const math = @import("support.zig");
 const database = @import("database.zig");
+const abi = @import("abi.zig");
 
 allocator: std.mem.Allocator,
 settings: types.Settings,
+robot_catalog: *const abi.RobotCatalog,
 objects: []const database.BodySlot,
 robot_spawn_pose: ?types.Pose = null,
 thruster_len: u8,
@@ -21,6 +22,7 @@ pub fn robot(self: *const Scene) database.BodySlot {
 
 pub fn init(
     allocator: std.mem.Allocator,
+    robot_catalog: *const abi.RobotCatalog,
     robot_slot: database.BodySlot,
     start: ?types.Pose,
     additional: []const database.BodySlot,
@@ -28,9 +30,9 @@ pub fn init(
     faults: []const types.Fault,
 ) !Scene {
     if (additional.len >= 4096) return error.SceneCapacity;
-    const thruster_count = database.ownedCount(robot_slot.db.thrusters, robot_slot.slot);
-    const hull_count = database.ownedCount(robot_slot.db.hulls, robot_slot.slot);
-    const sensor_count = database.ownedCount(robot_slot.db.sensors, robot_slot.slot);
+    const thruster_count = database.rna.owned(robot_catalog.thrusters, robot_slot.slot);
+    const hull_count = database.rna.owned(robot_catalog.hulls, robot_slot.slot);
+    const sensor_count = database.rna.owned(robot_catalog.sensors, robot_slot.slot);
     if (thruster_count > types.thruster_count or hull_count > types.max_hulls or sensor_count > 64)
         return error.SceneCapacity;
 
@@ -44,6 +46,7 @@ pub fn init(
     var scene: Scene = .{
         .allocator = allocator,
         .settings = settings,
+        .robot_catalog = robot_catalog,
         .objects = objects,
         .robot_spawn_pose = start,
         .thruster_len = @intCast(thruster_count),
@@ -52,9 +55,9 @@ pub fn init(
         .faults = owned_faults,
     };
     for (objects, 0..) |body, i| {
-        if (body.slot >= body.db.entities.len) return error.InvalidSlot;
+        if (body.slot >= body.entities.len) return error.InvalidSlot;
         for (objects[i + 1 ..]) |other| {
-            if (body.db == other.db and body.slot == other.slot) return error.InvalidSlot;
+            if (body.entities.ptr == other.entities.ptr and body.slot == other.slot) return error.InvalidSlot;
         }
     }
     try scene.validate();
@@ -70,12 +73,12 @@ pub fn deinit(self: *Scene) void {
 pub fn initialPose(self: *const Scene, index: usize) types.Pose {
     const o = self.objects[index];
     const override = if (index == 0) self.robot_spawn_pose else null;
-    return database.entityInitialPose(o.db, o.slot, override);
+    return database.entityInitialPose(o, override);
 }
 
 pub fn centerOfMass(self: *const Scene, index: usize) types.Pose {
     const o = self.objects[index];
-    return database.entityCenterOfMass(o.db, o.slot);
+    return database.entityCenterOfMass(o);
 }
 
 fn validate(self: *Scene) !void {
@@ -87,7 +90,7 @@ fn validate(self: *Scene) !void {
 
     for (self.objects, 0..) |object, i| {
         const e = database.entity(object);
-        const name = database.entityName(object.db, object.slot);
+        const name = database.rna.string(object.strings, database.entity(object).*);
         if (e.id == std.math.maxInt(u32) or name.len >= 64 or
             !math.finite3(math.fromAbi3(e.initial_velocity)) or !math.finite3(math.fromAbi3(e.initial_angular_velocity)) or
             !math.finite3(math.fromAbi3(e.inertia)) or !math.finite3(math.fromAbi3(e.buoyancy)) or
@@ -98,36 +101,36 @@ fn validate(self: *Scene) !void {
             !(positive(e.mass) and positive(e.inertia[0]) and positive(e.inertia[1]) and positive(e.inertia[2])))
             return error.InvalidBody;
         try math.validPose(self.initialPose(i));
-        try math.validPose(database.entityCenterOfMass(object.db, object.slot));
+        try math.validPose(database.entityCenterOfMass(object));
         for (self.objects[0..i]) |other| if (e.id == database.entity(other).id) return error.DuplicateBodyId;
-        const collider_count = database.ownedCount(object.db.colliders, object.slot);
+        const collider_count = database.rna.owned(object.colliders, object.slot);
         if (collider_count == 0 or collider_count > 1024) return error.InvalidColliders;
-        for (0..collider_count) |k| try validateCollider(object.db, database.colliderAt(object.db, object.slot, k));
+        for (0..collider_count) |k| try validateCollider(object, database.rna.ownedAt(object.colliders, object.slot, k));
     }
     const robot_slot = self.robot();
     for (0..self.thruster_len) |index| {
-        const t = database.thrusterAt(robot_slot.db, robot_slot.slot, index);
+        const t = database.rna.ownedAt(self.robot_catalog.thrusters, robot_slot.slot, index);
         if (t.body >= self.objects.len or !math.finite3(math.fromAbi3(t.position)) or !math.finite3(math.fromAbi3(t.direction)) or
             @abs(math.norm(math.fromAbi3(t.direction)) - 1) >= 1e-4 or !positive(t.max_rpm) or !positive(t.diameter) or !positive(t.inertia) or
             !std.math.isFinite(t.thrust) or !std.math.isFinite(t.torque) or !nonnegative(t.kp) or !nonnegative(t.ki) or
             (t.command_sign != 1 and t.command_sign != -1)) return error.InvalidThruster;
     }
-    const hull_count = database.ownedCount(robot_slot.db.hulls, robot_slot.slot);
+    const hull_count = database.rna.owned(self.robot_catalog.hulls, robot_slot.slot);
     for (0..hull_count) |index| {
-        const h = database.hullAt(robot_slot.db, robot_slot.slot, index);
+        const h = database.rna.ownedAt(self.robot_catalog.hulls, robot_slot.slot, index);
         if (h.body >= self.objects.len or h.vertex_count == 0 or h.vertex_count % 3 != 0 or
             !math.finite3(math.fromAbi3(h.drag)) or !math.finite3(math.fromAbi3(h.skin)) or !math.finite3(math.fromAbi3(h.centroid)) or !nonnegative(h.volume))
             return error.InvalidHull;
         try math.validPose(database.poseOf(h.pos, h.quat));
         try math.validPose(.{ .quat = math.fromAbi4(h.coefficient_frame) });
-        const positions = database.vertexSlice(robot_slot.db, h.vertex_start, h.vertex_count);
+        const positions = database.rna.vec3s(robot_slot.positions, h.vertex_start, h.vertex_count);
         for (positions) |position| if (!math.finite3(math.fromAbi3(position))) return error.InvalidHull;
     }
     for (0..self.sensor_len) |index| {
-        const sensor = database.sensorAt(robot_slot.db, robot_slot.slot, index);
+        const sensor = database.rna.ownedAt(self.robot_catalog.sensors, robot_slot.slot, index);
         if (sensor.body >= self.objects.len or sensor.period_ticks == 0) return error.InvalidSensor;
         try math.validPose(database.poseOf(sensor.pos, sensor.quat));
-        for (0..index) |other| if (sensor.id == database.sensorAt(robot_slot.db, robot_slot.slot, other).id) return error.DuplicateSensorId;
+        for (0..index) |other| if (sensor.id == database.rna.ownedAt(self.robot_catalog.sensors, robot_slot.slot, other).id) return error.DuplicateSensorId;
         if (database.sensorKind(sensor) == .camera) {
             if (sensor.width == 0 or sensor.height == 0 or sensor.width > 65536 or sensor.height > 65536 or
                 !positive(sensor.horizontal_fov) or sensor.horizontal_fov >= 180 or
@@ -138,7 +141,7 @@ fn validate(self: *Scene) !void {
     }
     var routed_body: ?types.BodyIndex = null;
     for (self.routing.values) |ref| if (ref) |sensor_index| {
-        const body_index: types.BodyIndex = @enumFromInt(database.sensorAt(robot_slot.db, robot_slot.slot, @intCast(@backingInt(sensor_index))).body);
+        const body_index: types.BodyIndex = @enumFromInt(database.rna.ownedAt(self.robot_catalog.sensors, robot_slot.slot, @intCast(@backingInt(sensor_index))).body);
         if (routed_body) |previous| if (body_index != previous) return error.InvalidSensorRouting;
         routed_body = body_index;
     };
@@ -158,16 +161,16 @@ fn validate(self: *Scene) !void {
 fn sensorIs(self: *const Scene, ref: types.SensorIndex, kind: types.SensorKind) bool {
     const index = @backingInt(ref);
     const robot_slot = self.robot();
-    return index < self.sensor_len and database.sensorKind(database.sensorAt(robot_slot.db, robot_slot.slot, index)) == kind;
+    return index < self.sensor_len and database.sensorKind(database.rna.ownedAt(self.robot_catalog.sensors, robot_slot.slot, index)) == kind;
 }
 
-fn validateCollider(db: *const database.Database, c: *const database.Collider) !void {
+fn validateCollider(slot: database.BodySlot, c: *const database.Collider) !void {
     const pose = database.poseOf(c.pos, c.quat);
     try math.validPose(pose);
     if (!math.finite3(math.fromAbi3(c.size)) or !math.finite3(math.fromAbi3(c.drag)) or !math.finite3(math.fromAbi3(c.skin)) or
         !nonnegative(c.friction) or !nonnegative(c.restitution) or c.restitution > 1)
         return error.InvalidCollider;
-    const shape = database.shapeFrom(db, c);
+    const shape = database.shapeFrom(slot, c);
     switch (shape) {
         .mesh => |mesh| {
             if (mesh.positions.len < 4 or mesh.positions.len > 1000000 or
