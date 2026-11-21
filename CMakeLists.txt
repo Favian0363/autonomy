@@ -60,6 +60,8 @@ target_link_libraries(auv_stonefish_sim PRIVATE
 
 set_target_properties(auv_stonefish_sim PROPERTIES
   BUILD_RPATH "${STONEFISH_DIR}/lib"
+  INSTALL_RPATH "\$ORIGIN/../../build/stonefish/lib"
+  BUILD_WITH_INSTALL_RPATH FALSE
 )
 
 install(

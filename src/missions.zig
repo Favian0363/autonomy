@@ -1,7 +1,8 @@
 const std = @import("std");
 const math = @import("math.zig");
-const MissionContext = @import("MissionContext.zig");
 const Auv = @import("Auv.zig");
+const MissionContext = @import("MissionContext.zig");
+const MissionIO = @import("MissionIO.zig");
 const c = Auv.c;
 
 pub fn teleopMission(ctx: *MissionContext) !void {
@@ -10,8 +11,8 @@ pub fn teleopMission(ctx: *MissionContext) !void {
 
     while (true) {
         if (ctx.telemetry.takeTeleopCommand()) |command| {
-            const next_translation: math.Vector3f = command.translation;
-            const next_orientation: math.Quaternionf = command.orientation;
+            const next_translation = MissionIO.teleopTranslation(command);
+            const next_orientation = MissionIO.teleopOrientation(command);
             const translation_finite = std.math.isFinite(next_translation[0]) and
                 std.math.isFinite(next_translation[1]) and
                 std.math.isFinite(next_translation[2]);
@@ -32,6 +33,11 @@ pub fn teleopMission(ctx: *MissionContext) !void {
         }
         try ctx.yieldUntilNextFrameAndUpdate();
     }
+}
+
+pub fn thrusterControl(ctx: *MissionContext) !void {
+    ctx.step = "direct_thruster_control";
+    while (true) try ctx.yieldUntilNextFrameAndUpdate();
 }
 
 pub fn missionControl(ctx: *MissionContext) !void {

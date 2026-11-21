@@ -4,6 +4,36 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
 
     const optimize = b.standardOptimizeOption(.{});
+    const sim_types = b.createModule(.{
+        .root_source_file = b.path("src/simulator/types.zig"),
+        .target = b.graph.host,
+    });
+    const blend_file = b.createModule(.{
+        .root_source_file = b.path("src/simulator/BlendFile.zig"),
+        .target = b.graph.host,
+        .imports = &.{.{ .name = "types", .module = sim_types }},
+    });
+    const mesh_export_codec = b.createModule(.{
+        .root_source_file = b.path("src/simulator/MeshExportCodec.zig"),
+        .target = b.graph.host,
+        .imports = &.{.{ .name = "types", .module = sim_types }},
+    });
+    const export_mesh = b.addExecutable(.{
+        .name = "export_mesh",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/export_mesh/main.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "blend_file", .module = blend_file },
+                .{ .name = "mesh_export_codec", .module = mesh_export_codec },
+            },
+        }),
+    });
+    const install_export_mesh = b.addInstallArtifact(export_mesh, .{});
+    const export_mesh_step = b.step("export-mesh", "Export one Blender object mesh to a .meshbin file");
+    export_mesh_step.dependOn(&install_export_mesh.step);
+
     const cxx = b.option([]const u8, "cxx", "System C++ compiler") orelse "g++";
     const zed_prefix = b.option([]const u8, "zed-prefix", "ZED SDK install prefix") orelse "/usr/local/zed";
     const cuda_prefix = b.option([]const u8, "cuda-prefix", "CUDA install prefix") orelse "/usr/local/cuda";
@@ -23,53 +53,77 @@ pub fn build(b: *std.Build) !void {
         }),
     });
 
-    exe.root_module.link_libc = true;
-    exe.root_module.addIncludePath(b.path("include"));
-    exe.root_module.addCSourceFile(.{
-        .file = b.path("auvs/trap_sim/auv.c"),
-    });
-    b.installArtifact(exe);
-    const teleop_sender = b.addExecutable(.{
-        .name = "teleop_sender",
-        .root_module = b.createModule(.{
+    const simulator = b.option(bool, "simulator", "Compile the native Zig/MuJoCo simulator") orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "simulator", simulator);
+    exe.root_module.addOptions("build_options", build_options);
+    var mujoco_build_step: ?*std.Build.Step = null;
+    if (simulator) {
+        const cmake_configure = b.addSystemCommand(&.{
+            "cmake",
+            "-S",
+            "vendor/mujoco",
+            "-B",
+            "vendor/mujoco/build",
+            "-DMUJOCO_BUILD_EXAMPLES=OFF",
+            "-DMUJOCO_BUILD_SIMULATE=OFF",
+            "-DMUJOCO_BUILD_STUDIO=OFF",
+            "-DMUJOCO_BUILD_TESTS=OFF",
+            "-DMUJOCO_TEST_PYTHON_UTIL=OFF",
+        });
+        const cmake_build = b.addSystemCommand(&.{
+            "cmake",
+            "--build",
+            "vendor/mujoco/build",
+            "--target",
+            "mujoco",
+            "--parallel",
+        });
+        cmake_build.step.dependOn(&cmake_configure.step);
+        mujoco_build_step = &cmake_build.step;
+
+        const headers = b.path("vendor/mujoco/include");
+        const library = b.path("vendor/mujoco/build/lib/libmujoco.so");
+        const mujoco_c = b.addTranslateC(.{
+            .root_source_file = b.path("vendor/mujoco/include/mujoco/mujoco.h"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        }),
-    });
-    teleop_sender.root_module.addCSourceFile(.{
-        .file = b.path("tools/teleop_sender/main.cpp"),
-        .flags = &.{ "-std=c++17", "-Wall", "-Wextra" },
-    });
-    teleop_sender.root_module.linkSystemLibrary("SDL2", .{ .use_pkg_config = .force });
+        });
+        mujoco_c.addIncludePath(headers);
+        exe.root_module.addImport("mujoco_c", mujoco_c.createModule());
+        exe.root_module.addObjectFile(library);
+        exe.root_module.addRPath(library.dirname());
+        exe.root_module.addRPathSpecial("$ORIGIN/../../vendor/mujoco/build/lib");
+        exe.step.dependOn(mujoco_build_step.?);
+    }
 
-    const install_teleop_sender = b.addInstallArtifact(teleop_sender, .{});
-    const teleop_sender_step = b.step("teleop-sender", "Build the optional SDL2 keyboard teleop sender");
-    teleop_sender_step.dependOn(&install_teleop_sender.step);
-
-    const mission_io = b.createModule(.{
-        .root_source_file = b.path("src/MissionIO.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    mission_io.addIncludePath(b.path("include"));
-
+    exe.root_module.link_libc = true;
+    exe.root_module.addIncludePath(b.path("include"));
+    b.installArtifact(exe);
     const raylib_dep = b.dependency("raylib_zig", .{
         .target = target,
         .optimize = optimize,
     });
+    const raylib = raylib_dep.module("raylib");
+    if (simulator) exe.root_module.addImport("raylib", raylib);
+    const visualizer = b.createModule(.{
+        .root_source_file = b.path("src/Visualizer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "raylib", .module = raylib }},
+    });
+    visualizer.addIncludePath(b.path("include"));
     const viewer_mod = b.createModule(.{
         .root_source_file = b.path("tools/viewer/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "raylib", .module = raylib_dep.module("raylib") },
-            .{ .name = "MissionIO", .module = mission_io },
+            .{ .name = "raylib", .module = raylib },
+            .{ .name = "Visualizer", .module = visualizer },
         },
     });
-    viewer_mod.linkLibrary(raylib_dep.artifact("raylib"));
     const viewer = b.addExecutable(.{
         .name = "viewer",
         .root_module = viewer_mod,
@@ -132,32 +186,46 @@ pub fn build(b: *std.Build) !void {
 
     run_cmd.addPassthruArgs();
 
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
-    const test_step = b.step("test", "Run tests");
-    // test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-
-    const viewer_ui_test_mod = b.createModule(.{
-        .root_source_file = b.path("tools/viewer/ui.zig"),
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{
-            .{ .name = "raylib", .module = raylib_dep.module("raylib") },
-            .{ .name = "MissionIO", .module = mission_io },
-        },
     });
-    viewer_ui_test_mod.linkLibrary(raylib_dep.artifact("raylib"));
-    const viewer_ui_tests = b.addTest(.{ .root_module = viewer_ui_test_mod });
+    test_module.addIncludePath(b.path("include"));
+    for (exe.root_module.import_table.keys(), exe.root_module.import_table.values()) |name, module| test_module.addImport(name, module);
+    for (exe.root_module.link_objects.items) |object| if (object == .static_path) try test_module.link_objects.append(b.allocator, object);
+    for (exe.root_module.rpaths.items) |path| try test_module.rpaths.append(b.allocator, path);
+    const exe_tests = b.addTest(.{ .root_module = test_module });
+    if (mujoco_build_step) |step| exe_tests.step.dependOn(step);
+
+    const run_exe_tests = b.addRunArtifact(exe_tests);
+
+    // Independent test suites run in parallel.
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_exe_tests.step);
+
+    const integration = b.addSystemCommand(&.{"python3"});
+    integration.addFileArg(b.path("tests/serial_integration.py"));
+    integration.addArtifactArg(exe);
+    test_step.dependOn(&integration.step);
+
+    for ([_][]const u8{ "pending", "slow", "init_fail", "frame_fail" }, 0..) |name, mode| {
+        const fixture = b.addLibrary(.{ .name = b.fmt("control_sensor_{s}", .{name}), .linkage = .dynamic, .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+        fixture.root_module.addCSourceFile(.{ .file = b.path("tests/control_sensor.c"), .flags = &.{b.fmt("-DTEST_MODE={d}", .{mode})} });
+        integration.addArtifactArg(fixture);
+    }
+
+    const firmware_tests = b.addExecutable(.{
+        .name = "firmware_test",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }),
+    });
+    firmware_tests.root_module.addIncludePath(b.path("tests/firmware_stubs"));
+    firmware_tests.root_module.addCSourceFile(.{ .file = b.path("tests/firmware_test.cpp"), .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" } });
+    const run_firmware_tests = b.addRunArtifact(firmware_tests);
+    test_step.dependOn(&run_firmware_tests.step);
+
+    const viewer_ui_tests = b.addTest(.{ .root_module = visualizer });
     const run_viewer_ui_tests = b.addRunArtifact(viewer_ui_tests);
     test_step.dependOn(&run_viewer_ui_tests.step);
 
@@ -204,29 +272,6 @@ pub fn build(b: *std.Build) !void {
     const arduino_step = b.step("arduino", "Compile the Proteus Arduino sketch");
     arduino_step.dependOn(&arduino_compile.step);
 
-    const arduino_sender = b.addExecutable(.{
-        .name = "arduino_sender",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    arduino_sender.root_module.link_libc = true;
-    arduino_sender.root_module.link_libcpp = true;
-    arduino_sender.root_module.addCSourceFile(.{
-        .file = b.path("auvs/proteus_hwd/arduino_sender.cpp"),
-        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
-    });
-    arduino_sender.root_module.addCSourceFile(.{
-        .file = b.path("auvs/proteus_hwd/arduino.cpp"),
-        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
-    });
-    const install_arduino_sender = b.addInstallArtifact(arduino_sender, .{});
-    b.getInstallStep().dependOn(&install_arduino_sender.step);
-
-    const arduino_sender_step = b.step("arduino-sender", "Build the Arduino sender executable");
-    arduino_sender_step.dependOn(&install_arduino_sender.step);
-
     const lib_auv_stationary_sim = b.addLibrary(.{
         .name = "auv_stationary_sim",
         .root_module = b.createModule(.{
@@ -241,6 +286,35 @@ pub fn build(b: *std.Build) !void {
         .flags = &.{"-fPIC"},
     });
     b.installArtifact(lib_auv_stationary_sim);
+    const test_paths = b.addOptions();
+    test_paths.addOptionPath("sensor", lib_auv_stationary_sim.getEmittedBin());
+    test_module.addOptions("test_paths", test_paths);
+    integration.addArtifactArg(lib_auv_stationary_sim);
+    integration.addArg(if (simulator) "simulated" else "hardware");
+    const fast_sensor = b.addLibrary(.{
+        .name = "auv_fast_sensor",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    fast_sensor.root_module.addCSourceFile(.{ .file = b.path("auvs/stationary_sim/auv.c"), .flags = &.{ "-fPIC", "-DFRAME_INTERVAL_NS=0" } });
+    integration.addArtifactArg(fast_sensor);
+    test_paths.addOptionPath("fast_sensor", fast_sensor.getEmittedBin());
+
+    const complete_sensor = b.addLibrary(.{
+        .name = "control_sensor_complete",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    complete_sensor.root_module.addCSourceFile(.{ .file = b.path("tests/control_sensor.c"), .flags = &.{"-DTEST_MODE=4"} });
+    integration.addArtifactArg(complete_sensor);
+
+    const deadline_sensor = b.addLibrary(.{
+        .name = "auv_deadline_sensor",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    deadline_sensor.root_module.addCSourceFile(.{ .file = b.path("auvs/stationary_sim/auv.c"), .flags = &.{"-DFRAME_INTERVAL_NS=2000000000ULL"} });
+    integration.addArtifactArg(deadline_sensor);
 
     const zed = b.option(bool, "zed", "Build the ZED camera plugin (requires ZED SDK and CUDA)") orelse false;
     const zed_rtp = b.option(bool, "zed-rtp", "Enable standard RTP relay in the ZED plugin (SDK >= 5.4 and GStreamer)") orelse false;
@@ -261,10 +335,8 @@ pub fn build(b: *std.Build) !void {
         }
         lib_auv_proteus_hwd.addFileArg(b.path("auvs/proteus_hwd/auv.cpp"));
         lib_auv_proteus_hwd.addFileArg(b.path("auvs/proteus_hwd/object_map.cpp"));
-        lib_auv_proteus_hwd.addFileArg(b.path("auvs/proteus_hwd/arduino.cpp"));
         lib_auv_proteus_hwd.addFileInput(b.path("auvs/proteus_hwd/object_map.hpp"));
         lib_auv_proteus_hwd.addFileInput(b.path("auvs/proteus_hwd/coordinates.hpp"));
-        lib_auv_proteus_hwd.addFileInput(b.path("auvs/proteus_hwd/arduino.hpp"));
         lib_auv_proteus_hwd.addFileInput(b.path("include/auv.h"));
         lib_auv_proteus_hwd.addFileInput(b.path("include/object_classes.h"));
         lib_auv_proteus_hwd.addFileInput(b.path("include/math.h"));
@@ -331,6 +403,14 @@ pub fn build(b: *std.Build) !void {
         install_stonefish_sim.step.dependOn(&cmake_build.step);
 
         b.getInstallStep().dependOn(&install_stonefish_sim.step);
+
+        // Host + dlopen'd plugin can find libStonefish.so without LD_LIBRARY_PATH.
+        exe.root_module.addRPath(b.path("build/stonefish/lib"));
+        exe.root_module.addRPath(b.path("zig-out/lib"));
+        exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+        exe.root_module.addRPathSpecial("$ORIGIN/../../build/stonefish/lib");
+        exe.step.dependOn(&install_stonefish_sim.step);
+        run_cmd.step.dependOn(&install_stonefish_sim.step);
     }
 
     cmake_build.step.dependOn(&cmake_configure.step);

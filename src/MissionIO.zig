@@ -4,253 +4,7 @@ const Io = std.Io;
 const math = @import("math.zig");
 const Auv = @import("Auv.zig");
 const MissionConfig = @import("MissionConfig.zig");
-
-var stop_requested = std.atomic.Value(bool).init(false);
-
-fn requestStop() void {
-    stop_requested.store(true, .monotonic);
-}
-
-pub fn stopRequested() bool {
-    return stop_requested.load(.monotonic);
-}
-
-const windows_ctrl_c_event: u32 = 0;
-const windows_ctrl_break_event: u32 = 1;
-const windows_ctrl_close_event: u32 = 2;
-const windows_ctrl_logoff_event: u32 = 5;
-const windows_ctrl_shutdown_event: u32 = 6;
-
-fn windowsConsoleHandler(ctrl_type: u32) callconv(.winapi) std.os.windows.BOOL {
-    switch (ctrl_type) {
-        windows_ctrl_c_event,
-        windows_ctrl_break_event,
-        windows_ctrl_close_event,
-        windows_ctrl_logoff_event,
-        windows_ctrl_shutdown_event,
-        => requestStop(),
-        else => return .FALSE,
-    }
-    return .TRUE;
-}
-
-extern "kernel32" fn SetConsoleCtrlHandler(
-    handler: ?*const fn (u32) callconv(.winapi) std.os.windows.BOOL,
-    add: std.os.windows.BOOL,
-) callconv(.winapi) std.os.windows.BOOL;
-
-pub fn installStopHandlers() void {
-    if (builtin.os.tag == .windows) {
-        _ = SetConsoleCtrlHandler(&windowsConsoleHandler, .TRUE);
-    } else {
-        const stop: std.posix.Sigaction = .{
-            .handler = .{ .handler = struct {
-                fn handle(_: std.posix.SIG) callconv(.c) void {
-                    requestStop();
-                }
-            }.handle },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        std.posix.sigaction(.INT, &stop, null);
-        std.posix.sigaction(.TERM, &stop, null);
-    }
-}
-
-const SharedMemory = struct {
-    const is_windows = builtin.os.tag == .windows;
-    const page_alignment = std.heap.page_size_min;
-    const NativeHandle = if (is_windows) std.os.windows.HANDLE else std.posix.fd_t;
-
-    handle: NativeHandle,
-    memory: []align(page_alignment) u8,
-    owner: bool,
-    name: [128:0]u8,
-    name_len: usize,
-
-    pub fn create(name: []const u8, size: usize) !SharedMemory {
-        if (size == 0) return error.InvalidSize;
-        var normalized: [128:0]u8 = undefined;
-        const normalized_len = try normalizeName(name, &normalized);
-        if (is_windows) {
-            return createWindows(normalized, normalized_len, size);
-        }
-        return createPosix(normalized, normalized_len, size);
-    }
-
-    pub fn open(name: []const u8, size: usize) !SharedMemory {
-        if (size == 0) return error.InvalidSize;
-        var normalized: [128:0]u8 = undefined;
-        const normalized_len = try normalizeName(name, &normalized);
-        if (is_windows) {
-            return openWindows(normalized, normalized_len, size);
-        }
-        return openPosix(normalized, normalized_len, size);
-    }
-
-    pub fn unlinkName(name: []const u8) void {
-        var normalized: [128:0]u8 = undefined;
-        const normalized_len = normalizeName(name, &normalized) catch return;
-        if (is_windows) return;
-        _ = std.c.shm_unlink(normalized[0..normalized_len :0].ptr);
-    }
-
-    pub fn deinit(self: *SharedMemory) void {
-        if (is_windows) {
-            _ = UnmapViewOfFile(self.memory.ptr);
-            _ = CloseHandle(self.handle);
-        } else {
-            std.posix.munmap(self.memory);
-            _ = std.c.close(self.handle);
-        }
-        self.* = undefined;
-    }
-
-    pub fn unlink(self: *SharedMemory) void {
-        if (is_windows or !self.owner) return;
-        _ = std.c.shm_unlink(self.name[0..self.name_len :0].ptr);
-    }
-
-    fn normalizeName(name: []const u8, out: *[128:0]u8) !usize {
-        if (name.len == 0) return error.InvalidName;
-        const prefix = if (is_windows) "Local\\" else "/";
-        const skip_prefix = if (is_windows)
-            std.mem.startsWith(u8, name, "Local\\")
-        else
-            std.mem.startsWith(u8, name, "/");
-        const needed = name.len + if (skip_prefix) 0 else prefix.len;
-        if (needed > out.len) return error.NameTooLong;
-        var at: usize = 0;
-        if (!skip_prefix) {
-            @memcpy(out[0..prefix.len], prefix);
-            at = prefix.len;
-        }
-        @memcpy(out[at..needed], name);
-        out[needed] = 0;
-        return needed;
-    }
-
-    fn createPosix(name: [128:0]u8, name_len: usize, size: usize) !SharedMemory {
-        if (is_windows) unreachable;
-        const zname = name[0..name_len :0];
-        const flags: std.posix.O = .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true };
-        const fd = std.c.shm_open(zname.ptr, @bitCast(flags), 0o600);
-        if (fd < 0) return if (std.c.errno(fd) == .EXIST) error.AlreadyExists else error.CreateFailed;
-        errdefer _ = std.c.close(fd);
-        if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.ResizeFailed;
-        const memory = try std.posix.mmap(
-            null,
-            size,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED },
-            fd,
-            0,
-        );
-        errdefer std.posix.munmap(memory);
-        @memset(memory, 0);
-        return .{
-            .handle = fd,
-            .memory = memory,
-            .owner = true,
-            .name = name,
-            .name_len = name_len,
-        };
-    }
-
-    fn openPosix(name: [128:0]u8, name_len: usize, size: usize) !SharedMemory {
-        if (is_windows) unreachable;
-        const zname = name[0..name_len :0];
-        const flags: std.posix.O = .{ .ACCMODE = .RDONLY };
-        const fd = std.c.shm_open(zname.ptr, @bitCast(flags), 0);
-        if (fd < 0) return error.OpenFailed;
-        errdefer _ = std.c.close(fd);
-        const memory = try std.posix.mmap(
-            null,
-            size,
-            .{ .READ = true },
-            .{ .TYPE = .SHARED },
-            fd,
-            0,
-        );
-        return .{
-            .handle = fd,
-            .memory = memory,
-            .owner = false,
-            .name = name,
-            .name_len = name_len,
-        };
-    }
-
-    const invalid_handle_value: std.os.windows.HANDLE = @ptrFromInt(std.math.maxInt(usize));
-    const page_readwrite: u32 = 0x04;
-    const file_map_all_access: u32 = 0x000f001f;
-    const file_map_read: u32 = 0x00000004;
-
-    fn createWindows(name: [128:0]u8, name_len: usize, size: usize) !SharedMemory {
-        if (!is_windows) unreachable;
-        const size64: u64 = @intCast(size);
-        const handle = CreateFileMappingA(
-            invalid_handle_value,
-            null,
-            page_readwrite,
-            @intCast(size64 >> 32),
-            @truncate(size64),
-            name[0..name_len :0].ptr,
-        ) orelse return error.CreateFailed;
-        errdefer _ = CloseHandle(handle);
-        if (GetLastError() == 183) return error.AlreadyExists;
-        const raw = MapViewOfFile(handle, file_map_all_access, 0, 0, size) orelse return error.MapFailed;
-        const memory = @as([*]align(page_alignment) u8, @ptrCast(@alignCast(raw)))[0..size];
-        @memset(memory, 0);
-        return .{
-            .handle = handle,
-            .memory = memory,
-            .owner = true,
-            .name = name,
-            .name_len = name_len,
-        };
-    }
-
-    fn openWindows(name: [128:0]u8, name_len: usize, size: usize) !SharedMemory {
-        if (!is_windows) unreachable;
-        const handle = OpenFileMappingA(file_map_read, .FALSE, name[0..name_len :0].ptr) orelse
-            return error.OpenFailed;
-        errdefer _ = CloseHandle(handle);
-        const raw = MapViewOfFile(handle, file_map_read, 0, 0, size) orelse return error.MapFailed;
-        const memory = @as([*]align(page_alignment) u8, @ptrCast(@alignCast(raw)))[0..size];
-        return .{
-            .handle = handle,
-            .memory = memory,
-            .owner = false,
-            .name = name,
-            .name_len = name_len,
-        };
-    }
-
-    extern "kernel32" fn CreateFileMappingA(
-        file: std.os.windows.HANDLE,
-        attributes: ?*anyopaque,
-        protect: u32,
-        maximum_size_high: u32,
-        maximum_size_low: u32,
-        name: [*:0]const u8,
-    ) callconv(.winapi) ?std.os.windows.HANDLE;
-    extern "kernel32" fn OpenFileMappingA(
-        desired_access: u32,
-        inherit_handle: std.os.windows.BOOL,
-        name: [*:0]const u8,
-    ) callconv(.winapi) ?std.os.windows.HANDLE;
-    extern "kernel32" fn MapViewOfFile(
-        mapping: std.os.windows.HANDLE,
-        desired_access: u32,
-        offset_high: u32,
-        offset_low: u32,
-        bytes_to_map: usize,
-    ) callconv(.winapi) ?*anyopaque;
-    extern "kernel32" fn UnmapViewOfFile(address: *const anyopaque) callconv(.winapi) std.os.windows.BOOL;
-    extern "kernel32" fn CloseHandle(handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL;
-    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
-};
+const reflection = @import("simulator/ReflectionWriter.zig");
 
 /// The compiled profile definitions shared by the runtime and viewer.
 pub const CompiledConfig = MissionConfig;
@@ -337,7 +91,7 @@ pub const SerialBinary = struct {
                 std.mem.writeInt(T, &buf, value, .little);
                 try w.writeAll(&buf);
             },
-            .float => try write(w, @as(u32, @bitCast(value))),
+            .float => try write(w, @as(u32, @bitCast(@as(f32, @floatCast(value))))),
             .bool => try write(w, @as(u8, @intFromBool(value))),
             .@"enum" => |info| try write(w, @as(info.tag_type, @backingInt(value))),
             .array => |info| {
@@ -375,7 +129,13 @@ pub const SerialBinary = struct {
                 try r.readSliceAll(&buf);
                 return std.mem.readInt(T, &buf, .little);
             },
-            .float => return @bitCast(try read(r, u32)),
+            .float => {
+                const bits = try read(r, u32);
+                const narrow = @as(f32, @bitCast(bits));
+                if (T == f32) return narrow;
+                if (T == f64) return @as(f64, narrow);
+                @compileError("unsupported float type " ++ @typeName(T));
+            },
             .bool => return try read(r, u8) != 0,
             .@"enum" => |info| {
                 const raw = try read(r, info.tag_type);
@@ -439,7 +199,7 @@ pub const MissionDiynLoader = struct {
         loader.dynlib = try DynLib.open(loader.auv_path);
         errdefer loader.dynlib.close();
 
-        return .{
+        const loaded: Auv = .{
             .init_impl = loader.dynlib.lookup(
                 *const Auv.InitFunc,
                 "auv_init",
@@ -447,20 +207,104 @@ pub const MissionDiynLoader = struct {
             .yield_until_next_frame_impl = loader.dynlib.lookup(
                 *const Auv.YieldUntilNextFrameFunc,
                 "auv_yield_until_next_frame",
-            ) orelse return error.MissingAuvYieldNextFrame,
-            .set_thrustor_values_impl = loader.dynlib.lookup(
-                *const Auv.SetThrustorValuesFunc,
-                "auv_set_thrustor_values",
-            ) orelse return error.MissingAuvSetThrustorsInput,
+            ) orelse return error.MissingAuvYieldUntilNextFrame,
             .deinit_impl = loader.dynlib.lookup(
                 *const Auv.DeinitFunc,
                 "auv_deinit",
             ) orelse return error.MissingAuvDeinit,
+            .stonefish_temporal_thrusters = loader.dynlib.lookup(
+                *const Auv.StonefishTemporalSetThrusters,
+                @import("StonefishTemporalBridge.zig").symbol,
+            ),
         };
+        return loaded;
     }
 };
 
-/// Mutable control values sent by the viewer over the control socket.
+/// f32 control fields on the live-config wire; runtime `MissionConfig` stores f64.
+pub const OdometryPidWire = struct {
+    rotation_gate: f32,
+    kp: [6]f32,
+    ki: [6]f32,
+    kd: [6]f32,
+};
+
+pub const IbvsWire = struct {
+    center_deadband: f32,
+    target_height: f32,
+    interaction_cols: u8,
+    _pad: [3]u8 = .{ 0, 0, 0 },
+    interaction: [math.interaction_output_len][MissionConfig.max_ibvs_error_cols]f32,
+};
+
+fn widen3(v: [3]f32) math.Vector3f {
+    return .{ v[0], v[1], v[2] };
+}
+
+fn narrow3(v: math.Vector3f) [3]f32 {
+    return .{ @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]) };
+}
+
+fn widen6(v: [6]f32) math.Vector6f {
+    return .{ v[0], v[1], v[2], v[3], v[4], v[5] };
+}
+
+fn narrow6(v: math.Vector6f) [6]f32 {
+    return .{
+        @floatCast(v[0]),
+        @floatCast(v[1]),
+        @floatCast(v[2]),
+        @floatCast(v[3]),
+        @floatCast(v[4]),
+        @floatCast(v[5]),
+    };
+}
+
+fn odometryFromWire(wire: OdometryPidWire) MissionConfig.OdometryPid {
+    return .{
+        .rotation_gate = wire.rotation_gate,
+        .kp = widen6(wire.kp),
+        .ki = widen6(wire.ki),
+        .kd = widen6(wire.kd),
+    };
+}
+
+fn odometryToWire(odometry: MissionConfig.OdometryPid) OdometryPidWire {
+    return .{
+        .rotation_gate = @floatCast(odometry.rotation_gate),
+        .kp = narrow6(odometry.kp),
+        .ki = narrow6(odometry.ki),
+        .kd = narrow6(odometry.kd),
+    };
+}
+
+fn ibvsFromWire(wire: IbvsWire) MissionConfig.Ibvs {
+    var interaction: [math.interaction_output_len][MissionConfig.max_ibvs_error_cols]f64 = @splat(@splat(0));
+    for (&interaction, &wire.interaction) |*row, source| {
+        inline for (0..MissionConfig.max_ibvs_error_cols) |i| row[i] = source[i];
+    }
+    return .{
+        .center_deadband = wire.center_deadband,
+        .target_height = wire.target_height,
+        .interaction_cols = wire.interaction_cols,
+        .interaction = interaction,
+    };
+}
+
+fn ibvsToWire(ibvs: MissionConfig.Ibvs) IbvsWire {
+    var interaction: [math.interaction_output_len][MissionConfig.max_ibvs_error_cols]f32 = @splat(@splat(0));
+    for (&interaction, &ibvs.interaction) |*row, source| {
+        inline for (0..MissionConfig.max_ibvs_error_cols) |i| row[i] = @floatCast(source[i]);
+    }
+    return .{
+        .center_deadband = @floatCast(ibvs.center_deadband),
+        .target_height = @floatCast(ibvs.target_height),
+        .interaction_cols = ibvs.interaction_cols,
+        .interaction = interaction,
+    };
+}
+
+/// Editable runtime configuration used by the viewer and the control protocol.
 pub const LiveConfigPacket = struct {
     magic: [4]u8 = magic_value,
     wire_version: u16 = wire_version_value,
@@ -468,8 +312,8 @@ pub const LiveConfigPacket = struct {
     rotation_limit: [3]f32,
     tam: [MissionConfig.thruster_count][MissionConfig.tam_cols]f32,
     tam_len: u8,
-    odometry: MissionConfig.OdometryPid,
-    ibvs: MissionConfig.Ibvs,
+    odometry: OdometryPidWire,
+    ibvs: IbvsWire,
     goal_dist_threshold: f32,
     thrustor_saturate: f32,
     log_freq_div: u16,
@@ -478,10 +322,20 @@ pub const LiveConfigPacket = struct {
     clear_print_stuff: bool,
     telemetry_transport: TelemetryTransport,
     telemetry_addr: MissionConfig.FixedText(MissionConfig.telemetry_addr_max),
-    telemetry_shm_name: MissionConfig.FixedText(MissionConfig.telemetry_shm_name_max),
     telemetry_log_path: MissionConfig.FixedText(MissionConfig.telemetry_log_path_max),
 
-    const wire_version_value: u16 = 3;
+    mission_id: MissionConfig.MissionId,
+    mission_profile: MissionConfig.MissionProfileId,
+    sensor_source: MissionConfig.SensorSource,
+    sensor_library: MissionConfig.FixedText(MissionConfig.path_max),
+    serial_port: MissionConfig.FixedText(MissionConfig.path_max),
+    sim_robot: MissionConfig.FixedText(MissionConfig.name_max),
+    sim_scene: MissionConfig.FixedText(MissionConfig.name_max),
+    sim_realtime: bool,
+
+    revision: u64 = 0,
+
+    const wire_version_value: u16 = 7;
     const magic_value: [4]u8 = "MCF1".*;
 
     const DecodeError = error{
@@ -500,13 +354,14 @@ pub const LiveConfigPacket = struct {
         NonFinite,
     };
 
-    fn decode(buf: []const u8) DecodeError!LiveConfigPacket {
+    pub fn decode(buf: []const u8) DecodeError!LiveConfigPacket {
         if (buf.len < 4 + 2) return error.BufferTooShort;
         if (!std.mem.eql(u8, buf[0..4], &magic_value)) return error.BadMagic;
         const version = std.mem.readInt(u16, buf[4..6], .little);
         if (version != wire_version_value) return error.UnsupportedWireVersion;
 
         const parsed = SerialBinary.readFromBuffer(LiveConfigPacket, buf) catch return error.BufferTooShort;
+        if (parsed.consumed != buf.len) return error.TooLong;
         if (!std.mem.eql(u8, &parsed.value.magic, &magic_value)) return error.BadMagic;
         if (parsed.value.wire_version != wire_version_value) return error.UnsupportedWireVersion;
         return parsed.value;
@@ -526,14 +381,14 @@ pub const LiveConfigPacket = struct {
         }
     }
 
-    fn validateOdometry(odometry: *const MissionConfig.OdometryPid) ValidateError!void {
+    fn validateOdometry(odometry: *const OdometryPidWire) ValidateError!void {
         try requireFinite(odometry.rotation_gate);
         for (odometry.kp) |v| try requireFinite(v);
         for (odometry.ki) |v| try requireFinite(v);
         for (odometry.kd) |v| try requireFinite(v);
     }
 
-    fn validateIbvs(ibvs: *const MissionConfig.Ibvs) ValidateError!void {
+    fn validateIbvs(ibvs: *const IbvsWire) ValidateError!void {
         if (ibvs.interaction_cols == 0 or ibvs.interaction_cols > MissionConfig.max_ibvs_error_cols)
             return error.InvalidInteractionCols;
         try requireFinite(ibvs.center_deadband);
@@ -543,11 +398,20 @@ pub const LiveConfigPacket = struct {
         }
     }
 
-    fn validate(packet: *const LiveConfigPacket) ValidateError!void {
+    pub fn validate(packet: *const LiveConfigPacket) !void {
+        if (!std.mem.eql(u8, &packet.magic, &magic_value)) return error.BadMagic;
+        if (packet.wire_version != wire_version_value) return error.UnsupportedWireVersion;
         if (packet.tam_len == 0 or packet.tam_len > MissionConfig.thruster_count)
             return error.InvalidTamLen;
         if (packet.queue_capacity == 0 or packet.queue_capacity > MissionConfig.queue_capacity_max)
             return error.InvalidQueueCapacity;
+        var forward_energy: f32 = 0;
+        for (packet.camera_forward) |value| {
+            try requireFinite(value);
+            forward_energy += value * value;
+        }
+        if (!std.math.isFinite(forward_energy) or forward_energy <= 1e-12) return error.NonFinite;
+        for (packet.rotation_limit) |value| if (std.math.isNan(value) or value < 0) return error.NonFinite;
         try validateTam(&packet.tam, packet.tam_len);
         try validateOdometry(&packet.odometry);
         try validateIbvs(&packet.ibvs);
@@ -558,47 +422,69 @@ pub const LiveConfigPacket = struct {
                 const address = try packet.telemetry_addr.slice();
                 if (address.len == 0) return error.InvalidTextLength;
             },
-            .shared_memory => {
-                const shm_name = try packet.telemetry_shm_name.slice();
-                if (shm_name.len == 0) return error.InvalidTextLength;
-            },
-            .stdout => {},
+            .stdout, .disabled => {},
         }
         _ = try packet.telemetry_log_path.slice();
+        var config = MissionConfig.compiledProfile(packet.mission_profile).*;
+        packet.applyToRuntimeConfig(&config);
+        try config.validate();
     }
 
     pub fn fromRuntimeConfig(config: *const MissionConfig.MissionConfig) LiveConfigPacket {
+        var tam_wire: [MissionConfig.thruster_count][MissionConfig.tam_cols]f32 = @splat(@splat(0));
+        for (0..config.tam_len) |i| {
+            inline for (0..MissionConfig.tam_cols) |j| tam_wire[i][j] = @floatCast(config.tam[i][j]);
+        }
         return .{
             .magic = magic_value,
             .wire_version = wire_version_value,
-            .camera_forward = config.camera_forward,
-            .rotation_limit = config.rotation_limit,
-            .tam = config.tam,
+            .mission_id = config.mission_id,
+            .mission_profile = config.mission_profile,
+            .sensor_source = config.sensor_source,
+            .sensor_library = config.sensor_library,
+            .serial_port = config.serial_port,
+            .sim_robot = config.sim_robot,
+            .sim_scene = config.sim_scene,
+            .sim_realtime = config.sim_realtime,
+            .camera_forward = narrow3(config.camera_forward),
+            .rotation_limit = narrow3(config.rotation_limit),
+            .tam = tam_wire,
             .tam_len = config.tam_len,
-            .odometry = config.odometry,
-            .ibvs = config.ibvs,
-            .goal_dist_threshold = config.goal_dist_threshold,
-            .thrustor_saturate = config.thrustor_saturate,
+            .odometry = odometryToWire(config.odometry),
+            .ibvs = ibvsToWire(config.ibvs),
+            .goal_dist_threshold = @floatCast(config.goal_dist_threshold),
+            .thrustor_saturate = @floatCast(config.thrustor_saturate),
             .log_freq_div = config.log_freq_div,
             .queue_capacity = config.queue_capacity,
             .print_stuff = config.print_stuff,
             .clear_print_stuff = config.clear_print_stuff,
             .telemetry_transport = config.telemetry_transport,
             .telemetry_addr = config.telemetry_addr,
-            .telemetry_shm_name = config.telemetry_shm_name,
             .telemetry_log_path = config.telemetry_log_path,
         };
     }
 
-    fn applyToRuntimeConfig(dst: *MissionConfig.MissionConfig, packet: LiveConfigPacket) void {
+    pub fn applyToRuntimeConfig(packet: LiveConfigPacket, dst: *MissionConfig.MissionConfig) void {
         const teleop_port = dst.teleop_port;
 
-        dst.camera_forward = packet.camera_forward;
-        dst.rotation_limit = packet.rotation_limit;
-        dst.tam = packet.tam;
+        dst.mission_id = packet.mission_id;
+        dst.mission_profile = packet.mission_profile;
+        dst.sensor_source = packet.sensor_source;
+        dst.sensor_library = packet.sensor_library;
+        dst.serial_port = packet.serial_port;
+        dst.sim_robot = packet.sim_robot;
+        dst.sim_scene = packet.sim_scene;
+        dst.sim_realtime = packet.sim_realtime;
+        dst.camera_forward = widen3(packet.camera_forward);
+        dst.rotation_limit = widen3(packet.rotation_limit);
+        var tam: [MissionConfig.thruster_count]math.Vector6f = @splat(@splat(0));
+        for (0..packet.tam_len) |i| {
+            inline for (0..MissionConfig.tam_cols) |j| tam[i][j] = packet.tam[i][j];
+        }
+        dst.tam = tam;
         dst.tam_len = packet.tam_len;
-        dst.odometry = packet.odometry;
-        dst.ibvs = packet.ibvs;
+        dst.odometry = odometryFromWire(packet.odometry);
+        dst.ibvs = ibvsFromWire(packet.ibvs);
         dst.goal_dist_threshold = packet.goal_dist_threshold;
         dst.thrustor_saturate = packet.thrustor_saturate;
         dst.log_freq_div = packet.log_freq_div;
@@ -607,7 +493,6 @@ pub const LiveConfigPacket = struct {
         dst.clear_print_stuff = packet.clear_print_stuff;
         dst.telemetry_transport = packet.telemetry_transport;
         dst.telemetry_addr = packet.telemetry_addr;
-        dst.telemetry_shm_name = packet.telemetry_shm_name;
         dst.telemetry_log_path = packet.telemetry_log_path;
 
         dst.teleop_port = teleop_port;
@@ -621,7 +506,6 @@ pub const Goal = struct {
 
 /// Runtime telemetry data produced by the mission loop for publication.
 pub const telemetry_step_max = 64;
-pub const telemetry_ring_slot_count = 32;
 pub const telemetry_frame_abi_version: u32 = 2;
 
 pub const TelemetryPose = extern struct {
@@ -636,6 +520,29 @@ pub const TelemetryObject = extern struct {
     cls: u8,
     _pad: [3]u8,
 };
+
+pub fn telemetryVec3(v: math.Vector3f) [3]f32 {
+    return .{ @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]) };
+}
+
+pub fn telemetryQuat(v: math.Quaternionf) [4]f32 {
+    return .{ @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]), @floatCast(v[3]) };
+}
+
+pub fn telemetryPose(p: math.Pose) TelemetryPose {
+    return .{ .pos = telemetryVec3(p.pos), .quat = telemetryQuat(p.quat) };
+}
+
+pub fn telemetryVec6(v: math.Vector6f) [6]f32 {
+    return .{
+        @floatCast(v[0]), @floatCast(v[1]), @floatCast(v[2]),
+        @floatCast(v[3]), @floatCast(v[4]), @floatCast(v[5]),
+    };
+}
+
+pub fn telemetryFloat(v: f64) f32 {
+    return @floatCast(v);
+}
 
 pub const TelemetryPoint2u = extern struct {
     x: u32,
@@ -664,7 +571,7 @@ pub const TelemetryGoal = extern struct {
 
 /// Canonical fixed-layout runtime telemetry shared with the viewer.
 /// All variable-length data is stored inline with explicit lengths so the same
-/// type can be used for runtime publication, shared memory, UDP, and logs.
+/// type can be used for direct display, UDP, and logs.
 pub const TelemetryFrame = extern struct {
     magic: [4]u8,
     abi_version: u32,
@@ -706,91 +613,18 @@ pub const TelemetryFrame = extern struct {
     attitude_error: [3]f32,
     rotation_limit: [3]f32,
     input: [6]f32,
-
 };
-
-fn layoutMix(h: u64, value: usize) u64 {
-    return h *% 1_000_003 +% @as(u64, @intCast(value));
-}
-
-pub const telemetry_layout_fingerprint: u64 = blk: {
-    var h: u64 = telemetry_frame_abi_version;
-    h = layoutMix(h, @sizeOf(TelemetryFrame));
-    h = layoutMix(h, @alignOf(TelemetryFrame));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "camera_pose"));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "objects"));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "boxes"));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "goals"));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "clear_screen"));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "cycle_us"));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "kp"));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "tam"));
-    h = layoutMix(h, @offsetOf(TelemetryFrame, "input"));
-    break :blk h;
-};
-
-const RingHeader = extern struct {
-    magic: [4]u8,
-    abi_version: u32,
-    layout_fingerprint: u64,
-    owner_pid: u64,
-    slot_count: u32,
-    slot_size: u32,
-    published_seq: u64,
-};
-
-const RingSlot = extern struct {
-    seq: u64,
-    frame: TelemetryFrame,
-};
-
-const RingMemory = extern struct {
-    header: RingHeader,
-    slots: [telemetry_ring_slot_count]RingSlot,
-};
-
-fn publishTelemetryFrame(ring: *RingMemory, frame: *const TelemetryFrame) void {
-    const previous = @atomicLoad(u64, &ring.header.published_seq, .monotonic);
-    const seq = previous +% 1;
-    const slot = &ring.slots[seq % telemetry_ring_slot_count];
-    @atomicStore(u64, &slot.seq, seq *% 2 -% 1, .release);
-    slot.frame = frame.*;
-    @atomicStore(u64, &slot.seq, seq *% 2, .release);
-    @atomicStore(u64, &ring.header.published_seq, seq, .release);
-}
-
-fn ownerPid() u64 {
-    if (builtin.os.tag == .windows) return 0;
-    return @intCast(std.c.getpid());
-}
-
-fn ownerAlive(pid: u64) bool {
-    if (pid == 0) return false;
-    if (builtin.os.tag == .windows) return true;
-    const result = std.c.kill(@intCast(pid), @fromBackingInt(@intCast(0)));
-    return result == 0 or std.c.errno(result) == .PERM;
-}
-
-fn staleSharedMemory(name: []const u8) bool {
-    var existing = SharedMemory.open(name, @sizeOf(RingMemory)) catch return false;
-    defer existing.deinit();
-    const ring: *const RingMemory = @ptrCast(@alignCast(existing.memory.ptr));
-    validateRingHeader(&ring.header) catch return false;
-    if (ring.header.owner_pid == 0) return ring.header.published_seq != 0;
-    return !ownerAlive(ring.header.owner_pid);
-}
 
 comptime {
     // LiveConfigPacket is serialized field-by-field by SerialBinary. Keep
     // these anchors in order when changing the control wire schema.
     const live_fields = @typeInfo(LiveConfigPacket).@"struct".field_names;
-    if (live_fields.len != 18 or
+    if (live_fields.len != 26 or
         !std.mem.eql(u8, live_fields[2], "camera_forward") or
         !std.mem.eql(u8, live_fields[14], "telemetry_transport") or
-        !std.mem.eql(u8, live_fields[17], "telemetry_log_path"))
+        !std.mem.eql(u8, live_fields[16], "telemetry_log_path"))
         @compileError("live config packet control fields changed order");
-    // TelemetryFrame is shared-memory ABI, so its fixed offsets are part of
-    // the viewer/runtime contract.
+    // Preserve the existing telemetry frame layout for runtime and viewer.
     if (@offsetOf(TelemetryFrame, "timestamp") != 8)
         @compileError("telemetry timestamp ABI drift");
     if (@offsetOf(TelemetryFrame, "objects") <= @offsetOf(TelemetryFrame, "goals_len"))
@@ -798,59 +632,11 @@ comptime {
     if (@offsetOf(TelemetryFrame, "cycle_us") <= @offsetOf(TelemetryFrame, "clear_screen") or
         @offsetOf(TelemetryFrame, "input") <= @offsetOf(TelemetryFrame, "rotation_limit"))
         @compileError("telemetry diagnostics ABI drift");
-    if (@offsetOf(RingHeader, "published_seq") % @alignOf(u64) != 0)
-        @compileError("shared telemetry sequence must be naturally aligned");
-    if (@offsetOf(RingSlot, "frame") % @alignOf(TelemetryFrame) != 0)
-        @compileError("shared telemetry frame must be naturally aligned");
 }
 
-pub const LatestFrame = struct {
-    frame: *const TelemetryFrame,
-    slot: *const RingSlot,
-    expected_seq: u64,
+/// Fingerprint of `TelemetryFrame`. A datagram is this hash plus the raw `extern` image.
+pub const telemetry_schema_hash: u64 = reflection.schemaHash(TelemetryFrame);
 
-    /// Call after consuming `frame`; false means the producer wrapped onto this slot.
-    pub fn valid(self: LatestFrame) bool {
-        return @atomicLoad(u64, &self.slot.seq, .acquire) == self.expected_seq;
-    }
-};
-
-pub const TelemetrySubscriber = struct {
-    shared: SharedMemory,
-    ring: *const RingMemory,
-
-    pub fn open(name: []const u8) !TelemetrySubscriber {
-        var shared = try SharedMemory.open(name, @sizeOf(RingMemory));
-        errdefer shared.deinit();
-        const ring: *const RingMemory = @ptrCast(@alignCast(shared.memory.ptr));
-        try validateRingHeader(&ring.header);
-        return .{ .shared = shared, .ring = ring };
-    }
-
-    pub fn deinit(self: *TelemetrySubscriber) void {
-        self.shared.deinit();
-        self.* = undefined;
-    }
-
-    pub fn latest(self: *const TelemetrySubscriber) ?LatestFrame {
-        const seq = @atomicLoad(u64, &self.ring.header.published_seq, .acquire);
-        if (seq == 0) return null;
-        const slot = &self.ring.slots[seq % telemetry_ring_slot_count];
-        const expected = seq *% 2;
-        if (@atomicLoad(u64, &slot.seq, .acquire) != expected) return null;
-        return .{ .frame = &slot.frame, .slot = slot, .expected_seq = expected };
-    }
-};
-
-fn validateRingHeader(header: *const RingHeader) !void {
-    if (!std.mem.eql(u8, &header.magic, "AUVS")) return error.BadMagic;
-    if (header.abi_version != telemetry_frame_abi_version) return error.UnsupportedAbiVersion;
-    if (header.layout_fingerprint != telemetry_layout_fingerprint) return error.LayoutMismatch;
-    if (header.slot_count != telemetry_ring_slot_count or header.slot_size != @sizeOf(RingSlot))
-        return error.LayoutMismatch;
-}
-
-const live_config_recv_buf_len = 4096;
 const outbound_buf_len = 64 * 1024;
 
 pub const UdpPublisher = struct {
@@ -872,43 +658,6 @@ pub const UdpPublisher = struct {
 
     fn deinit(self: *UdpPublisher, io: Io) void {
         self.socket.close(io);
-        self.* = undefined;
-    }
-};
-
-pub const SharedMemoryPublisher = struct {
-    shared: SharedMemory,
-    ring: *RingMemory,
-
-    fn init(name: []const u8) !SharedMemoryPublisher {
-        var shared = SharedMemory.create(name, @sizeOf(RingMemory)) catch |err| switch (err) {
-            error.AlreadyExists => blk: {
-                if (!staleSharedMemory(name)) return err;
-                SharedMemory.unlinkName(name);
-                break :blk try SharedMemory.create(name, @sizeOf(RingMemory));
-            },
-            else => return err,
-        };
-        errdefer {
-            shared.unlink();
-            shared.deinit();
-        }
-        const ring: *RingMemory = @ptrCast(@alignCast(shared.memory.ptr));
-        ring.header = .{
-            .magic = "AUVS".*,
-            .abi_version = telemetry_frame_abi_version,
-            .layout_fingerprint = telemetry_layout_fingerprint,
-            .owner_pid = ownerPid(),
-            .slot_count = telemetry_ring_slot_count,
-            .slot_size = @sizeOf(RingSlot),
-            .published_seq = 0,
-        };
-        return .{ .shared = shared, .ring = ring };
-    }
-
-    fn deinit(self: *SharedMemoryPublisher) void {
-        self.shared.unlink();
-        self.shared.deinit();
         self.* = undefined;
     }
 };
@@ -946,45 +695,56 @@ pub const StdoutPublisher = struct {
 /// Runtime-owned transport selected from the compiled startup configuration.
 pub const TelemetryPublisher = union(TelemetryTransport) {
     udp: UdpPublisher,
-    shared_memory: SharedMemoryPublisher,
     stdout: StdoutPublisher,
+    disabled: void,
 
     fn init(io: Io, config: MissionConfig.MissionConfig) !TelemetryPublisher {
         return switch (config.telemetry_transport) {
             .udp => .{ .udp = try .init(io, config) },
-            .shared_memory => .{ .shared_memory = try .init(try config.telemetryShmName()) },
             .stdout => .{ .stdout = try .init(io) },
+            .disabled => .disabled,
         };
     }
 
     fn publishEncoded(
         self: *TelemetryPublisher,
         io: Io,
-        frame: TelemetryFrame,
         encoded: ?[]const u8,
         ascii_encoded: ?[]const u8,
     ) void {
         switch (self.*) {
             .udp => |*publisher| if (encoded) |bytes| publisher.publishEncoded(io, bytes),
-            .shared_memory => |*publisher| publishTelemetryFrame(publisher.ring, &frame),
             .stdout => |*publisher| if (ascii_encoded) |bytes| publisher.publishEncoded(io, bytes),
+            .disabled => {},
         }
     }
 
     fn deinit(self: *TelemetryPublisher, io: Io) void {
         switch (self.*) {
             .udp => |*publisher| publisher.deinit(io),
-            .shared_memory => |*publisher| publisher.deinit(),
             .stdout => |*publisher| publisher.deinit(),
+            .disabled => {},
         }
         self.* = undefined;
     }
 };
 
 pub fn encodeTelemetryFrame(buf: []u8, frame: TelemetryFrame) ![]const u8 {
-    var writer: Io.Writer = .fixed(buf);
-    try SerialBinary.write(&writer, frame);
-    return writer.buffered();
+    const image = std.mem.asBytes(&frame);
+    if (buf.len < 8 + image.len) return error.NoSpaceLeft;
+    std.mem.writeInt(u64, buf[0..8], telemetry_schema_hash, .little);
+    @memcpy(buf[8..][0..image.len], image);
+    return buf[0 .. 8 + image.len];
+}
+
+/// A matching hash and an aligned payload are a pointer into `buf`.
+pub fn telemetryFrameView(buf: []const u8) error{ EndOfStream, UnsupportedAbiVersion, MisalignedTelemetry }!*const TelemetryFrame {
+    if (buf.len < 8 + @sizeOf(TelemetryFrame)) return error.EndOfStream;
+    if (std.mem.readInt(u64, buf[0..8], .little) != telemetry_schema_hash) return error.UnsupportedAbiVersion;
+    const payload = buf[8..][0..@sizeOf(TelemetryFrame)];
+    if (@intFromPtr(payload.ptr) % @alignOf(TelemetryFrame) != 0) return error.MisalignedTelemetry;
+    const aligned: []align(@alignOf(TelemetryFrame)) const u8 = @alignCast(payload);
+    return std.mem.bytesAsValue(TelemetryFrame, aligned);
 }
 
 fn roundDisplayFloat(value: f32) f32 {
@@ -1171,7 +931,7 @@ fn processTelemetry(
     else
         null;
 
-    publisher.publishEncoded(io, frame, encoded, ascii_encoded);
+    publisher.publishEncoded(io, encoded, ascii_encoded);
     if (log_file) |file| {
         if (encoded) |bytes| file.writeStreamingAll(io, bytes) catch |err| {
             std.log.err("telemetry log write failed: {s}", .{@errorName(err)});
@@ -1179,10 +939,14 @@ fn processTelemetry(
     }
 }
 
-/// Decode the fixed telemetry frame used by both UDP/log and shared memory.
+/// Decode the fixed telemetry frame used for UDP and logs.
 pub fn decodeTelemetryFrame(buf: []const u8, frame: *TelemetryFrame) !void {
-    var reader: Io.Reader = .fixed(buf);
-    frame.* = try SerialBinary.read(&reader, TelemetryFrame);
+    if (telemetryFrameView(buf)) |view| {
+        frame.* = view.*;
+    } else |err| switch (err) {
+        error.MisalignedTelemetry => @memcpy(std.mem.asBytes(frame), buf[8..][0..@sizeOf(TelemetryFrame)]),
+        else => return err,
+    }
     if (!std.mem.eql(u8, &frame.magic, "AUV1")) return error.BadMagic;
     if (frame.abi_version != telemetry_frame_abi_version) return error.UnsupportedAbiVersion;
     if (frame.objects_len > frame.objects.len or frame.boxes_len > frame.boxes.len or
@@ -1190,6 +954,16 @@ pub fn decodeTelemetryFrame(buf: []const u8, frame: *TelemetryFrame) !void {
         frame.goals_len > frame.goals.len or frame.tam_len > frame.tam.len)
         return error.InvalidTelemetryLengths;
 }
+
+/// Direct command sent over the control socket; values use the active TAM order.
+pub const ThrusterCommand = struct {
+    magic: [4]u8 = "AUT1".*,
+    run_id: u64,
+    client_id: u64,
+    sequence: u64,
+    count: u8,
+    values: [MissionConfig.thruster_count]f32,
+};
 
 pub const TeleopCommand = struct {
     translation: [3]f32,
@@ -1200,6 +974,30 @@ pub const MissionCommandKind = enum(u8) {
     point,
     object,
 };
+pub fn teleopCommand(translation: math.Vector3f, orientation: math.Quaternionf) TeleopCommand {
+    return .{
+        .translation = .{
+            @floatCast(translation[0]),
+            @floatCast(translation[1]),
+            @floatCast(translation[2]),
+        },
+        .orientation = .{
+            @floatCast(orientation[0]),
+            @floatCast(orientation[1]),
+            @floatCast(orientation[2]),
+            @floatCast(orientation[3]),
+        },
+    };
+}
+
+pub fn teleopTranslation(command: TeleopCommand) math.Vector3f {
+    return .{ command.translation[0], command.translation[1], command.translation[2] };
+}
+
+pub fn teleopOrientation(command: TeleopCommand) math.Quaternionf {
+    return .{ command.orientation[0], command.orientation[1], command.orientation[2], command.orientation[3] };
+}
+
 
 pub const MissionManeuver = enum(u8) {
     move,
@@ -1268,37 +1066,49 @@ const mission_command_magic: [4]u8 = "AUM1".*;
 const mission_command_wire_version: u16 = 1;
 
 pub const Telemetry = struct {
+    state: RuntimeState = .idle,
+    result: RuntimeResult = .none,
+    revision: u64 = 1,
+    last_error: MissionConfig.FixedText(256) = .{},
+    telemetry_error: MissionConfig.FixedText(256) = .{},
+    run_id: u64 = 0,
+    direct_command: ?ThrusterCommand = null,
+    direct_last_received: ?Io.Clock.Timestamp = null,
+    teleop_command: ?TeleopCommand = null,
+    mission_command: ?MissionCommand = null,
+    pending_lifecycle: ?error{ MissionRestart, MissionStopped } = null,
+    accepted_client_id: u64 = 0,
+    accepted_request_id: u64 = 0,
+    clients: [16]struct { id: u64 = 0, request: u64 = 0 } = @splat(.{}),
+    client_slot: usize = 0,
+
     publisher: TelemetryPublisher,
     log_file: ?Io.File,
     encoded_buf: [outbound_buf_len]u8 = undefined,
     ascii_buf: [outbound_buf_len]u8 = undefined,
     stdout_log_counter: u64 = 0,
     stdout_log_freq_div: u16,
-    control_socket: Io.net.Socket = undefined,
-    teleop_command: ?TeleopCommand = null,
-    mission_command: ?MissionCommand = null,
-    live_config_packet: LiveConfigPacket = undefined,
+    control_socket: ?Io.net.Socket = null,
+
     initial_config_packet: LiveConfigPacket = undefined,
 
-    fn refreshLiveConfigPacket(self: *Telemetry, config: MissionConfig.MissionConfig) void {
-        self.live_config_packet = LiveConfigPacket.fromRuntimeConfig(&config);
-    }
-
-    pub fn init(_: std.mem.Allocator, io: Io, config: MissionConfig.MissionConfig) !Telemetry {
+    pub fn init(io: Io, config: MissionConfig.MissionConfig, enable_udp_control: bool) !Telemetry {
         var publisher = try TelemetryPublisher.init(io, config);
         errdefer publisher.deinit(io);
 
-        var control_addr_buf: [48]u8 = undefined;
-        const control_addr_text = try std.fmt.bufPrint(&control_addr_buf, "0.0.0.0:{d}", .{config.teleop_port});
-        const control_bind = try Io.net.IpAddress.parseLiteral(control_addr_text);
-        const control_socket = control_bind.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| switch (err) {
-            error.AddressInUse => {
-                std.log.err("control UDP port {d} is already in use", .{config.teleop_port});
-                return error.AddressInUse;
-            },
-            else => return err,
-        };
-        errdefer control_socket.close(io);
+        const control_socket: ?Io.net.Socket = if (enable_udp_control) blk: {
+            var control_addr_buf: [48]u8 = undefined;
+            const control_addr_text = try std.fmt.bufPrint(&control_addr_buf, "0.0.0.0:{d}", .{config.teleop_port});
+            const control_bind = try Io.net.IpAddress.parseLiteral(control_addr_text);
+            break :blk control_bind.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| switch (err) {
+                error.AddressInUse => {
+                    std.log.err("control UDP port {d} is already in use", .{config.teleop_port});
+                    return error.AddressInUse;
+                },
+                else => return err,
+            };
+        } else null;
+        errdefer if (control_socket) |socket| socket.close(io);
 
         const log_file: ?Io.File = if (try config.telemetryLogPath()) |path|
             try Io.Dir.cwd().createFile(io, path, .{})
@@ -1306,57 +1116,58 @@ pub const Telemetry = struct {
             null;
         errdefer if (log_file) |file| file.close(io);
 
-        var telemetry: Telemetry = .{
+        const telemetry: Telemetry = .{
             .publisher = publisher,
             .log_file = log_file,
             .stdout_log_freq_div = config.log_freq_div,
             .control_socket = control_socket,
             .initial_config_packet = LiveConfigPacket.fromRuntimeConfig(&config),
         };
-        telemetry.refreshLiveConfigPacket(config);
         return telemetry;
     }
 
     pub fn deinit(self: *Telemetry, io: Io) void {
         if (self.log_file) |file| file.close(io);
         self.publisher.deinit(io);
-        self.control_socket.close(io);
+        if (self.control_socket) |socket| socket.close(io);
         self.* = undefined;
     }
 
-    pub fn warnImmutableFields(self: *const Telemetry, config: MissionConfig.MissionConfig) void {
-        const initial_transport = self.initial_config_packet.telemetry_transport;
-        if (initial_transport == .udp or config.telemetry_transport == .udp) {
-            const init_telemetry = self.initial_config_packet.telemetry_addr.slice() catch "";
-            const new_telemetry = config.telemetryAddr() catch {
-                std.log.err("live config has invalid telemetry_addr", .{});
-                return;
-            };
-            if (!std.mem.eql(u8, new_telemetry, init_telemetry)) {
-                std.log.warn("config telemetry_addr changed; restart required", .{});
-            }
+    /// Replace outputs transactionally; the listener never changes ownership.
+    pub fn reconfigure(self: *Telemetry, io: Io, config: MissionConfig.MissionConfig) !void {
+        const previous = self.initial_config_packet;
+        const publisher_changed = config.telemetry_transport != previous.telemetry_transport or
+            (config.telemetry_transport == .udp and !MissionConfig.textEqual(config.telemetry_addr, previous.telemetry_addr));
+        var replacement: ?TelemetryPublisher = if (publisher_changed) try TelemetryPublisher.init(io, config) else null;
+        errdefer if (replacement) |*publisher| publisher.deinit(io);
+        const log_changed = !MissionConfig.textEqual(config.telemetry_log_path, previous.telemetry_log_path);
+        const log_file: ?Io.File = if (log_changed) blk: {
+            if (try config.telemetryLogPath()) |path| break :blk try Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+            break :blk null;
+        } else self.log_file;
+        if (replacement) |publisher| {
+            self.publisher.deinit(io);
+            self.publisher = publisher;
         }
-        if (config.telemetry_transport != self.initial_config_packet.telemetry_transport) {
-            std.log.warn("config telemetry_transport changed; restart required", .{});
+        if (log_changed) {
+            if (self.log_file) |file| file.close(io);
+            self.log_file = log_file;
         }
-        if (initial_transport == .shared_memory or config.telemetry_transport == .shared_memory) {
-            const init_shm_name = self.initial_config_packet.telemetry_shm_name.slice() catch "";
-            const new_shm_name = config.telemetryShmName() catch {
-                std.log.err("live config has invalid telemetry_shm_name", .{});
-                return;
-            };
-            if (!std.mem.eql(u8, new_shm_name, init_shm_name)) {
-                std.log.warn("config telemetry_shm_name changed; restart required", .{});
-            }
-        }
-        const init_log_path = self.initial_config_packet.telemetry_log_path.slice() catch "";
-        const new_log_path = config.telemetryLogPath() catch {
-            std.log.err("live config has invalid telemetry_log_path", .{});
-            return;
-        } orelse "";
-        if (init_log_path.len != new_log_path.len or !std.mem.eql(u8, new_log_path, init_log_path)) {
-            std.log.warn("config telemetry_log_path changed; restart required", .{});
-        }
+        self.stdout_log_freq_div = config.log_freq_div;
+        self.initial_config_packet = LiveConfigPacket.fromRuntimeConfig(&config);
+    }
+
+    pub fn report(self: *Telemetry, err: anyerror) void {
+        const detail = if (err == error.SensorInitFailed or err == error.SensorFrameFailed) Auv.lastError() else "";
+        setText(&self.last_error, if (detail.len != 0) detail else @errorName(err));
+        std.log.err("mission: {s}", .{self.last_error.slice() catch @errorName(err)});
+    }
+
+    pub fn clearCommands(self: *Telemetry) void {
+        self.direct_command = null;
+        self.direct_last_received = null;
+        self.teleop_command = null;
+        self.mission_command = null;
     }
 
     pub fn takeTeleopCommand(self: *Telemetry) ?TeleopCommand {
@@ -1371,67 +1182,201 @@ pub const Telemetry = struct {
         return command;
     }
 
-    pub fn pollLiveConfig(
-        self: *Telemetry,
-        io: Io,
-        base: MissionConfig.MissionConfig,
-        print_stuff: bool,
-        merged_out: *MissionConfig.MissionConfig,
-    ) bool {
-        const timeout: std.Io.Timeout = .{ .duration = .{
-            .clock = .awake,
-            .raw = .fromNanoseconds(0),
-        } };
-        var recv_buf: [live_config_recv_buf_len]u8 = undefined;
-        var applied = false;
-        var working = base;
-        while (true) {
-            const msg = self.control_socket.receiveTimeout(io, &recv_buf, timeout) catch |err| switch (err) {
-                error.Timeout => break,
-                else => {
-                    if (print_stuff) std.log.err("live config UDP recv: {s}", .{@errorName(err)});
-                    break;
-                },
+    pub fn applyConfig(self: *Telemetry, io: Io, current: *MissionConfig.MissionConfig, packet: LiveConfigPacket) !void {
+        try packet.validate();
+        if (packet.sensor_source != current.sensor_source) return error.SensorSourceIsCompiled;
+        if (packet.revision != self.revision) {
+            // A repeated accepted packet is an acknowledgment retry, not a new edit.
+            var current_packet = LiveConfigPacket.fromRuntimeConfig(current);
+            current_packet.revision = packet.revision;
+            if (std.meta.eql(packet, current_packet)) return;
+            return error.StaleConfig;
+        }
+        var next = current.*;
+        packet.applyToRuntimeConfig(&next);
+        const restart = !MissionConfig.MissionConfig.operationallyEqual(current, &next);
+        // Open replacement telemetry resources before committing the new config.
+        try self.reconfigure(io, next);
+        self.last_error = .{};
+        self.telemetry_error = .{};
+        current.* = next;
+        self.revision += 1;
+        if (restart) self.pending_lifecycle = error.MissionRestart;
+    }
+
+    pub fn acceptRequest(self: *Telemetry, request: RuntimeRequest) void {
+        if (request.action == .query) {
+            self.accepted_client_id = request.client_id;
+            self.accepted_request_id = 0;
+            for (self.clients) |client| if (client.id == request.client_id) {
+                self.accepted_request_id = client.request;
+                break;
             };
-            if (msg.data.len >= mission_command_magic.len and
-                std.mem.eql(u8, msg.data[0..mission_command_magic.len], &mission_command_magic))
-            {
-                self.mission_command = MissionCommand.decode(msg.data) catch |err| {
-                    if (print_stuff) std.log.debug("mission command rejected: {s}", .{@errorName(err)});
+            return;
+        }
+        if (request.client_id == 0 or request.request_id == 0) {
+            self.report(error.InvalidRequestId);
+            return;
+        }
+        var slot: ?usize = null;
+        for (self.clients, 0..) |client, i| if (client.id == request.client_id) {
+            slot = i;
+            break;
+        };
+        const index = slot orelse blk: {
+            const index = self.client_slot;
+            self.client_slot = (self.client_slot + 1) % self.clients.len;
+            self.clients[index] = .{ .id = request.client_id };
+            break :blk index;
+        };
+        if (request.request_id <= self.clients[index].request) {
+            self.accepted_client_id = request.client_id;
+            self.accepted_request_id = self.clients[index].request;
+            return;
+        }
+        self.clients[index].request = request.request_id;
+        self.accepted_client_id = request.client_id;
+        self.accepted_request_id = request.request_id;
+        switch (request.action) {
+            .query => unreachable,
+            .start => if (self.state == .idle or (if (self.pending_lifecycle) |pending| pending == error.MissionStopped else false)) {
+                self.pending_lifecycle = error.MissionRestart;
+            },
+            .stop => self.pending_lifecycle = error.MissionStopped,
+            .restart => self.pending_lifecycle = error.MissionRestart,
+        }
+    }
+
+    pub fn status(self: *const Telemetry, current: *const MissionConfig.MissionConfig, config_reply_revision: u64, config_rejected: bool) RuntimeStatus {
+        var desired = LiveConfigPacket.fromRuntimeConfig(current);
+        desired.revision = self.revision;
+        var active = LiveConfigPacket.fromRuntimeConfig(current);
+        // Publication resources belong to the application and can differ from the
+        // desired defaults after a failed startup publisher open.
+        active.telemetry_transport = self.initial_config_packet.telemetry_transport;
+        active.telemetry_addr = self.initial_config_packet.telemetry_addr;
+        active.telemetry_log_path = self.initial_config_packet.telemetry_log_path;
+        return .{
+            .run_id = self.run_id,
+            .state = if (self.pending_lifecycle != null and self.state != .idle) .stopping else self.state,
+            .result = self.result,
+            .revision = self.revision,
+            .accepted_client_id = self.accepted_client_id,
+            .accepted_request_id = self.accepted_request_id,
+            .config_reply_revision = config_reply_revision,
+            .config_rejected = config_rejected,
+            .active = self.state != .idle,
+            .desired = desired,
+            .active_config = active,
+            .last_error = if (self.last_error.len != 0) self.last_error else self.telemetry_error,
+        };
+    }
+
+    fn reply(self: *Telemetry, io: Io, current: *const MissionConfig.MissionConfig, destination: *const Io.net.IpAddress, config_reply_revision: u64, config_rejected: bool) void {
+        const socket = self.control_socket orelse return;
+        var buffer: [8192]u8 = undefined;
+        var writer: Io.Writer = .fixed(&buffer);
+        SerialBinary.write(&writer, self.status(current, config_reply_revision, config_rejected)) catch return;
+        socket.send(io, destination, writer.buffered()) catch {};
+    }
+
+    pub fn acceptThrusters(self: *Telemetry, io: Io, current: *const MissionConfig.MissionConfig, command: ThrusterCommand) void {
+        if (self.state != .running or self.pending_lifecycle != null or
+            current.mission_id != .thruster_control or command.run_id != self.run_id or
+            command.client_id == 0 or command.sequence == 0 or command.count != current.tam_len or
+            command.count > command.values.len) return;
+        for (command.values[0..command.count]) |value| {
+            if (!std.math.isFinite(value) or value < -1 or value > 1) return;
+        }
+        if (self.direct_command) |previous| {
+            if (command.client_id != previous.client_id or command.sequence < previous.sequence) return;
+            if (command.sequence == previous.sequence and !std.mem.eql(f32, &command.values, &previous.values)) return;
+        }
+        self.direct_command = command;
+        self.direct_last_received = .now(io, .awake);
+    }
+
+    pub fn acceptTeleop(self: *Telemetry, command: TeleopCommand) void {
+        if (self.state == .running and self.pending_lifecycle == null) self.teleop_command = command;
+    }
+
+    pub fn acceptMission(self: *Telemetry, input: MissionCommand) !void {
+        var command = input;
+        try command.validate();
+        self.queueMission(command);
+    }
+
+    fn queueMission(self: *Telemetry, command: MissionCommand) void {
+        if (self.state == .running and self.pending_lifecycle == null) self.mission_command = command;
+    }
+
+    /// Drain a bounded batch before unwinding, so only the latest requested
+    /// configuration is opened by the next mission attempt.
+    pub fn pollControl(self: *Telemetry, io: Io, current: *MissionConfig.MissionConfig) !void {
+        if (self.direct_last_received) |last| {
+            if (last.untilNow(io).raw.toMilliseconds() >= 2000) {
+                setText(&self.last_error, "Thruster control connection timed out");
+                self.clearCommands();
+                return error.MissionStopped;
+            }
+        }
+        var buffer: [4096]u8 = undefined;
+        const timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromNanoseconds(0) } };
+        if (self.control_socket) |socket| {
+            for (0..64) |_| {
+                const message = socket.receiveTimeout(io, &buffer, timeout) catch |err| switch (err) {
+                    error.Timeout => break,
+                    else => {
+                        self.report(err);
+                        break;
+                    },
+                };
+                var config_reply_revision: u64 = 0;
+                var config_rejected = false;
+                if (message.data.len >= 4 and std.mem.eql(u8, message.data[0..4], "ACR1")) {
+                    const decoded = SerialBinary.readFromBuffer(RuntimeRequest, message.data) catch |err| {
+                        self.report(err);
+                        self.reply(io, current, &message.from, 0, false);
+                        continue;
+                    };
+                    if (decoded.consumed != message.data.len) self.report(error.InvalidLength) else self.acceptRequest(decoded.value);
+                } else if (message.data.len >= 4 and std.mem.eql(u8, message.data[0..4], "MCF1")) {
+                    const packet = LiveConfigPacket.decode(message.data) catch |err| {
+                        self.report(err);
+                        self.reply(io, current, &message.from, 0, false);
+                        continue;
+                    };
+                    config_reply_revision = packet.revision;
+                    self.applyConfig(io, current, packet) catch |err| {
+                        self.report(err);
+                        config_rejected = true;
+                    };
+                } else if (message.data.len >= 4 and std.mem.eql(u8, message.data[0..4], "AUT1")) {
+                    const decoded = SerialBinary.readFromBuffer(ThrusterCommand, message.data) catch continue;
+                    if (decoded.consumed == message.data.len) self.acceptThrusters(io, current, decoded.value);
                     continue;
-                };
-                continue;
-            }
-            if (msg.data.len == 7 * @sizeOf(f32)) {
-                var values: [7]f32 = undefined;
-                for (0..values.len) |i| {
-                    const bits = std.mem.readInt(u32, msg.data[i * 4 ..][0..4], .little);
-                    values[i] = @bitCast(bits);
+                } else if (message.data.len == 28) {
+                    const decoded = SerialBinary.readFromBuffer(TeleopCommand, message.data) catch continue;
+                    self.acceptTeleop(decoded.value);
+                    continue;
+                } else {
+                    const command = MissionCommand.decode(message.data) catch |err| {
+                        self.report(err);
+                        self.reply(io, current, &message.from, 0, false);
+                        continue;
+                    };
+                    self.queueMission(command);
+                    continue;
                 }
-                self.teleop_command = .{
-                    .translation = .{ values[0], values[1], values[2] },
-                    .orientation = .{ values[3], values[4], values[5], values[6] },
-                };
-                continue;
+                self.reply(io, current, &message.from, config_reply_revision, config_rejected);
             }
-            const packet = LiveConfigPacket.decode(msg.data) catch |err| {
-                if (print_stuff) std.log.debug("live config UDP decode: {s}", .{@errorName(err)});
-                continue;
-            };
-            LiveConfigPacket.validate(&packet) catch |err| {
-                std.log.warn("live config UDP rejected: {s}", .{@errorName(err)});
-                continue;
-            };
-            LiveConfigPacket.applyToRuntimeConfig(&working, packet);
-            if (print_stuff) std.log.debug("applied live config UDP on control port", .{});
-            applied = true;
         }
-        if (applied) {
-            self.refreshLiveConfigPacket(working);
-            self.stdout_log_freq_div = working.log_freq_div;
-            merged_out.* = working;
+        const lifecycle = self.pending_lifecycle;
+        self.pending_lifecycle = null;
+        if (lifecycle) |err| {
+            self.clearCommands();
+            return err;
         }
-        return applied;
     }
 
     /// Publish one runtime telemetry frame synchronously.
@@ -1440,15 +1385,7 @@ pub const Telemetry = struct {
         io: Io,
         frame: *const TelemetryFrame,
     ) void {
-        if (self.log_file == null) {
-            switch (self.publisher) {
-                .shared_memory => |*publisher| {
-                    publishTelemetryFrame(publisher.ring, frame);
-                    return;
-                },
-                else => {},
-            }
-        }
+        if (self.publisher == .disabled and self.log_file == null) return;
         self.stdout_log_counter +%= 1;
         const stdout_enabled = self.stdout_log_freq_div != 0 and
             self.stdout_log_counter % self.stdout_log_freq_div == 0;
@@ -1463,3 +1400,112 @@ pub const Telemetry = struct {
         );
     }
 };
+
+// Control replies use the control socket, including when no sensor is available.
+pub const RuntimeState = enum(u8) { idle, starting, running, stopping };
+pub const RuntimeResult = enum(u8) { none, completed, stopped, failed };
+pub const RuntimeAction = enum(u8) { query, start, stop, restart };
+pub const RuntimeRequest = struct {
+    magic: [4]u8 = "ACR1".*,
+    client_id: u64,
+    request_id: u64,
+    action: RuntimeAction,
+};
+pub const RuntimeStatus = struct {
+    magic: [4]u8 = "ACS1".*,
+    state: RuntimeState,
+    result: RuntimeResult,
+    revision: u64,
+    accepted_client_id: u64,
+    accepted_request_id: u64,
+    config_reply_revision: u64,
+    config_rejected: bool,
+    active: bool,
+    desired: LiveConfigPacket,
+    active_config: LiveConfigPacket,
+    last_error: MissionConfig.FixedText(256),
+    run_id: u64,
+};
+
+pub fn setText(destination: anytype, message: []const u8) void {
+    destination.* = .{};
+    const len = @min(destination.bytes.len, message.len);
+    @memcpy(destination.bytes[0..len], message[0..len]);
+    destination.len = @intCast(len);
+}
+
+test "telemetry hash plus raw frame round trip" {
+    var frame = std.mem.zeroes(TelemetryFrame);
+    frame.magic = "AUV1".*;
+    frame.abi_version = telemetry_frame_abi_version;
+    frame.depth = 1.25;
+    frame.thrusters_len = 6;
+    frame.thrusters[0] = 0.5;
+    const packet_len = 8 + @sizeOf(TelemetryFrame);
+    const storage = try std.testing.allocator.alignedAlloc(u8, .of(TelemetryFrame), packet_len);
+    defer std.testing.allocator.free(storage);
+    const encoded = try encodeTelemetryFrame(storage, frame);
+    const view = try telemetryFrameView(encoded);
+    const start = @intFromPtr(encoded.ptr);
+    try std.testing.expect(@intFromPtr(view) >= start and @intFromPtr(view) < start + encoded.len);
+    try std.testing.expectEqual(frame.depth, view.depth);
+
+    var decoded: TelemetryFrame = undefined;
+    try decodeTelemetryFrame(encoded, &decoded);
+    try std.testing.expectEqual(frame.depth, decoded.depth);
+    try std.testing.expectEqual(frame.thrusters[0], decoded.thrusters[0]);
+    try std.testing.expectEqual(frame.thrusters_len, decoded.thrusters_len);
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(TelemetryFrame, "camera_pose"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(TelemetryFrame, "thrusters_len"));
+    try std.testing.expectEqual(@as(usize, 9284), @offsetOf(TelemetryFrame, "thrusters"));
+
+    const raw = try std.testing.allocator.alignedAlloc(u8, .of(TelemetryFrame), packet_len + 1);
+    defer std.testing.allocator.free(raw);
+    const misaligned = raw[1..][0..encoded.len];
+    @memcpy(misaligned, encoded);
+    try std.testing.expectError(error.MisalignedTelemetry, telemetryFrameView(misaligned));
+    try decodeTelemetryFrame(misaligned, &decoded);
+    try std.testing.expectEqual(frame.depth, decoded.depth);
+
+    var bad = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(bad);
+    bad[0] ^= 0xff;
+    try std.testing.expectError(error.UnsupportedAbiVersion, decodeTelemetryFrame(bad, &decoded));
+}
+
+test "lifecycle requests deduplicate and the latest request wins" {
+    var telemetry: Telemetry = .{ .publisher = undefined, .log_file = null, .stdout_log_freq_div = 1, .state = .running };
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 1, .action = .start });
+    try std.testing.expect(telemetry.pending_lifecycle == null);
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 2, .action = .restart });
+    try std.testing.expectEqual(error.MissionRestart, telemetry.pending_lifecycle.?);
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 3, .action = .stop });
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 2, .action = .restart });
+    try std.testing.expectEqual(error.MissionStopped, telemetry.pending_lifecycle.?);
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 3, .action = .query });
+    try std.testing.expectEqual(@as(u64, 3), telemetry.accepted_request_id);
+    telemetry.acceptRequest(.{ .client_id = 1, .request_id = 4, .action = .start });
+    try std.testing.expectEqual(error.MissionRestart, telemetry.pending_lifecycle.?);
+}
+
+test "direct control works without UDP and clears commands on restart" {
+    const io = std.testing.io;
+    var config = MissionConfig.startup_config;
+    config.telemetry_transport = .disabled;
+    var telemetry: Telemetry = try .init(io, config, false);
+    defer telemetry.deinit(io);
+    try std.testing.expect(telemetry.control_socket == null);
+
+    telemetry.state = .running;
+    try telemetry.acceptMission(.{ .kind = .point, .maneuver = .move, .look_direction = .{ 0, 4, 0 } });
+    try std.testing.expectEqual(math.Vector3f{ 0, 1, 0 }, telemetry.takeMissionCommand().?.look_direction);
+
+    var edit = LiveConfigPacket.fromRuntimeConfig(&config);
+    edit.revision = telemetry.revision;
+    edit.mission_id = .teleop;
+    try telemetry.applyConfig(io, &config, edit);
+    telemetry.acceptTeleop(.{ .translation = .{ 1, 0, 0 }, .orientation = .{ 0, 0, 0, 1 } });
+    try std.testing.expect(telemetry.takeTeleopCommand() == null);
+    try std.testing.expectError(error.MissionRestart, telemetry.pollControl(io, &config));
+    try std.testing.expectEqual(MissionConfig.MissionId.teleop, config.mission_id);
+}

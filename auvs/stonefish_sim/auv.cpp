@@ -1,12 +1,16 @@
 #include <cmath>
 #include <cstdio>
 #include <math.h>
-#include <csignal>
 #include <cstdlib>
 #include "../../include/auv.h"
+#include "../../include/stonefish_temporal_bridge.h"
+#include <exception>
+#include <stdexcept>
+static AuvFrameError initialization_error{};
+static void sensor_init();
+static void sensor_read(AuvFrame *frame);
+static void sensor_close();
 
-#include "Stonefish/actuators/Actuator.h"
-#include "Stonefish/actuators/Thruster.h"
 #include "Stonefish/core/ConsoleSimulationApp.h"
 #include "Stonefish/core/GraphicalSimulationApp.h"
 #include "Stonefish/core/Robot.h"
@@ -20,9 +24,11 @@
 #include "Stonefish/sensors/Sensor.h"
 #include "Stonefish/sensors/ScalarSensor.h"
 #include "Stonefish/sensors/vision/Camera.h"
-
+#include "Stonefish/actuators/Actuator.h"
+#include "Stonefish/actuators/Thruster.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -34,6 +40,8 @@
 #include <unordered_map>
 #include <vector>
 
+static constexpr auto kFrameTimeout = std::chrono::seconds(1);
+static constexpr auto kFrameRetryInterval = std::chrono::milliseconds(1);
 
 static std::filesystem::path dataPath = "auvs/stonefish_sim/data/";
 static std::string scenario_file = "scenarios/hydrus_env.scn";
@@ -45,21 +53,18 @@ static constexpr auto kMinRenderInterval = std::chrono::milliseconds(16);
 static constexpr bool kConsoleApp = false;
 static sf::Scalar realtimeFactorCap = kRealtimeFactorCap;
 
+static constexpr size_t kThrusterChannels = 8;
+static std::array<float, kThrusterChannels> g_pending_thrusters{};
 
-volatile std::sig_atomic_t g_stop_requested = 0;
-
-void requestStop(int)
+extern "C" void stonefish_temporal_bridge_set_thrusters(const float* values, uint8_t count)
 {
-    g_stop_requested = 1;
-}
-
-void stopIfRequested()
-{
-    if(g_stop_requested == 0)
+    if(values == nullptr)
         return;
-    std::cerr << "[stonefish_sim] interrupted; shutting down" << std::endl;
-    auv_deinit();
-    std::exit(130);
+    const uint8_t n = std::min<uint8_t>(count, static_cast<uint8_t>(kThrusterChannels));
+    for(uint8_t i = 0; i < n; ++i)
+        g_pending_thrusters[i] = values[i];
+    for(uint8_t i = n; i < kThrusterChannels; ++i)
+        g_pending_thrusters[i] = 0.f;
 }
 
 namespace
@@ -281,8 +286,21 @@ public:
     {
     }
 
+    void applyPendingThrusters()
+    {
+        if(!thrusters_indexed_)
+            indexThrusters();
+        for(size_t i = 0; i < kThrusterChannels; ++i)
+        {
+            if(thrusters_[i] != nullptr)
+                thrusters_[i]->setSetpoint(g_pending_thrusters[i]);
+        }
+    }
+
     void BuildScenario() override
     {
+        thrusters_indexed_ = false;
+        thrusters_.fill(nullptr);
         AuvScenarioParser parser(this);
         if(!parser.Parse(scenarioPath.string()))
         {
@@ -290,6 +308,7 @@ public:
             return;
         }
         const auto objectClasses = std::move(parser.objectClasses);
+        indexThrusters();
 
         odometry = nullptr;
         have_odometry = false;
@@ -347,25 +366,6 @@ public:
             body->setCollisionFlags(body->getCollisionFlags() | btCollisionObject::CF_NO_CONTACT_RESPONSE);
         }
 
-        thrusters.clear();
-        sf::Robot* robot = getRobot(0u);
-        if(robot == nullptr)
-        {
-            std::cout << "[stonefish_sim] no robot in scenario; thrusters will not run\n";
-            return;
-        }
-        for(size_t i = 0; sf::Actuator* actuator = robot->getActuator(i); ++i)
-        {
-            if(actuator->getType() != sf::ActuatorType::THRUSTER)
-                continue;
-            thrusters.push_back(static_cast<sf::Thruster*>(actuator));
-        }
-    }
-
-    void setThrustorValues(const float* thrustor_values, uint8_t thrustor_values_len)
-    {
-        for(uint8_t i = 0; i < thrustor_values_len; ++i)
-            thrusters[i]->setSetpoint(thrustor_values[i]);
     }
 
     AuvFrame getAuvFrame()
@@ -383,6 +383,26 @@ public:
             frame.camera_pose.quat.buf[1] = static_cast<float>(odometry->getLastValue(7));
             frame.camera_pose.quat.buf[2] = static_cast<float>(odometry->getLastValue(8));
             frame.camera_pose.quat.buf[3] = static_cast<float>(odometry->getLastValue(9));
+            const float qx = frame.camera_pose.quat.buf[0];
+            const float qy = frame.camera_pose.quat.buf[1];
+            const float qz = frame.camera_pose.quat.buf[2];
+            const float qw = frame.camera_pose.quat.buf[3];
+            const float n2 = qx * qx + qy * qy + qz * qz + qw * qw;
+            if(!(n2 > 1e-12f) || !std::isfinite(n2))
+            {
+                frame.camera_pose.quat.buf[0] = 0.f;
+                frame.camera_pose.quat.buf[1] = 0.f;
+                frame.camera_pose.quat.buf[2] = 0.f;
+                frame.camera_pose.quat.buf[3] = 1.f;
+            }
+            else if(std::abs(n2 - 1.f) > 1e-3f)
+            {
+                const float inv = 1.f / std::sqrt(n2);
+                frame.camera_pose.quat.buf[0] = qx * inv;
+                frame.camera_pose.quat.buf[1] = qy * inv;
+                frame.camera_pose.quat.buf[2] = qz * inv;
+                frame.camera_pose.quat.buf[3] = qw * inv;
+            }
         }
 
         for(const TrackedObject& tracked : tracked_objects)
@@ -445,7 +465,39 @@ public:
     float focal_px = 0.f;
     bool logged_tracking_loss = false;
     std::vector<TrackedObject> tracked_objects;
-    std::vector<sf::Thruster*> thrusters;
+    std::array<sf::Thruster*, kThrusterChannels> thrusters_{};
+    bool thrusters_indexed_ = false;
+
+    void indexThrusters()
+    {
+        thrusters_.fill(nullptr);
+        for(unsigned int i = 0; sf::Actuator* act = getActuator(i); ++i)
+        {
+            if(act->getType() != sf::ActuatorType::THRUSTER)
+                continue;
+            const std::string& name = act->getName();
+            const size_t thruster_tag = name.find("thruster_");
+            if(thruster_tag == std::string::npos)
+                continue;
+            const size_t digit_begin = thruster_tag + 9;
+            const size_t digit_end = name.find('_', digit_begin);
+            if(digit_end == std::string::npos || digit_end <= digit_begin)
+                continue;
+            int idx = 0;
+            try
+            {
+                idx = std::stoi(name.substr(digit_begin, digit_end - digit_begin));
+            }
+            catch(...)
+            {
+                continue;
+            }
+            if(idx < 0 || static_cast<size_t>(idx) >= kThrusterChannels)
+                continue;
+            thrusters_[static_cast<size_t>(idx)] = dynamic_cast<sf::Thruster*>(act);
+        }
+        thrusters_indexed_ = true;
+    }
 };
 
 class SimApp : public sf::GraphicalSimulationApp
@@ -607,11 +659,9 @@ sf::HelperSettings DefaultHelperSettings()
 }
 }
 
-void auv_init(void)
+static void sensor_init(void)
 {
-    g_stop_requested = 0;
-    std::signal(SIGINT, requestStop);
-    auv_deinit();
+    sensor_close();
 
     g_simulation_context = new SimulationContext();
     g_simulation_context->sim = new SimManager(kStepsPerSecond, dataPath / scenario_file);
@@ -630,13 +680,13 @@ void auv_init(void)
     }
 }
 
-void auv_yield_until_next_frame(AuvFrame* frame)
+static void sensor_read(AuvFrame* frame)
 {
 
-    stopIfRequested();
     if(g_simulation_context == nullptr)
         return;
 
+    g_simulation_context->sim->applyPendingThrusters();
     g_simulation_context->sim->StepSimulation(kPhysicsDt);
     if(g_simulation_context->graphical != nullptr)
         g_simulation_context->graphical->updateGraphics();
@@ -650,22 +700,17 @@ void auv_yield_until_next_frame(AuvFrame* frame)
     if(finished)
     {
         std::cerr << "[stonefish_sim] simulation finished; restart for another run\n";
-        auv_deinit();
-        std::exit(0);
+        sensor_close();
+        throw std::runtime_error("simulation finished");
     }
     *frame = g_simulation_context->sim->getAuvFrame();
 }
 
 
 
-void auv_set_thrustor_values(const float* thrustor_values, uint8_t thrustor_values_len)
-{
-    if(g_simulation_context == nullptr)
-        return;
-    g_simulation_context->sim->setThrustorValues(thrustor_values, thrustor_values_len); 
-}
 
-void auv_deinit(void)
+
+static void sensor_close(void)
 {
     if(g_simulation_context == nullptr)
         return;
@@ -684,4 +729,53 @@ void auv_deinit(void)
 
     delete g_simulation_context;
     g_simulation_context = nullptr;
+}
+
+// SDK calls run directly on the mission thread. Control is polled between calls
+// by the host. Frame deadlines are measured here; SDK calls can still block.
+void auv_init(void) {
+  initialization_error = {};
+  try {
+    sensor_init();
+  } catch (const std::exception &e) {
+    initialization_error.code = AUV_FRAME_ERROR_INITIALIZATION;
+    std::snprintf(initialization_error.message, sizeof(initialization_error.message), "%s", e.what());
+  } catch (...) {
+    initialization_error.code = AUV_FRAME_ERROR_INITIALIZATION;
+    std::snprintf(initialization_error.message, sizeof(initialization_error.message), "unexpected sensor initialization exception");
+  }
+}
+void auv_yield_until_next_frame(AuvFrame *frame) {
+  *frame = {};
+  if (initialization_error.code != AUV_FRAME_ERROR_NONE) {
+    frame->frame_error = initialization_error;
+    return;
+  }
+  try {
+    const auto started = std::chrono::steady_clock::now();
+    while (true) {
+      if (std::chrono::steady_clock::now() - started >= kFrameTimeout) break;
+      sensor_read(frame);
+      if (frame->frame_error.code != AUV_FRAME_ERROR_NONE) return;
+      if (std::chrono::steady_clock::now() - started >= kFrameTimeout) break;
+      if (frame->timestamp) return;
+      std::this_thread::sleep_for(kFrameRetryInterval);
+    }
+    frame->frame_error.code = AUV_FRAME_ERROR_TIMEOUT;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message),
+                  "Stonefish frame timed out after %lld ms",
+                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(kFrameTimeout).count()));
+  } catch (const std::exception &e) {
+    frame->frame_error.code = AUV_FRAME_ERROR_SENSOR;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "%s", e.what());
+  } catch (...) {
+    frame->frame_error.code = AUV_FRAME_ERROR_SENSOR;
+    std::snprintf(frame->frame_error.message, sizeof(frame->frame_error.message), "unexpected sensor frame exception");
+  }
+}
+void auv_deinit(void) {
+  try { sensor_close(); }
+  catch (const std::exception &e) { std::fprintf(stderr, "sensor cleanup: %s\n", e.what()); }
+  catch (...) { std::fputs("unexpected sensor cleanup exception\n", stderr); }
+  initialization_error = {};
 }

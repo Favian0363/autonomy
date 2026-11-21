@@ -7,7 +7,7 @@ pub const Quat = math.Quaternionf; // x,y,z,w
 pub const identity: Quat = .{ 0, 0, 0, 1 };
 pub const Error = error{ InvalidVector, InvalidQuaternion, InvalidAngle, InvalidTolerance };
 
-const vec_eps: f32 = 1e-6;
+const vec_eps: f64 = 1e-6;
 
 pub fn normalizedQuat(q: Quat) Error!Quat {
     const n2 = @reduce(.Add, q * q);
@@ -17,7 +17,7 @@ pub fn normalizedQuat(q: Quat) Error!Quat {
 
 /// Rotation alpha around arbitrary camera-forward BODY axis.
 /// This is only an axis-angle quaternion; it does not align a look direction.
-pub fn forwardRotation(forward_body: Vec3, alpha: f32) Error!Quat {
+pub fn forwardRotation(forward_body: Vec3, alpha: f64) Error!Quat {
     const forward_len = math.length3f(forward_body);
     if (!std.math.isFinite(forward_len) or forward_len <= vec_eps) return error.InvalidVector;
     const f = math.normalize3f(forward_body);
@@ -55,7 +55,7 @@ fn shortestArc(from: Vec3, to: Vec3) Error!Quat {
 /// A fixed reference gives a fixed zero-twist convention. Passing current_q instead
 /// makes alpha an increment relative to the newly aligned current orientation.
 /// No movement constraints are selected or solved here.
-pub fn targetQuaternion(forward_body: Vec3, look_world: Vec3, alpha: f32, reference_q: Quat) Error!Quat {
+pub fn targetQuaternion(forward_body: Vec3, look_world: Vec3, alpha: f64, reference_q: Quat) Error!Quat {
     const forward_len = math.length3f(forward_body);
     if (!std.math.isFinite(forward_len) or forward_len <= vec_eps) return error.InvalidVector;
     const f = math.normalize3f(forward_body);
@@ -86,7 +86,7 @@ pub fn targetAboutAxis(axis_body: Vec3, forward_body: Vec3, look_world: Vec3, re
 /// A zero limit leaves that axis at `reference_q`.
 pub fn lookWithinLimits(forward_body: Vec3, look_world: Vec3, reference_q: Quat, max_abs: Vec3) Error!Quat {
     const axes = [3]Vec3{ .{ 1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, 0, 1 } };
-    const limits = [3]f32{ max_abs[0], max_abs[1], max_abs[2] };
+    const limits = [3]f64{ max_abs[0], max_abs[1], max_abs[2] };
     const order = [3]usize{ 2, 0, 1 };
     var q = try normalizedQuat(reference_q);
     for (order) |i| {
@@ -101,7 +101,7 @@ pub fn lookWithinLimits(forward_body: Vec3, look_world: Vec3, reference_q: Quat,
     return q;
 }
 
-fn axisAimAngle(axis_body: Vec3, forward_body: Vec3, look_world: Vec3, reference_q: Quat) Error!?f32 {
+fn axisAimAngle(axis_body: Vec3, forward_body: Vec3, look_world: Vec3, reference_q: Quat) Error!?f64 {
     const axis_len = math.length3f(axis_body);
     if (!std.math.isFinite(axis_len) or axis_len <= vec_eps) return error.InvalidVector;
     const axis = math.normalize3f(axis_body);
@@ -131,7 +131,7 @@ pub const ThrustDirections = struct {
     /// Zero directions are ignored. A direction already covered by an earlier one is ignored
     /// when the leftover fraction of its length is below `distinct_direction_tolerance`.
     /// Use 1e-5 for ordinary f32 axis directions.
-    pub fn fromBodyDirections(directions: []const Vec3, distinct_direction_tolerance: f32) Error!ThrustDirections {
+    pub fn fromBodyDirections(directions: []const Vec3, distinct_direction_tolerance: f64) Error!ThrustDirections {
         if (!std.math.isFinite(distinct_direction_tolerance) or distinct_direction_tolerance <= 0 or distinct_direction_tolerance >= 1)
             return error.InvalidTolerance;
         var thrust: ThrustDirections = .{};
@@ -171,8 +171,8 @@ pub const ThrustDirections = struct {
     }
 
     fn fromColumns(rows: []const math.Vector6f, comptime first_column: usize) Error!ThrustDirections {
-        const relative_tolerance: f32 = 1e-3;
-        var energy: [3]f32 = .{ 0, 0, 0 };
+        const relative_tolerance: f64 = 1e-3;
+        var energy: [3]f64 = .{ 0, 0, 0 };
         for (rows) |row| {
             inline for (0..3) |axis| {
                 const gain = row[first_column + axis];
@@ -180,7 +180,7 @@ pub const ThrustDirections = struct {
                 energy[axis] += gain * gain;
             }
         }
-        var strongest: f32 = 0;
+        var strongest: f64 = 0;
         for (energy) |e| strongest = @max(strongest, e);
         const axis_directions = [3]Vec3{
             .{ 1, 0, 0 },
@@ -202,7 +202,7 @@ pub const ThrustDirections = struct {
     }
 };
 
-pub const Tilt = struct { axis: Vec3, angle: f32 };
+pub const Tilt = struct { axis: Vec3, angle: f64 };
 
 pub const ForceCoverage = struct {
     force: Vec3,
@@ -228,10 +228,10 @@ pub fn coverForce(
 
     const Candidate = struct {
         axis: Vec3,
-        angle: f32,
+        angle: f64,
         force: Vec3,
-        delivered: f32,
-        alignment: f32,
+        delivered: f64,
+        alignment: f64,
     };
     var best: ?Candidate = null;
     const half_pi = std.math.pi / 2.0;
@@ -243,7 +243,7 @@ pub fn coverForce(
         const axis = axis_raw / @as(Vec3, @splat(axis_len));
         const held = moment_dirs.alongThrust(axis);
         if (math.length3f(axis - held) > 0.25) continue;
-        var room: f32 = std.math.inf(f32);
+        var room: f64 = std.math.inf(f64);
         inline for (0..3) |i| {
             const component = @abs(axis[i]);
             if (component > 1e-4) room = @min(room, @abs(rotation_limit[i]) / component);
@@ -253,7 +253,8 @@ pub fn coverForce(
         const along = math.dot3f(force, thrust);
         if (@abs(along) <= 1e-4) continue;
         const capacity = @abs(along) * @tan(theta_max);
-        const clamped = std.math.clamp(missing_len, 0, capacity);
+        if (!std.math.isFinite(capacity) or capacity <= 1e-4) continue;
+        const clamped = @min(missing_len, capacity);
         if (clamped <= 1e-4) continue;
         var angle = std.math.atan2(clamped, along);
         if (angle > half_pi) angle -= std.math.pi;
@@ -297,8 +298,8 @@ pub fn attitudeError(current_q: Quat, target_q: Quat) Error!Vec3 {
 }
 
 /// Your TAM convention: one row per motor, six columns per row. No output limiting.
-pub fn mix(comptime motor_count: usize, rows: [motor_count]math.Vector6f, c: math.Vector6f) [motor_count]f32 {
-    var out: [motor_count]f32 = undefined;
+pub fn mix(comptime motor_count: usize, rows: [motor_count]math.Vector6f, c: math.Vector6f) [motor_count]f64 {
+    var out: [motor_count]f64 = undefined;
     _ = math.tamMul(&rows, c, &out);
     return out;
 }

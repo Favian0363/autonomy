@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "math.h"
 #include "object_classes.h"
 
@@ -38,6 +39,23 @@ typedef struct {
 } AuvAxisOk;
 
 #define AUV_FRAME_MAX_OBJECTS 128
+#define AUV_FRAME_ERROR_MESSAGE_CAPACITY 256
+
+typedef enum {
+  AUV_FRAME_ERROR_NONE = 0,
+  AUV_FRAME_ERROR_SENSOR = 2,
+  AUV_FRAME_ERROR_END_OF_STREAM = 3,
+  AUV_FRAME_ERROR_NOT_INITIALIZED = 4,
+  AUV_FRAME_ERROR_TIMEOUT = 5,
+  AUV_FRAME_ERROR_INITIALIZATION = 6
+} AuvFrameErrorCode;
+
+typedef struct {
+  // Zero means success. Plugins may define additional custom error codes.
+  uint32_t code;
+  char message[AUV_FRAME_ERROR_MESSAGE_CAPACITY];
+} AuvFrameError;
+
 typedef struct {
   AuvObject objects[AUV_FRAME_MAX_OBJECTS];
   uint8_t objects_len;
@@ -56,25 +74,27 @@ typedef struct {
   uint32_t image_height;
   float pressure_depth;
   bool pressure_depth_ok;
+  AuvFrameError frame_error;
 } AuvFrame;
 
+// Initialization failures are reported in frame_error on the next yield call.
 void auv_init(void);
+// Wait for a complete frame or set frame_error. Each plugin measures elapsed
+// time against its compiled deadline.
+// A blocking SDK call can only be checked after it returns.
 void auv_yield_until_next_frame(AuvFrame *frame);
-void auv_set_thrustor_values(const float *thrustor_values, uint8_t thrustor_values_len);
 void auv_deinit(void);
 
 #ifdef __cplusplus
 
 using AuvInitFunc = decltype(auv_init);
 using AuvYieldUntilNextFrameFunc = decltype(auv_yield_until_next_frame);
-using AuvSetThrustorsInputFunc = decltype(auv_set_thrustor_values);
 using AuvDeinitFunc = decltype(auv_deinit);
 
 #else
 
 typedef typeof(auv_init) AuvInitFunc;
 typedef typeof(auv_yield_until_next_frame) AuvYieldUntilNextFrameFunc;
-typedef typeof(auv_set_thrustor_values) AuvSetThrustorsInputFunc;
 typedef typeof(auv_deinit) AuvDeinitFunc;
 
 #endif // __cplusplus
