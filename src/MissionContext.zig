@@ -91,8 +91,9 @@ pub fn initProcess(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, w
     var bootstrap = ctx.config;
     bootstrap.telemetry_transport = .disabled;
     bootstrap.telemetry_log_path = .{};
+    const enable_udp_control = !windowed and ctx.config.mission_profile != .stonefish_sim;
     ctx.telemetry = try allocator.create(MissionIO.Telemetry);
-    ctx.telemetry.* = try .init(io, bootstrap, !windowed);
+    ctx.telemetry.* = try .init(io, bootstrap, enable_udp_control);
     errdefer ctx.telemetry.deinit(io);
     ctx.telemetry.reconfigure(io, ctx.config) catch |err| {
         ctx.telemetry.report(err);
@@ -188,14 +189,13 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
     const telemetry = ctx.telemetry;
     const config = ctx.config;
     try config.validate();
-    if (!simulator_enabled and config.serial_port.len == 0) return error.MissingOutput;
     const tam_len = config.tam_len;
 
     // MissionConfig compile-time preset checks bind Proteus to the six-channel
     // firmware protocol; the profile selects whether serial output is permitted.
     if (config.serial_port.len != 0) switch (config.mission_profile) {
         .proteus_hwd => {},
-        .stonefish_sim => return error.InvalidThrusterCount,
+        .stonefish_sim, .mujoco_sim => return error.InvalidThrusterCount,
     };
     var mission_diyn_loader: ?MissionIO.MissionDiynLoader = null;
     var auv: ?Auv = null;
@@ -206,6 +206,10 @@ pub fn init(ctx: *MissionContext, allocator: std.mem.Allocator) !void {
         const loaded = try loader.load();
         mission_diyn_loader = loader;
         auv = loaded;
+    }
+    const stonefish_temporal_thrusters = if (auv) |loaded| loaded.stonefish_temporal_thrusters != null else false;
+    if (!simulator_enabled and config.serial_port.len == 0 and !stonefish_temporal_thrusters) return error.MissingOutput;
+    if (comptime !simulator_enabled) {
         auv.?.init();
         try telemetry.pollControl(io, &ctx.config);
         // The void initialization ABI reports failures through the first frame.
@@ -303,6 +307,20 @@ fn paceHardwareFrame(ctx: *MissionContext) !void {
 pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     const start = Io.Clock.Timestamp.now(ctx.io, .awake);
     try ctx.telemetry.pollControl(ctx.io, &ctx.config);
+    var thruster_buffer: [MissionConfig.thruster_count]f32 = @splat(0);
+    const direct = ctx.config.mission_id == .thruster_control;
+    const thruster_values = if (direct) blk: {
+        if (ctx.telemetry.direct_command) |command| thruster_buffer = command.values;
+        break :blk thruster_buffer[0..ctx.config.tam_len];
+    } else ctx.controlStep(&thruster_buffer, &ctx.telemetry_frame);
+    if (!direct or ctx.telemetry.direct_command != null) {
+        if (comptime simulator_enabled) try ctx.simulator.?.setThrusters(&thruster_buffer);
+        if (ctx.auv) |loaded| loaded.setStonefishTemporalThrusters(thruster_values);
+        if (ctx.serial) |*port| {
+            const packet = Serial.encode(&thruster_values[0..Serial.protocol_v2_command_channel_count].*);
+            try port.writeAll(&packet, 100);
+        }
+    }
     if (comptime simulator_enabled) {
         try ctx.simulator.?.nextFrame(&ctx.frame);
     } else {
@@ -363,20 +381,6 @@ pub fn yieldUntilNextFrameAndUpdate(ctx: *MissionContext) !void {
     const step_len = @min(ctx.step.len, telemetry_frame.step.len);
     telemetry_frame.step_len = @intCast(step_len);
     @memcpy(telemetry_frame.step[0..step_len], ctx.step[0..step_len]);
-
-    var thruster_buffer: [MissionConfig.thruster_count]f32 = @splat(0);
-    const direct = ctx.config.mission_id == .thruster_control;
-    const thruster_values = if (direct) blk: {
-        if (ctx.telemetry.direct_command) |command| thruster_buffer = command.values;
-        break :blk thruster_buffer[0..ctx.config.tam_len];
-    } else ctx.controlStep(&thruster_buffer, telemetry_frame);
-    if (!direct or ctx.telemetry.direct_command != null) {
-        if (comptime simulator_enabled) try ctx.simulator.?.setThrusters(&thruster_buffer);
-        if (ctx.serial) |*port| {
-            const packet = Serial.encode(&thruster_values[0..Serial.protocol_v2_command_channel_count].*);
-            try port.writeAll(&packet, 100);
-        }
-    }
 
     const nobj = @min(@as(usize, ctx.seen_objects_len), ctx.seen_objects.len);
     const nbox = @min(@as(usize, ctx.seen_objects2d_len), ctx.seen_objects2d.len);
@@ -541,15 +545,15 @@ fn visualBodyError(ctx: *MissionContext) ?math.Vector6f {
     const mapped = math.mapInteraction(interaction_rows[0..], &image_error) catch {
         return null;
     };
-    const current = bc.normalizedQuat(ctx.frame.camera_pose.quat) catch unreachable;
+    const current = bc.normalizedQuat(ctx.frame.camera_pose.quat) catch return null;
     const yaw = math.quaternionToEuler(current)[2] + mapped[5];
     const look_q = bc.lookWithinLimits(
         ctx.config.camera_forward,
         lookAtHeading(yaw),
         bc.identity,
         ctx.config.rotation_limit,
-    ) catch unreachable;
-    var angular = bc.attitudeError(current, look_q) catch unreachable;
+    ) catch return null;
+    var angular = bc.attitudeError(current, look_q) catch return null;
     angular[0] += mapped[3];
     angular[1] += mapped[4];
     return .{ mapped[0], mapped[1], mapped[2], angular[0], angular[1], angular[2] };
@@ -595,7 +599,7 @@ fn controlStep(
     const body_error = ctx.bodyError();
     const timestamp_ns = ctx.frame.timestamp;
     const dt: ?f64 = if (ctx.pid_prev_timestamp_ns) |previous| blk: {
-        const elapsed_ns = timestamp_ns - previous;
+        const elapsed_ns = if (timestamp_ns >= previous) timestamp_ns - previous else 0;
         ctx.pid_prev_timestamp_ns = timestamp_ns;
         break :blk @as(f64, @floatFromInt(elapsed_ns)) * 1e-9;
     } else blk: {
@@ -641,10 +645,10 @@ fn controlStep(
     ctx.tilt_correction = slew3(ctx.tilt_correction, desired_tilt, tilt_step);
     const tilt_len = math.length3f(ctx.tilt_correction);
     if (tilt_len > 1e-4) {
-        const tilt_q = bc.forwardRotation(ctx.tilt_correction, tilt_len) catch unreachable;
-        target_q = bc.normalizedQuat(math.quaternionMul(target_q, tilt_q)) catch unreachable;
+        const tilt_q = bc.forwardRotation(ctx.tilt_correction, tilt_len) catch bc.identity;
+        target_q = bc.normalizedQuat(math.quaternionMul(target_q, tilt_q)) catch target_q;
     }
-    var attitude_error = bc.attitudeError(current, target_q) catch unreachable;
+    var attitude_error = bc.attitudeError(current_q, target_q) catch math.Vector3f{ 0, 0, 0 };
     const attitude_axis = [3]bool{ ctx.frame.attitude_ok.x, ctx.frame.attitude_ok.y, ctx.frame.attitude_ok.z };
     inline for (0..3) |i| {
         if (!attitude_axis[i]) attitude_error[i] = 0;

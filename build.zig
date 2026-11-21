@@ -403,6 +403,14 @@ pub fn build(b: *std.Build) !void {
         install_stonefish_sim.step.dependOn(&cmake_build.step);
 
         b.getInstallStep().dependOn(&install_stonefish_sim.step);
+
+        // Host + dlopen'd plugin can find libStonefish.so without LD_LIBRARY_PATH.
+        exe.root_module.addRPath(b.path("build/stonefish/lib"));
+        exe.root_module.addRPath(b.path("zig-out/lib"));
+        exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+        exe.root_module.addRPathSpecial("$ORIGIN/../../build/stonefish/lib");
+        exe.step.dependOn(&install_stonefish_sim.step);
+        run_cmd.step.dependOn(&install_stonefish_sim.step);
     }
 
     cmake_build.step.dependOn(&cmake_configure.step);

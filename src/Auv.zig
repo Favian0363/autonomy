@@ -138,12 +138,18 @@ const AbiFrame = extern struct {
 
 pub const YieldUntilNextFrameFunc = fn (*AbiFrame) callconv(.c) void;
 pub const DeinitFunc = fn () callconv(.c) void;
+pub const StonefishTemporalSetThrusters = @import("StonefishTemporalBridge.zig").SetThrustersFn;
 
 const Auv = @This();
 
 init_impl: *const InitFunc,
 yield_until_next_frame_impl: *const YieldUntilNextFrameFunc,
 deinit_impl: *const DeinitFunc,
+stonefish_temporal_thrusters: ?*const StonefishTemporalSetThrusters = null,
+
+pub fn setStonefishTemporalThrusters(self: Auv, values: []const f32) void {
+    if (self.stonefish_temporal_thrusters) |set| @import("StonefishTemporalBridge.zig").apply(set, values);
+}
 
 pub fn init(self: Auv) void {
     diagnostic = @splat(0);

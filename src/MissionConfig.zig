@@ -2,6 +2,7 @@
 const std = @import("std");
 const bc = @import("BodyControl.zig");
 const math = @import("math.zig");
+const simulator_default = @import("build_options").simulator;
 
 /// Thrusters / TAM rows (max). Active count per vehicle is `tam_len`.
 pub const thruster_count = 8;
@@ -65,6 +66,7 @@ pub const Ibvs = struct {
 
 pub const MissionProfileId = enum(u8) {
     stonefish_sim,
+    mujoco_sim,
     proteus_hwd,
 
     pub fn fromName(name: []const u8) ?MissionProfileId {
@@ -86,11 +88,12 @@ pub const path_max = 256;
 pub const name_max = 64;
 pub const control_port: u16 = 8080;
 pub const startup_mission: MissionId = .mission_control;
-pub const startup_profile: MissionProfileId = .stonefish_sim;
+pub const startup_profile: MissionProfileId = if (simulator_default) .mujoco_sim else .stonefish_sim;
 
 /// Compiled vehicle tuning presets.
 pub const MissionProfiles = struct {
     stonefish_sim: MissionConfig,
+    mujoco_sim: MissionConfig,
     proteus_hwd: MissionConfig,
 };
 
@@ -229,6 +232,9 @@ fn presetBaseline() MissionConfig {
 fn presetStonefishSim() MissionConfig {
     var config = presetBaseline();
     config.mission_profile = .stonefish_sim;
+    config.mission_id = .prequalify_robosub;
+    config.sensor_library = .fromLiteral("./zig-out/lib/libauv_stonefish_sim.so");
+    config.telemetry_transport = .stdout;
     config.rotation_limit = .{ 0, 0, 100 };
     config.odometry = .{
         .rotation_gate = 0.292699081688714,
@@ -255,6 +261,19 @@ fn presetStonefishSim() MissionConfig {
         .{ 0, 0, 0, 0, 0, 0, 0, 0 },
         .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
+    return config;
+}
+
+fn presetMujocoSim() MissionConfig {
+    var config = presetStonefishSim();
+    config.mission_profile = .mujoco_sim;
+    config.mission_id = .prequalify_robosub;
+    config.sensor_source = .simulated;
+    config.sensor_library = .{};
+    config.telemetry_transport = .udp;
+    config.sim_robot = .fromLiteral("hydrus");
+    config.sim_scene = .fromLiteral("robosub_course");
+    config.sim_scene_catalog = .embedded_bin;
     return config;
 }
 
@@ -294,6 +313,7 @@ fn presetProteusHwd() MissionConfig {
 
 pub const mission_profiles: MissionProfiles = .{
     .stonefish_sim = presetStonefishSim(),
+    .mujoco_sim = presetMujocoSim(),
     .proteus_hwd = presetProteusHwd(),
 };
 
@@ -301,6 +321,7 @@ pub const mission_profiles: MissionProfiles = .{
 pub fn compiledProfile(profile: MissionProfileId) *const MissionConfig {
     return switch (profile) {
         .stonefish_sim => &mission_profiles.stonefish_sim,
+        .mujoco_sim => &mission_profiles.mujoco_sim,
         .proteus_hwd => &mission_profiles.proteus_hwd,
     };
 }
@@ -391,6 +412,7 @@ fn assertPreset(comptime name: []const u8, comptime config: MissionConfig) void 
 comptime {
     if (mission_profiles.proteus_hwd.tam_len != 6) @compileError("Proteus firmware requires six TAM rows");
     assertPreset("stonefish_sim", mission_profiles.stonefish_sim);
+    assertPreset("mujoco_sim", mission_profiles.mujoco_sim);
     assertPreset("proteus_hwd", mission_profiles.proteus_hwd);
 }
 
@@ -399,6 +421,6 @@ pub fn textEqual(a: anytype, b: @TypeOf(a)) bool {
 }
 pub const startup_config: MissionConfig = blk: {
     var config = compiledProfile(startup_profile).*;
-    config.mission_id = startup_mission;
+    if (startup_profile == .proteus_hwd) config.mission_id = startup_mission;
     break :blk config;
 };

@@ -192,7 +192,11 @@ pub fn draw(self: *Self, font: rl.Font, bounds: rl.Rectangle, packet: *const IO.
         self.dirty = true;
     }
     if (button(font, rl.textFormat("Profile: %s", .{@tagName(self.draft.mission_profile).ptr}), .{ .x = x + w * 0.5, .y = y, .width = w * 0.5, .height = 28 }, ready)) {
-        const profile: Config.MissionProfileId = if (self.draft.mission_profile == .proteus_hwd) .stonefish_sim else .proteus_hwd;
+        const profile: Config.MissionProfileId = switch (self.draft.mission_profile) {
+            .stonefish_sim => .mujoco_sim,
+            .mujoco_sim => .proteus_hwd,
+            .proteus_hwd => .stonefish_sim,
+        };
         const preset = Config.compiledProfile(profile);
         self.draft.mission_profile = profile;
         const wire = IO.LiveConfigPacket.fromRuntimeConfig(preset);

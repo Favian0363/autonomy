@@ -17,7 +17,9 @@ zig build test
 zig build run
 ```
 
-## Native simulator
+## Native simulator (MuJoCo)
+
+Build with `-Dsimulator` sets the default profile to **`mujoco_sim`**: Hydrus, `robosub_course`, RoboSub mission, same 8-thruster TAM as Stonefish. Switch profiles in the embedded UI or via live config.
 
 ```sh
 git submodule update --init vendor/mujoco
@@ -69,6 +71,16 @@ zig build viewer -Dviewer-gstreamer
 
 ## Legacy Stonefish plugin
 
+Build the C++ plugin only:
+
+```sh
+git submodule update --init vendor/stonefish
+zig build -Dstonefish
+```
+
+Build with `-Dstonefish` embeds RUNPATH on `src_3` and the plugin so you do not need `LD_LIBRARY_PATH`. Run from the repo root so `auvs/stonefish_sim/data/` resolves. Default startup profile is Stonefish with the **RoboSub** prequalify mission:
+
 ```sh
 zig build -Dstonefish
+./zig-out/bin/src_3
 ```

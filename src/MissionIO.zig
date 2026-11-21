@@ -199,7 +199,7 @@ pub const MissionDiynLoader = struct {
         loader.dynlib = try DynLib.open(loader.auv_path);
         errdefer loader.dynlib.close();
 
-        return .{
+        const loaded: Auv = .{
             .init_impl = loader.dynlib.lookup(
                 *const Auv.InitFunc,
                 "auv_init",
@@ -212,7 +212,12 @@ pub const MissionDiynLoader = struct {
                 *const Auv.DeinitFunc,
                 "auv_deinit",
             ) orelse return error.MissingAuvDeinit,
+            .stonefish_temporal_thrusters = loader.dynlib.lookup(
+                *const Auv.StonefishTemporalSetThrusters,
+                @import("StonefishTemporalBridge.zig").symbol,
+            ),
         };
+        return loaded;
     }
 };
 

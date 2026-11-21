@@ -253,7 +253,8 @@ pub fn coverForce(
         const along = math.dot3f(force, thrust);
         if (@abs(along) <= 1e-4) continue;
         const capacity = @abs(along) * @tan(theta_max);
-        const clamped = std.math.clamp(missing_len, 0, capacity);
+        if (!std.math.isFinite(capacity) or capacity <= 1e-4) continue;
+        const clamped = @min(missing_len, capacity);
         if (clamped <= 1e-4) continue;
         var angle = std.math.atan2(clamped, along);
         if (angle > half_pi) angle -= std.math.pi;
