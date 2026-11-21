@@ -1,86 +1,61 @@
 # Autonomy
 
-Requires Zig 0.17+, C/C++ toolchain, CMake, libc, pkg-config, and Python 3.
+Needs Zig 0.17+, CMake, and a C/C++ toolchain. On Debian/Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config python3 \
-  cmake \
+sudo apt install build-essential cmake pkg-config python3 \
   libsdl2-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
   libxinerama-dev libxrandr-dev libxi-dev
 ```
 
-## Build, test, run
+## Hardware (Jetson + Proteus)
+
+**On the vehicle** (ZED SDK under `/usr/local/zed`, CUDA under `/usr/local/cuda`):
 
 ```sh
-zig build
-zig build test
-zig build run
+zig build -Dzed -Dzed-prefix=/usr/local/zed -Dcuda-prefix=/usr/local/cuda
+./zig-out/bin/src_3
 ```
 
-## Native simulator (MuJoCo)
+Use the **Proteus** profile, serial port, and `libauv_proteus_hwd.so` paths from the viewer (UDP control **8080**, telemetry **5600**). Set **telemetry** on the Jetson to your ground-station IP `:5600` when the viewer is not on the same host.
 
-Build with `-Dsimulator` sets the default profile to **`mujoco_sim`**: Hydrus, `robosub_course`, RoboSub mission, same 8-thruster TAM as Stonefish. Switch profiles in the embedded UI or via live config.
+**On a ground station** (telemetry )
+
+```sh
+zig build viewer
+./zig-out/bin/viewer --video none --teleop-host JETSON_IP
+```
+
+With ZED RTP from the vehicle:
+
+```sh
+./zig-out/bin/viewer --video 127.0.0.1:5610 --teleop-host JETSON_IP
+```
+
+```sh
+zig build test
+```
+
+
+## MuJoCo + embedded visualizer
 
 ```sh
 git submodule update --init vendor/mujoco
 zig build -Dsimulator
-zig build test -Dsimulator
 zig build run -Dsimulator
 zig build run -Dsimulator -- --headless
+zig build test -Dsimulator
 ```
 
-Environment layout is selected with `sim_scene_catalog` in mission config (see [`MissionConfig.zig`](src/MissionConfig.zig)):
 
-| `sim_scene_catalog` | Behavior |
-|---|---|
-| `embedded_bin` (default) | Load committed [`src/simulator/scenes.bin`](src/simulator/scenes.bin) |
-| `file` | Load `sim_scene_catalog_path` |
 
-`sim_scene` still picks a **preset name** inside the catalog (`robosub_course`, `robot_only`, …). Scene and robot files are separate DNA documents (`database.loadScene`, `database.loadRobot`). Each file header is the reflection of the struct that was saved. Robots stay in `robots.bin`.
 
-Blender is only for **mesh geometry** (`zig build export-mesh` → `.meshbin` for offline catalog authoring).
+## Stonefish (Legacy Simulator)
 
-## ZED sensor plugin
-
-```sh
-zig build -Dzed \
-  -Dzed-prefix=/usr/local/zed \
-  -Dcuda-prefix=/usr/local/cuda
-zig build run -Dzed
-```
-
-## Standalone viewer for hardware or headless simulation
-
-```sh
-zig build viewer
-./zig-out/bin/viewer --video none
-```
-
-```sh
-zig build viewer -Dviewer-zed
-./zig-out/bin/viewer --video 127.0.0.1:5610
-```
-
-```sh
-sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-  gstreamer1.0-plugins-bad gstreamer1.0-libav
-zig build viewer -Dviewer-gstreamer
-./zig-out/bin/viewer --video rtp://0.0.0.0:5612
-```
-
-## Legacy Stonefish plugin
-
-Build the C++ plugin only:
+Run from the **repo root**.
 
 ```sh
 git submodule update --init vendor/stonefish
-zig build -Dstonefish
-```
-
-Build with `-Dstonefish` embeds RUNPATH on `src_3` and the plugin so you do not need `LD_LIBRARY_PATH`. Run from the repo root so `auvs/stonefish_sim/data/` resolves. Default startup profile is Stonefish with the **RoboSub** prequalify mission:
-
-```sh
 zig build -Dstonefish
 ./zig-out/bin/src_3
 ```
