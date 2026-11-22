@@ -91,7 +91,8 @@ pub fn initProcess(ctx: *MissionContext, allocator: std.mem.Allocator, io: Io, w
     var bootstrap = ctx.config;
     bootstrap.telemetry_transport = .disabled;
     bootstrap.telemetry_log_path = .{};
-    const enable_udp_control = !windowed and ctx.config.mission_profile != .stonefish_sim;
+    const builtin = @import("builtin");
+    const enable_udp_control = !windowed and ctx.config.mission_profile != .stonefish_sim and builtin.os.tag != .windows;
     ctx.telemetry = try allocator.create(MissionIO.Telemetry);
     ctx.telemetry.* = try .init(io, bootstrap, enable_udp_control);
     errdefer ctx.telemetry.deinit(io);

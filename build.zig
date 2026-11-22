@@ -71,6 +71,16 @@ pub fn build(b: *std.Build) !void {
             "-DMUJOCO_BUILD_TESTS=OFF",
             "-DMUJOCO_TEST_PYTHON_UTIL=OFF",
         });
+        const host_os = b.graph.host.result.os.tag;
+        if (host_os == .windows) {
+            cmake_configure.addArgs(&.{
+                "-G",
+                "Ninja",
+                "-DCMAKE_TOOLCHAIN_FILE=cmake/zig-gnu-windows.cmake",
+                "-DCMAKE_BUILD_TYPE=Debug",
+                "-DCMAKE_CXX_FLAGS=-Wno-error=format",
+            });
+        }
         const cmake_build = b.addSystemCommand(&.{
             "cmake",
             "--build",
@@ -83,7 +93,6 @@ pub fn build(b: *std.Build) !void {
         mujoco_build_step = &cmake_build.step;
 
         const headers = b.path("vendor/mujoco/include");
-        const library = b.path("vendor/mujoco/build/lib/libmujoco.so");
         const mujoco_c = b.addTranslateC(.{
             .root_source_file = b.path("vendor/mujoco/include/mujoco/mujoco.h"),
             .target = target,
@@ -91,9 +100,19 @@ pub fn build(b: *std.Build) !void {
         });
         mujoco_c.addIncludePath(headers);
         exe.root_module.addImport("mujoco_c", mujoco_c.createModule());
-        exe.root_module.addObjectFile(library);
-        exe.root_module.addRPath(library.dirname());
-        exe.root_module.addRPathSpecial("$ORIGIN/../../vendor/mujoco/build/lib");
+        if (host_os == .windows) {
+            const import_lib = b.path("vendor/mujoco/build/lib/libmujoco.dll.a");
+            exe.root_module.addObjectFile(import_lib);
+            const dll = b.path("vendor/mujoco/build/bin/libmujoco.dll");
+            const install_dll = b.addInstallFileWithDir(dll, .bin, "libmujoco.dll");
+            install_dll.step.dependOn(mujoco_build_step.?);
+            b.getInstallStep().dependOn(&install_dll.step);
+        } else {
+            const library = b.path("vendor/mujoco/build/lib/libmujoco.so");
+            exe.root_module.addObjectFile(library);
+            exe.root_module.addRPath(library.dirname());
+            exe.root_module.addRPathSpecial("$ORIGIN/../../vendor/mujoco/build/lib");
+        }
         exe.step.dependOn(mujoco_build_step.?);
     }
 
@@ -205,10 +224,13 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
-    const integration = b.addSystemCommand(&.{"python3"});
+    const integration_os = b.graph.host.result.os.tag;
+    const integration = b.addSystemCommand(&.{
+        if (integration_os == .windows) "python" else "python3",
+    });
     integration.addFileArg(b.path("tests/serial_integration.py"));
     integration.addArtifactArg(exe);
-    test_step.dependOn(&integration.step);
+    if (integration_os == .linux) test_step.dependOn(&integration.step);
 
     for ([_][]const u8{ "pending", "slow", "init_fail", "frame_fail" }, 0..) |name, mode| {
         const fixture = b.addLibrary(.{ .name = b.fmt("control_sensor_{s}", .{name}), .linkage = .dynamic, .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
